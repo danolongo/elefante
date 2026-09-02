@@ -1,0 +1,13 @@
+[package]
+name = "elefante-srv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+elefante-core = { path = "../elefante-core" }
+elefante-rpc = { path = "../elefante-rpc" }
+
+[lints]
+workspace = true

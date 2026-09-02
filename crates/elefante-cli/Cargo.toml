@@ -1,0 +1,20 @@
+[package]
+name = "elefante-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "elefante"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+elefante-core = { path = "../elefante-core" }
+elefante-provider = { path = "../elefante-provider" }
+elefante-tools = { path = "../elefante-tools" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/elefante-cli",
+    "crates/elefante-core",
+    "crates/elefante-guard",
+    "crates/elefante-mem",
+    "crates/elefante-provider",
+    "crates/elefante-rpc",
+    "crates/elefante-srv",
+    "crates/elefante-tools",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+futures-util = "0.3"
+globset = "0.4"
+ignore = "0.4"
+regex = "1.11"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tree-sitter = "0.27"
+tree-sitter-bash = "0.25"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

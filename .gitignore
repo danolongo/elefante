@@ -1,0 +1,18 @@
+# Rust build and profiling output
+/target/
+*.profraw
+
+# Local Elefante and development-agent state
+/.elefante/
+/.omx/
+
+# Credentials and private key material
+.env
+.env.*
+*.key
+*.pem
+
+# Local editor and operating-system files
+.DS_Store
+*.swp
+*.swo

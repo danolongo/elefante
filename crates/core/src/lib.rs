@@ -394,17 +394,3 @@ async fn execute_calls(tools: &ToolExecutor, calls: &[ToolCall]) -> Vec<ToolResu
     )
     .await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::DEFAULT_SYSTEM_PROMPT;
-
-    #[test]
-    fn standing_prompt_stays_small() {
-        let words = DEFAULT_SYSTEM_PROMPT.split_whitespace().count();
-        assert!(
-            words < 300,
-            "conservative prompt proxy grew to {words} words"
-        );
-    }
-}

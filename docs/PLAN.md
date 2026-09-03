@@ -33,7 +33,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | Real OpenTUI (widgets, flexbox, mouse) has no Rust equivalent — `opentui_rust` is a 35-star rendering-only port with no widgets, layout, or event loop. The split is opencode's own architecture, and a headless core is what makes tmux subagents work later. |
+| UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | The same split opencode runs in production, so it is a proven shape rather than one invented here. A headless core is also what makes tmux subagents work later. |
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. Pluggable vector slot left open. |
 | Storage | User graph in `~/.elefante`, project graph in `<repo>/.elefante/`, all gitignored | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |

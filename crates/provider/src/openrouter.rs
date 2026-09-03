@@ -13,7 +13,11 @@ use crate::{
     sse::{SseDecoder, SseFrame},
 };
 
-const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+// The trailing slash is load-bearing: `Url::join` replaces the last path
+// segment when the base does not end in one, so omitting it resolves to
+// `/api/chat/completions` and 404s. `with_base_url` normalises user input the
+// same way.
+const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/";
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// Streaming client for the `OpenRouter` chat-completions API.
@@ -126,7 +130,7 @@ impl Provider for OpenRouterProvider {
                 let body = response.text().await.unwrap_or_else(|error| error.to_string());
                 Err(ProviderError::HttpStatus {
                     status: status.as_u16(),
-                    body,
+                    body: truncate_error_body(&body),
                 })?
             };
 
@@ -152,6 +156,22 @@ impl Provider for OpenRouterProvider {
             }
         })
     }
+}
+
+/// Caps an error body so a misrouted request cannot bury its own cause.
+///
+/// A wrong path returns an HTML error page, and printing tens of kilobytes of
+/// markup hides the status line that actually explains the failure.
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 600;
+    if body.len() <= LIMIT {
+        return body.to_owned();
+    }
+    let mut end = LIMIT;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes total]", &body[..end], body.len())
 }
 
 /// Capability resolution for one model-slug prefix.
@@ -675,6 +695,47 @@ mod tests {
     }
 
     #[test]
+    fn a_long_error_body_is_truncated_but_keeps_its_opening() {
+        let html = format!(
+            "<!DOCTYPE html><title>Not Found</title>{}",
+            "x".repeat(50_000)
+        );
+        let truncated = truncate_error_body(&html);
+
+        assert!(truncated.starts_with("<!DOCTYPE html><title>Not Found</title>"));
+        assert!(truncated.len() < 800, "kept {} bytes", truncated.len());
+        assert!(truncated.contains("bytes total"), "reports the real size");
+        assert_eq!(truncate_error_body("short body"), "short body");
+    }
+
+    #[test]
+    fn default_base_url_resolves_to_the_versioned_completions_path() {
+        // Regression: every other test overrides the base URL to reach the mock
+        // server, so nothing exercised the shipped default. Without a trailing
+        // slash `Url::join` drops `v1` and the real endpoint 404s.
+        let url = OpenRouterProvider::new("test-key")
+            .completions_url()
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn an_overridden_base_url_without_a_trailing_slash_keeps_its_last_segment() {
+        let url = OpenRouterProvider::new("test-key")
+            .with_base_url("https://gateway.example/proxy/v9")
+            .unwrap()
+            .completions_url()
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gateway.example/proxy/v9/chat/completions"
+        );
+    }
+
+    #[test]
     fn require_parameters_is_sent_only_alongside_tools() {
         let provider = OpenRouterProvider::new("test-key");
         let request = Request {
@@ -1153,7 +1214,7 @@ mod tests {
     async fn live_second_identical_request_reads_prompt_cache() {
         let api_key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
         let model = std::env::var("OPENROUTER_MODEL")
-            .unwrap_or_else(|_| "anthropic/claude-opus-5".to_owned());
+            .unwrap_or_else(|_| "anthropic/claude-sonnet-5".to_owned());
         let provider = OpenRouterProvider::new(api_key);
         let stable = "This is stable provider integration test context. ".repeat(300);
         let mut request = Request::new(

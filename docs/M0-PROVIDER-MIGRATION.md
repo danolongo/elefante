@@ -243,7 +243,7 @@ field · standing prompt stays small.
 - Unknown model slug yields all-false capabilities and a request carrying no reasoning field.
 
 **Environment:** `OPENROUTER_API_KEY` (required), `OPENROUTER_MODEL`
-(default `anthropic/claude-opus-5`), `OPENROUTER_BASE_URL`
+(default `anthropic/claude-sonnet-5`), `OPENROUTER_BASE_URL`
 (default `https://openrouter.ai/api/v1`), `ELEFANTE_EFFORT`.
 
 ## Decisions made during implementation

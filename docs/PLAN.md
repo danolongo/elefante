@@ -145,7 +145,7 @@ Roles are provider-agnostic and configured, not hardcoded — **author**, **crit
 
 With one provider a role is just `(model, effort)`. M0 ships only `OPENROUTER_MODEL` + `ELEFANTE_EFFORT`; the `config.toml` role table arrives when a second role actually exists — the bash triage critic in M4. Building it in M0 would be configuration with one consumer.
 
-Starting config: author = `anthropic/claude-opus-5` @ `xhigh`; critic = a *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage = anything cheap and fast. Per-model pricing no longer needs a local table — `usage.cost` comes back on every response.
+Starting config: author = `anthropic/claude-sonnet-5` @ `xhigh`; critic = a *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage = anything cheap and fast. Per-model pricing no longer needs a local table — `usage.cost` comes back on every response.
 
 ### First-run key setup
 

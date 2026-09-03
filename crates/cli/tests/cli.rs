@@ -98,6 +98,18 @@ fn live_edit_lands_in_a_scratch_repository() {
     command
         .current_dir(workspace.path())
         .env("OPENROUTER_API_KEY", api_key)
+        // Bound what this test can spend. The production defaults (16k tokens,
+        // high effort) are sized for real work; a one-word edit needs neither,
+        // and reserving 16k output tokens makes the test fail on any
+        // credit-limited key for reasons that have nothing to do with the code.
+        .args([
+            "--max-tokens",
+            "2048",
+            "--effort",
+            "low",
+            "--max-rounds",
+            "8",
+        ])
         .arg("In note.txt, replace the word hello with goodbye. Change nothing else.");
     if let Ok(model) = std::env::var("OPENROUTER_MODEL") {
         command.env("OPENROUTER_MODEL", model);

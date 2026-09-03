@@ -44,7 +44,7 @@ Useful options:
 --max-tokens N
 ```
 
-Environment defaults are `OPENROUTER_MODEL` (default `anthropic/claude-opus-5`),
+Environment defaults are `OPENROUTER_MODEL` (default `anthropic/claude-sonnet-5`),
 `ELEFANTE_EFFORT`, and `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`).
 Command-line values take precedence where both forms exist. Models are named by OpenRouter
 slug, so reaching a different vendor is a different slug rather than a different transport.
@@ -59,7 +59,7 @@ itself. Keep one for your shell to source, structured like this:
 OPENROUTER_API_KEY=sk-or-v1-...
 
 # Optional — all have defaults.
-OPENROUTER_MODEL=anthropic/claude-opus-5
+OPENROUTER_MODEL=anthropic/claude-sonnet-5
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ELEFANTE_EFFORT=xhigh
 ```

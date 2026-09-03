@@ -23,7 +23,7 @@ impl CliOptions {
         let mut arguments = env::args().skip(1);
         let mut prompt_parts = Vec::new();
         let mut model =
-            env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "anthropic/claude-opus-5".to_owned());
+            env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "anthropic/claude-sonnet-5".to_owned());
         let mut effort =
             parse_effort(&env::var("ELEFANTE_EFFORT").unwrap_or_else(|_| "high".to_owned()))?;
         let mut max_rounds = 24;

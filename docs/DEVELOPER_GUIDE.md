@@ -495,7 +495,7 @@ Configuration precedence and defaults:
 
 | Concern | Highest precedence | Environment fallback | Default |
 |---|---|---|---|
-| Model | `--model` | `OPENROUTER_MODEL` | `anthropic/claude-opus-5` |
+| Model | `--model` | `OPENROUTER_MODEL` | `anthropic/claude-sonnet-5` |
 | Effort | `--effort` | `ELEFANTE_EFFORT` | `high` |
 | Max rounds | `--max-rounds` | — | `24` |
 | Max tokens | `--max-tokens` | — | `16,384` |
@@ -552,7 +552,7 @@ requests. Run it explicitly against a slug whose upstream supports prompt cachin
 
 ```sh
 export OPENROUTER_API_KEY="..."
-export OPENROUTER_MODEL="anthropic/claude-opus-5"
+export OPENROUTER_MODEL="anthropic/claude-sonnet-5"
 cargo test -p elefante-provider live_second_identical_request_reads_prompt_cache -- --ignored
 ```
 

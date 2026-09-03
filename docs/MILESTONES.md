@@ -17,48 +17,48 @@ Entry format:
 
 ---
 
-_No milestones completed yet._
+## M0 — Loop            (completed 2026-09-02)
 
-**M0 is open.** Its provider baseline was reversed on 2026-09-02 — from two peer providers
-(Anthropic + OpenRouter) to OpenRouter alone. The Anthropic transport was implemented, passed
-its gate, and was then deleted. That work was not wasted: its SSE decoder and hermetic TCP
-test harness carried over intact, and writing it is what surfaced the reasoning-block question
-the contract settles. Patch, frozen type contract, and the decisions made while implementing
-it: [`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md).
+**Shipped.** Cargo workspace of eight crates. `Provider` trait + `Capabilities` with a single
+OpenRouter transport: OpenAI-compatible SSE, per-model capability resolution, `reasoning`
+control and verbatim replay, `tool_calls` normalised by array index, prompt caching where the
+upstream supports it, and `usage` accounting including real `cost`. Transport-generic SSE
+decoder in its own module. Agent loop over seven tools with plain stdout. `PathPolicy`,
+the deterministic bash classifier, and the output scrubber — an ungated bash tool never
+existed, not even briefly.
 
-Settled by that change: reasoning blocks are stored verbatim as opaque JSON rather than typed
-variants, because OpenRouter's replay rule requires unknown future block types to round-trip.
+**Gate.** 55 hermetic tests, plus both credentialed checks run against a live key:
+`live_second_identical_request_reads_prompt_cache` and `live_edit_lands_in_a_scratch_repository`.
+`cargo clippy --workspace --all-targets` clean under pedantic; `cargo fmt --check` clean.
 
-**State: 52 tests passing, 2 ignored, `cargo clippy --workspace --all-targets` clean under
-pedantic, `cargo fmt --check` clean.** Every gate item in [`PLAN.md`](./PLAN.md) § M0 now maps
-to a test except the two below.
+The credentialed half earned its place. It caught a bug the hermetic suite **structurally
+could not**: `DEFAULT_BASE_URL` lacked a trailing slash, and `Url::join` replaces the final
+path segment without one, so `new()` resolved to `/api/chat/completions` with `v1` silently
+dropped. Every hermetic test overrides the base URL to reach the mock server, and that path
+normalises the slash — so the shipped default was the one code path nothing exercised. Anyone
+relying on it would have hit a 404 on their first request. Now pinned by two offline tests.
 
-Two defects were found during implementation that the original M0 did not cover, both fixed:
+Two further defects were found and fixed during the milestone, neither covered by the
+original baseline:
 
 - `elefante-core` discarded `Event::Usage` outright, which would have made the session-level
-  cache gate unsatisfiable and left cost accounting with no input. `RunOutcome` now carries a
-  `Usage` summed across rounds.
+  cache gate unsatisfiable and left cost accounting with no input.
 - Requests carrying `tools` did not set `provider: {require_parameters: true}`, so an endpoint
   could silently drop `tools` — the model answers in prose, the loop stops after one round,
   and the agent does nothing while appearing to work.
 
-## Remaining before M0 can close
+**Deferred.** Nothing from the baseline. The interactive approval transport for escalated bash
+commands waits on the daemon and TUI, as planned — the classifier decides, but there is
+nowhere to render a prompt yet.
 
-Both require `OPENROUTER_API_KEY` and issue real, billable requests. Neither can be run
-without an operator's credentials, so neither is claimed as passing.
+**Amended.** The provider baseline was reversed mid-milestone from two peer providers to
+OpenRouter alone ([`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md)), which settled how
+reasoning blocks are represented: verbatim opaque JSON, because the replay rule requires
+unknown future block types to round-trip. `PLAN.md` also gained the model-picker and
+first-run key-setup designs, the plan to derive capabilities from catalogue metadata rather
+than hardcoded slug prefixes, and gate items for `require_parameters` and `openrouter/auto`.
+Default model moved to `anthropic/claude-sonnet-5` to keep credentialed runs cheap.
 
-```sh
-export OPENROUTER_API_KEY="..."
-export OPENROUTER_MODEL="..."     # optional; a cheap tool-capable slug is fine
+---
 
-# Prompt-cache hit on the second identical request.
-cargo test -p elefante-provider live_second_identical_request_reads_prompt_cache -- --ignored
-
-# End-to-end: the loop completes and the edit lands. Runs in a temp directory,
-# not this repository, so a misread instruction cannot touch tracked files.
-cargo test -p elefante-cli -- --ignored --nocapture
-```
-
-The cache check needs a slug whose upstream actually supports prompt caching — `pricing`
-must carry `input_cache_read`. `openrouter/auto` will not do: its capability profile leaves
-caching off, because its pricing declares no cache rates.
+_Next: M1 — daemon, RPC protocol, and OpenTUI client._

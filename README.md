@@ -1,7 +1,7 @@
 # Elefante
 
 Elefante is a small, modifiable coding-agent harness. Its current implementation is a
-Rust command-line agent loop with a provider-neutral core, Anthropic streaming support,
+Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
 seven guarded tools, and policy enforced in code rather than in a long system prompt.
 
 The long-term design adds a daemon, OpenTUI client, graph-backed project memory,
@@ -12,19 +12,20 @@ the repository currently contains the M0 loop and compile-safe scaffolds for lat
 
 M0 is implemented and all hermetic checks pass. Formal milestone completion still requires
 the two credentialed checks described in [`docs/MILESTONES.md`](docs/MILESTONES.md): a real
-Anthropic prompt-cache hit and a live edit against this repository. M1 work has not begun.
+prompt-cache hit through OpenRouter and a live edit against this repository. M1 work has not
+begun.
 
 ## Quick start
 
 Requirements:
 
 - Rust 1.85 or newer
-- An Anthropic API key supplied through the process environment
+- An OpenRouter API key supplied through the process environment
 
 Run the agent from the repository it should be allowed to modify:
 
 ```sh
-export ANTHROPIC_API_KEY="..."
+export OPENROUTER_API_KEY="..."
 cargo run -p elefante-cli -- "Inspect this repository and summarize its structure."
 ```
 
@@ -43,8 +44,10 @@ Useful options:
 --max-tokens N
 ```
 
-Environment defaults are `ANTHROPIC_MODEL`, `ELEFANTE_EFFORT`, and
-`ANTHROPIC_BASE_URL`. Command-line values take precedence where both forms exist.
+Environment defaults are `OPENROUTER_MODEL` (default `anthropic/claude-opus-5`),
+`ELEFANTE_EFFORT`, and `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`).
+Command-line values take precedence where both forms exist. Models are named by OpenRouter
+slug, so reaching a different vendor is a different slug rather than a different transport.
 
 ## Safety model
 

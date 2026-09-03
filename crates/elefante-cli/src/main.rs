@@ -5,10 +5,10 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use elefante_core::{OutputEvent, RunConfig, run_agent_loop};
-use elefante_provider::{Effort, StopReason, anthropic::AnthropicProvider};
+use elefante_provider::{Effort, OpenRouterProvider, StopReason};
 use elefante_tools::ToolExecutor;
 
-const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n\nIf PROMPT is omitted, it is read from stdin. Required: ANTHROPIC_API_KEY. Optional: ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, ELEFANTE_EFFORT.";
+const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n\nIf PROMPT is omitted, it is read from stdin. Required: OPENROUTER_API_KEY. Optional: OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
 
 struct CliOptions {
     prompt: Option<String>,
@@ -22,7 +22,8 @@ impl CliOptions {
     fn parse() -> anyhow::Result<Self> {
         let mut arguments = env::args().skip(1);
         let mut prompt_parts = Vec::new();
-        let mut model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-5".to_owned());
+        let mut model =
+            env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "anthropic/claude-opus-5".to_owned());
         let mut effort =
             parse_effort(&env::var("ELEFANTE_EFFORT").unwrap_or_else(|_| "high".to_owned()))?;
         let mut max_rounds = 24;
@@ -116,12 +117,12 @@ fn read_prompt(argument: Option<String>) -> anyhow::Result<String> {
 async fn main() -> anyhow::Result<()> {
     let options = CliOptions::parse()?;
     let prompt = read_prompt(options.prompt)?;
-    let api_key = env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
-    let mut provider = AnthropicProvider::new(api_key);
-    if let Ok(base_url) = env::var("ANTHROPIC_BASE_URL") {
+    let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is not set")?;
+    let mut provider = OpenRouterProvider::new(api_key);
+    if let Ok(base_url) = env::var("OPENROUTER_BASE_URL") {
         provider = provider
             .with_base_url(base_url)
-            .context("ANTHROPIC_BASE_URL is invalid")?;
+            .context("OPENROUTER_BASE_URL is invalid")?;
     }
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let executor = ToolExecutor::new(&cwd)
@@ -132,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     config.max_tokens = options.max_tokens;
 
     let outcome = run_agent_loop(&provider, &executor, prompt, config, |event| match event {
-        OutputEvent::ThinkingDelta(delta) | OutputEvent::TextDelta(delta) => {
+        OutputEvent::ReasoningDelta(delta) | OutputEvent::TextDelta(delta) => {
             print!("{delta}");
             let _ = io::stdout().flush();
         }

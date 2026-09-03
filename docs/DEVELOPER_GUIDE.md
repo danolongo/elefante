@@ -9,8 +9,8 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 The repository is at M0: a provider-backed coding loop running in a plain terminal. The
 implemented vertical slice can:
 
-- send a prompt and stable tool catalog to Anthropic;
-- stream summarized thinking and text;
+- send a prompt and stable tool catalog to OpenRouter;
+- stream reasoning and text;
 - assemble provider events into replayable conversation history;
 - execute model-requested tools concurrently;
 - enforce path, shell, and output-scrubbing policy; and
@@ -25,7 +25,7 @@ are expensive to retrofit. They do not imply that later milestones have shipped:
 - `elefante-mem` contains only an M2 availability marker; there is no database or graph.
 - There is no `tui/` directory yet.
 
-M0's hermetic gate is green. The credentialed Anthropic cache-hit test and live repository
+M0's hermetic gate is green. The credentialed OpenRouter cache-hit test and live repository
 edit have not run, so the milestone remains formally in progress.
 
 ## 2. Design principles
@@ -36,7 +36,7 @@ The implementation follows four project-level convictions:
    gate, or test, enforce it there. The core prompt describes intent; it does not pretend to
    be a filesystem or process sandbox.
 2. **Normalize at boundaries.** Core code works with provider-neutral requests, content,
-   events, usage, and stop reasons. Anthropic JSON and SSE details stay in the provider crate.
+   events, usage, and stop reasons. OpenRouter JSON and SSE details stay in the provider crate.
 3. **Make unsafe paths fail closed.** Filesystem aliases are resolved before access, shell
    syntax is classified across the full parse tree, and unclassified mutation requires an
    approval mechanism that M0 intentionally does not provide.
@@ -57,11 +57,12 @@ elefante/
 ├── docs/
 │   ├── PLAN.md                    design of record and milestone gates
 │   ├── MILESTONES.md              completion record
+│   ├── M0-PROVIDER-MIGRATION.md    frozen contract for the single-provider rewrite
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/
     ├── elefante-cli/              `elefante` terminal binary
     ├── elefante-core/             provider/tool conversation loop
-    ├── elefante-provider/         normalized model API + Anthropic transport
+    ├── elefante-provider/         normalized model API + OpenRouter transport
     ├── elefante-guard/            path, shell, and secret-output policy
     ├── elefante-tools/            schemas and syscall-facing tool executor
     ├── elefante-rpc/              M1 protocol scaffold
@@ -94,8 +95,8 @@ elefante-rpc ──► no internal crate
 ### `elefante-cli`
 
 The binary is composition code. It parses arguments, reads environment configuration,
-constructs `AnthropicProvider` and `ToolExecutor`, builds `RunConfig`, and calls
-`run_agent_loop`. It renders thinking and text deltas directly to stdout. Tool lifecycle
+constructs `OpenRouterProvider` and `ToolExecutor`, builds `RunConfig`, and calls
+`run_agent_loop`. It renders reasoning and text deltas directly to stdout. Tool lifecycle
 events are available from core but are not rendered by the M0 terminal frontend.
 
 Keep provider protocol parsing, policy, and orchestration out of this crate. M1 will replace
@@ -110,22 +111,26 @@ Core owns conversation semantics:
 - retaining assistant content in provider order;
 - validating tool-use lifecycle and IDs;
 - executing a batch of tools concurrently while retaining deterministic result order;
-- returning all results in one user message; and
+- returning every tool result together as one batch; and
 - enforcing refusal and round-limit behavior.
 
-Core does not know Anthropic field names and does not perform filesystem operations.
+Core does not know OpenRouter field names, does not know how a result batch is shaped on the
+wire, and does not perform filesystem operations.
 
 ### `elefante-provider`
 
 The crate has two layers:
 
 - `lib.rs` defines the normalized provider contract and shared data models.
-- `anthropic.rs` maps that contract onto `POST /v1/messages`, parses incremental SSE, and
-  maps wire events back to normalized events.
+- `sse.rs` owns the transport-generic SSE decoder.
+- `openrouter.rs` maps that contract onto `POST {base}/chat/completions`, drives the decoder,
+  and maps wire chunks back to normalized events.
 
-Provider capability differences are descriptive. A transport may emit only fields supported
-by the selected model. The current Anthropic capability resolver uses model-name matching;
-update its tests whenever supported model families change.
+Capability differences are descriptive. A transport may emit only fields supported by the
+selected model. Capabilities are resolved per model by prefix-matching the OpenRouter slug,
+with a conservative all-false default for unrecognized slugs: an unknown model must not
+silently receive fields it cannot handle. Update the resolver's tests whenever supported
+model families change.
 
 ### `elefante-guard`
 
@@ -170,11 +175,11 @@ elefante-cli
       build normalized Request
            │
            ▼
-      Provider::stream ──► Anthropic request JSON ──► SSE response
+      Provider::stream ──► OpenRouter request JSON ─► SSE response
            ▲                                         │
            └──────────── normalized Event stream ◄───┘
            │
-           ├─ thinking/text delta ──► frontend callback
+           ├─ reasoning/text delta ─► frontend callback
            ├─ complete content block ──► assistant history
            └─ stop_reason == tool_use
                           │
@@ -190,7 +195,7 @@ elefante-cli
                     scrub every result
                           │
                           ▼
-             one user message with all results
+            all tool results, consecutively
                           │
                           └──────────────► next provider round
 ```
@@ -218,8 +223,10 @@ polled concurrently, while the returned vector preserves request order. Each fai
 a `ToolResult` with `is_error: true`; dropping a failure would desynchronize tool IDs on the
 next provider request.
 
-Core then appends exactly one user message containing every `ToolResult` block. This is a
-protocol invariant, not a formatting preference.
+Core then appends every `ToolResult` block from the batch together, before the next assistant
+turn. This is a protocol invariant, not a formatting preference: splitting a result batch
+across turns trains the model out of parallel tool calls. Section 7 describes how the provider
+fans that batch onto the wire.
 
 ### Refusals
 
@@ -250,14 +257,16 @@ Six independent flags describe what may be sent or observed:
 
 | Field | Meaning |
 |---|---|
-| `adaptive_thinking` | The model accepts adaptive thinking configuration. |
-| `effort` | The model accepts `output_config.effort`. |
+| `adaptive_thinking` | The model reasons before answering. |
+| `effort` | The model accepts `reasoning: { effort }`. |
 | `prompt_caching` | Stable system/tool cache breakpoints may be sent. |
-| `mid_conversation_system` | Memory or findings may later use system-role placement. |
+| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. Gains its consumer in M2/M3, when memory blocks and critic findings are placed mid-conversation. |
 | `structured_output` | Strict schemas may be requested. |
 | `cache_metrics` | Cache creation/read usage is observable. |
 
-The core must degrade behavior based on capabilities rather than matching provider names.
+Core must degrade behavior based on capabilities rather than matching model names. Within a
+single provider this matters more, not less: model variance inside OpenRouter is wider than
+the cross-provider variance it replaced.
 
 ### Request and conversation types
 
@@ -269,33 +278,44 @@ conversation messages, and optional `Effort`.
 | Variant | Purpose |
 |---|---|
 | `Text` | Visible assistant or user text. |
-| `Thinking` | Complete summarized/omitted thinking plus opaque signature for replay. |
-| `RedactedThinking` | Opaque encrypted block that must be replayed unchanged. |
+| `Reasoning` | Ordered `ReasoningDetail` values, preserved exactly for replay. |
 | `ToolUse` | Tool ID, name, and parsed JSON input. |
 | `ToolResult` | Matching tool-use ID, content, and error flag. |
 
-Thinking blocks deserve special care. `ThinkingDelta` is display-facing, but complete
-`ThinkingBlockComplete` and `RedactedThinkingBlockComplete` events carry replay state. Core
+Reasoning blocks deserve special care. A `ReasoningDetail` keeps the model's original object
+verbatim in `raw`, alongside a `kind` discriminator (`reasoning.text`, `reasoning.summary`,
+`reasoning.encrypted`); `display_text()` extracts human-visible text where a block carries any,
+and returns `None` for encrypted blocks. A typed enum was rejected deliberately, because an
+unknown future `reasoning.*` type must round-trip rather than fail to parse.
+
+`ReasoningDelta` is display-facing, but `ReasoningDetails` events carry replay state. Core
 stores those complete blocks in the assistant message without rendering them. Reordering,
-editing, or dropping these blocks can invalidate an Anthropic tool continuation.
+editing, or dropping these blocks can invalidate a tool continuation: the provider requires
+the reasoning sequence to be returned unmodified and unreordered in `reasoning_details`.
+Lossless round-trip outranks ergonomic access here, which is why the raw object is kept.
 
 ### Streaming events
 
 `Event` normalizes provider output into:
 
-- visible thinking and text deltas;
-- complete thinking/redacted-thinking replay blocks;
-- tool start, input delta, and completion;
-- usage; and
-- a terminal `StopReason`.
+- `ReasoningDelta` and `TextDelta` display fragments;
+- `ReasoningDetails` replay blocks, which a frontend must not render;
+- `ToolUseStart`, `ToolUseInputDelta`, and `ToolUseComplete`;
+- `Usage`; and
+- a terminal `Stop(StopReason)`.
 
-`Usage` tracks input, output, cache-creation, and cache-read tokens. M0 parses it but does not
-yet aggregate or display cost; that belongs to M5.
+Stop reasons normalize as `stop` → `EndTurn`, `tool_calls` → `ToolUse`, `length` →
+`MaxTokens`, `content_filter` → `Refusal`, and anything else → `Other(String)`.
+
+`Usage` tracks input, output, reasoning, cached-input, and cache-write tokens plus an optional
+`cost` in real dollars reported by the provider. `cached_input_tokens` is the cache-hit signal.
+M0 parses usage but does not yet aggregate or display it; that belongs to M5, where the
+reported `cost` replaces a local price-table calculation.
 
 ### Core result types
 
 - `RunConfig` controls model, effort, token ceiling, round ceiling, and system prompt.
-- `OutputEvent` is the frontend-facing subset: thinking/text deltas and tool lifecycle.
+- `OutputEvent` is the frontend-facing subset: reasoning/text deltas and tool lifecycle.
 - `RunOutcome` reports the terminal reason, number of rounds, and accumulated visible text.
 - `LoopError` distinguishes provider failure, normalized protocol failure, and round limit.
 
@@ -326,38 +346,72 @@ and distinguishes outside-root, denied-secret, resolution, and custom-pattern fa
 `RequestEnvelope` currently models only `jsonrpc`, `id`, `method`, and `params`. Do not infer
 M1 method or notification stability from this placeholder.
 
-## 7. Anthropic transport details
+## 7. OpenRouter transport details
 
-`AnthropicProvider` uses raw `reqwest` because there is no official Rust SDK assumed by the
-project. Production requests use:
+`OpenRouterProvider` uses raw `reqwest` against OpenRouter's OpenAI-compatible surface, because
+there is no official Rust SDK assumed by the project. Production requests use:
 
-- `POST /v1/messages`;
-- `x-api-key` from `ANTHROPIC_API_KEY`;
-- `anthropic-version: 2023-06-01`; and
+- `POST {base}/chat/completions` with `stream: true`;
+- `Authorization: Bearer` carrying `OPENROUTER_API_KEY`; and
 - `Accept: text/event-stream`.
 
-The base URL is injectable through `ANTHROPIC_BASE_URL`, which is also how transport tests
-use a loopback mock server.
+The base URL defaults to `https://openrouter.ai/api/v1` and is injectable through
+`OPENROUTER_BASE_URL`, which is also how transport tests use a loopback mock server.
 
 ### Stable request construction
 
-Tool definitions are sorted before serialization. The final system block and final tool
-definition receive ephemeral cache controls when caching is supported. Adaptive models get
-`thinking: { type: "adaptive", display: "summarized" }`, plus configured effort. The client
-never constructs the removed `budget_tokens` field.
+- `system` blocks become leading `{ role: "system" }` messages.
+- Tool definitions become `[{ type: "function", function: { name, description, parameters } }]`,
+  sorted by name and serialized with stable key order.
+- `Effort` becomes `reasoning: { effort }`, and is omitted entirely when the model does not
+  declare effort support.
+- Assistant `ToolUse` becomes `tool_calls[{ id, type: "function", function: { name, arguments } }]`,
+  with `arguments` serialized to a string rather than an object.
+- Assistant `Reasoning` is replayed verbatim as `reasoning_details` on the assistant message.
+- A `cache_control` breakpoint is placed on the final system block, and only when the model
+  declares `prompt_caching`.
 
-Changing system bytes, tool order, JSON shape, thinking mode, or messages before a cache
-breakpoint can invalidate the prefix. Treat request serialization tests as behavioral tests,
-not snapshots that can be casually regenerated.
+Caching is model-dependent here rather than guaranteed by the transport, so an unsupported
+model must receive no breakpoint at all. Changing system bytes, tool order, JSON key order, or
+messages before a cache breakpoint can invalidate the prefix. Treat request serialization tests
+as behavioral tests, not snapshots that can be casually regenerated.
+
+### Tool results are one message each
+
+This is the one place where the normalized model and the wire genuinely differ, and it is not
+worth papering over. Anthropic returned every tool result inside a single user message;
+OpenAI-shaped APIs require one `{ role: "tool" }` message per result. The provider therefore
+fans a `ToolResult` batch out into consecutive tool messages, in the same order as the
+`tool_calls` that produced them.
+
+The invariant that actually mattered survives the change: a result batch is never split across
+turns, so every tool message belonging to one batch is emitted consecutively before the next
+assistant turn. A test asserts that ordering; it is the reason the model keeps issuing parallel
+tool calls.
 
 ### SSE parsing
 
-`SseDecoder` handles frames split across arbitrary network chunks, both LF and CRLF frame
-boundaries, comments, and multi-line data. `AnthropicEventParser` owns content-block state,
-incremental tool JSON, thinking signatures, usage, refusals, and stop reasons. Unknown future
-event types are ignored so compatible protocol additions do not terminate a session.
+`sse.rs` owns `SseDecoder`, which handles frames split across arbitrary network chunks, both LF
+and CRLF frame boundaries, comments, and multi-line data. It is transport-generic on purpose:
+it was salvaged from the deleted Anthropic transport and belongs to no single provider.
 
-Tool input is parsed with `serde_json`; never reconstruct JSON with string splitting.
+`openrouter.rs` owns chunk interpretation, and three details are worth knowing before debugging
+a stream:
+
+1. The terminal sentinel is `data: [DONE]`.
+2. OpenRouter emits `: OPENROUTER PROCESSING` comment keep-alives. They must be ignored, not
+   treated as frames — this is the likeliest source of a spurious protocol error.
+3. `delta.tool_calls[]` accumulate by array `index`, not by id. `id` and `function.name` arrive
+   on the first fragment for an index only, and `function.arguments` arrives as string fragments
+   that must be concatenated in order. This differs from a content-block-index model, and
+   confusing the two is the second likeliest bug.
+
+`usage` arrives on the final chunk before `[DONE]`, and `finish_reason` on the chunk before
+that. Unknown future fields and event types are ignored so compatible protocol additions do not
+terminate a session.
+
+Accumulated tool `arguments` are parsed with `serde_json`. Malformed accumulated JSON is an
+error, never a silent `{}`; never reconstruct JSON with string splitting.
 
 ## 8. Tool surface
 
@@ -423,9 +477,15 @@ not describe it as a sandbox.
 ### Output scrubber
 
 Every `ToolExecutor::execute` result—success or error—is scrubbed before returning to core.
-Current patterns cover Anthropic key prefixes, AWS access-key shapes, PEM blocks, and
-token/secret/password assignments. The same implementation is intended for future memory
-writes so transient leaks cannot become durable graph data.
+Current patterns cover Anthropic key prefixes (`sk-ant-`), OpenRouter key prefixes
+(`sk-or-v1-`), AWS access-key shapes, PEM blocks, and token/secret/password assignments. The
+same implementation is intended for future memory writes so transient leaks cannot become
+durable graph data.
+
+The Anthropic pattern stays even though Elefante no longer calls Anthropic. These are *secret*
+patterns, not provider dependencies: Anthropic keys still leak out of the repositories Elefante
+reads and edits, regardless of which API Elefante itself talks to. Adding a pattern is cheap;
+removing one costs a leak.
 
 The scrubber is defense in depth, not permission to weaken path or shell policy.
 
@@ -435,12 +495,15 @@ Configuration precedence and defaults:
 
 | Concern | Highest precedence | Environment fallback | Default |
 |---|---|---|---|
-| Model | `--model` | `ANTHROPIC_MODEL` | `claude-opus-5` |
+| Model | `--model` | `OPENROUTER_MODEL` | `anthropic/claude-opus-5` |
 | Effort | `--effort` | `ELEFANTE_EFFORT` | `high` |
 | Max rounds | `--max-rounds` | — | `24` |
 | Max tokens | `--max-tokens` | — | `16,384` |
-| API origin | — | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
-| API key | — | `ANTHROPIC_API_KEY` | required |
+| API origin | — | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| API key | — | `OPENROUTER_API_KEY` | required |
+
+Models are named by OpenRouter slug, not by vendor model name. The default routes to Claude
+through OpenRouter; a different vendor's model is a different slug, not a different transport.
 
 Prompt words after options are joined with spaces. `--` ends option parsing. If no prompt is
 provided, stdin is read to EOF. Empty input, invalid numbers, unknown effort, unknown options,
@@ -472,8 +535,10 @@ Test ownership follows behavior:
   redirections, known classifier limits, and scrub patterns.
 - `elefante-tools` tests strict schemas, exact editing, path enforcement at syscall boundaries,
   deterministic walks, bash non-execution, scrubbing, and cloned/concurrent executors.
-- `elefante-provider` tests deterministic request JSON, capabilities, arbitrary SSE chunking,
-  tool JSON, signed/redacted thinking replay, usage, refusals, and forward-compatible events.
+- `elefante-provider` tests deterministic request JSON, per-model capabilities, arbitrary SSE
+  chunking, `[DONE]` and keep-alive handling, `tool_calls` accumulation by index, malformed tool
+  JSON, verbatim `reasoning_details` replay, consecutive tool-result messages, usage including
+  cached-input tokens, refusals, and forward-compatible events.
 - `elefante-core/tests/loop.rs` uses a scripted provider to test a complete edit loop,
   parallel result pairing, refusal, and malformed/incomplete streams without network access.
 
@@ -483,13 +548,18 @@ local sockets, permit loopback binding rather than disabling the test.
 ### Credentialed provider check
 
 The live cache test is ignored by default because it uses network access and billable API
-requests. Run it explicitly with a model known to support the configured behavior:
+requests. Run it explicitly against a slug whose upstream supports prompt caching:
 
 ```sh
-export ANTHROPIC_API_KEY="..."
-export ANTHROPIC_TEST_MODEL="..."
+export OPENROUTER_API_KEY="..."
+export OPENROUTER_TEST_MODEL="anthropic/claude-opus-5"
 cargo test -p elefante-provider live_second_identical_request_reads_prompt_cache -- --ignored
 ```
+
+Caching is model-dependent under OpenRouter, so the check is only meaningful for a model that
+declares `prompt_caching`. It passes when the second identical request reports nonzero
+`cached_input_tokens`. The hermetic suite proves the *parsing* of that field; this gate proves
+the cache actually hit.
 
 Do not record M0 complete until this check reports a nonzero cache read on the second request
 and a live agent request lands a trivial, reviewed edit in this repository.
@@ -507,7 +577,7 @@ and a live agent request lands a trivial, reviewed edit in this repository.
 6. Return operational failures as `ToolResult { is_error: true, ... }`.
 7. Let the single executor exit path scrub the result.
 8. Add policy-boundary, error-pairing, deterministic-order, and schema tests.
-9. Confirm Anthropic request-order/cache tests remain green.
+9. Confirm the provider's request-order and cache-stability tests remain green.
 
 Do not expose a second tool executor or construct tool results in core to work around this
 flow. The single boundary is what makes “every result is scrubbed” auditable.
@@ -517,15 +587,18 @@ flow. The single boundary is what makes “every result is scrubbed” auditable
 1. Implement the normalized `Provider` trait.
 2. Resolve `Capabilities` per model when support varies.
 3. Send only fields the model declares.
-4. Normalize text, thinking, tools, usage, refusal, and stop behavior without leaking wire
+4. Normalize text, reasoning, tools, usage, refusal, and stop behavior without leaking wire
    types into core.
 5. Preserve any opaque replay blocks exactly and in order.
 6. Use a configurable endpoint and hermetic transport fixtures.
 7. Test malformed chunks, provider errors, refusal, tool-result continuation, and capability
    degradation.
 
-OpenRouter belongs to M4. Do not add it merely as an Anthropic fallback; the design treats
-providers as peers selected by role.
+OpenRouter is the only transport as of M0, and the `Provider` trait exists to keep wire types
+out of core rather than to host a second implementation. Prefer a different model slug to a
+second transport: OpenRouter already reaches other vendors' models, which is what lets
+adversarial review run on a different vendor without a second integration. Adding a transport
+is a milestone decision recorded in `PLAN.md`, not a fallback bolted onto the existing path.
 
 ### Changing the loop
 
@@ -533,9 +606,9 @@ Protect these invariants with regression tests first:
 
 - one live turn per invocation;
 - at most one assistant history message per provider response;
-- complete opaque thinking blocks retained in order;
+- reasoning blocks retained verbatim and in order;
 - every tool call receives one matching result;
-- all parallel results returned in one user message;
+- all parallel results returned together, before the next assistant turn;
 - refusal dispatches no unfinished tools; and
 - the round cap terminates rather than spinning.
 
@@ -569,7 +642,7 @@ When behavior changes, update:
 - Usage is parsed but not accumulated into cost/staleness reporting until M5.
 - There is no daemon, socket, session registry, reconnect, interrupt, or multi-client support.
 - There is no OpenTUI client.
-- There is no OpenRouter provider or model-backed critic.
+- There is no model-backed critic.
 - The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
   time-of-check/time-of-use filesystem races.
 
@@ -578,7 +651,7 @@ and gate rather than hiding partial versions behind existing APIs.
 
 ## 15. Troubleshooting
 
-### `ANTHROPIC_API_KEY is not set`
+### `OPENROUTER_API_KEY is not set`
 
 Export the key into the process environment. Do not create a repository `.env`; it is ignored
 by Git and denied by Elefante's own path policy.
@@ -600,5 +673,7 @@ This is expected M0 behavior. Repository inspection currently uses `read`, `glob
 
 ### Provider stream ends with a protocol error
 
-Start with the provider fixture tests. Check SSE framing, terminal stop events, tool block
-completion, and exact thinking-signature replay before changing core validation.
+Start with the provider fixture tests. Check SSE framing, `: OPENROUTER PROCESSING`
+keep-alives being mistaken for frames, `tool_calls` fragments accumulated by the wrong key, the
+`[DONE]` sentinel, terminal stop events, and verbatim `reasoning_details` replay before changing
+core validation.

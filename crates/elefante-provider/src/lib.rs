@@ -1,9 +1,11 @@
 //! Provider-neutral request and streaming response types.
 //!
 //! Provider wire formats stay behind [`Provider`], so the agent loop only has
-//! to understand one message model and one event stream.
+//! to understand one message model and one event stream. The crate ships a
+//! single transport, [`OpenRouterProvider`].
 
-pub mod anthropic;
+pub mod openrouter;
+pub mod sse;
 
 use std::fmt;
 
@@ -11,6 +13,8 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+pub use openrouter::OpenRouterProvider;
 
 /// Features that may vary by provider and model.
 // Booleans are intentional independent capability axes, not exclusive states.
@@ -142,20 +146,59 @@ impl Message {
     }
 }
 
+/// One reasoning block, preserved exactly as the model produced it.
+///
+/// The replay rule is strict: the sequence of reasoning blocks must be returned
+/// unmodified and unreordered. Lossless round-tripping therefore outranks
+/// ergonomic access, so the original object is kept verbatim in [`Self::raw`].
+/// A typed enum was rejected because unknown future `reasoning.*` kinds would
+/// fail to round-trip, silently violating the replay rule rather than erroring.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningDetail {
+    /// Wire discriminator: `reasoning.text`, `reasoning.summary`, or `reasoning.encrypted`.
+    pub kind: String,
+    /// The complete original object. Replayed unmodified; never edited or reordered.
+    pub raw: Value,
+}
+
+impl ReasoningDetail {
+    /// Wraps a wire object, reading its `type` field as the discriminator.
+    #[must_use]
+    pub fn new(raw: Value) -> Self {
+        Self {
+            kind: raw
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            raw,
+        }
+    }
+
+    /// Human-visible text, if this block carries any.
+    ///
+    /// Reads `.text` or `.summary`; encrypted blocks carry neither and return `None`.
+    #[must_use]
+    pub fn display_text(&self) -> Option<&str> {
+        self.raw
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| self.raw.get("summary").and_then(Value::as_str))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
     },
-    /// A complete Anthropic thinking block retained for exact conversation replay.
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
-    /// An opaque encrypted thinking block retained for exact conversation replay.
-    RedactedThinking {
-        data: String,
+    /// Reasoning retained for exact conversation replay.
+    ///
+    /// Ordering within an assistant turn is significant: the blocks are replayed
+    /// in the order the model produced them.
+    Reasoning {
+        details: Vec<ReasoningDetail>,
     },
     ToolUse {
         id: String,
@@ -171,16 +214,10 @@ pub enum ContentBlock {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    ThinkingDelta(String),
+    /// Renderable reasoning fragments.
+    ReasoningDelta(String),
     /// Delivers replay state to the loop; frontends must not render this event.
-    ThinkingBlockComplete {
-        thinking: String,
-        signature: String,
-    },
-    /// Delivers opaque replay state to the loop; frontends must not render this event.
-    RedactedThinkingBlockComplete {
-        data: String,
-    },
+    ReasoningDetails(Vec<ReasoningDetail>),
     TextDelta(String),
     ToolUseStart {
         id: String,
@@ -195,18 +232,43 @@ pub enum Event {
     Stop(StopReason),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
+    /// `prompt_tokens`.
     pub input_tokens: u64,
+    /// `completion_tokens`.
     pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
+    /// `completion_tokens_details.reasoning_tokens`.
+    pub reasoning_tokens: u64,
+    /// `prompt_tokens_details.cached_tokens` — the cache-hit signal.
+    pub cached_input_tokens: u64,
+    /// `cache_write_tokens`.
+    pub cache_write_tokens: u64,
+    /// Real dollars, reported by the provider rather than derived from a price table.
+    pub cost: Option<f64>,
 }
 
 impl Usage {
     #[must_use]
     pub fn is_empty(self) -> bool {
         self == Self::default()
+    }
+
+    /// Fold another report into this one.
+    ///
+    /// Usage arrives per-round and, on `OpenRouter`, only after the stop event, so a
+    /// whole-run total is a sum rather than a single terminal reading. `cost` stays
+    /// `None` until at least one report carries it, so "not reported" and "reported
+    /// as zero" remain distinguishable.
+    pub fn accumulate(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        if let Some(cost) = other.cost {
+            *self.cost.get_or_insert(0.0) += cost;
+        }
     }
 }
 

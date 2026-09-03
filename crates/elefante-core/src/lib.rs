@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use elefante_provider::{
-    ContentBlock, Effort, Event, Message, ModelId, Provider, ProviderError, Request, Role,
-    StopReason, ToolDefinition,
+    ContentBlock, Effort, Event, Message, ModelId, Provider, ProviderError, ReasoningDetail,
+    Request, Role, StopReason, ToolDefinition, Usage,
 };
 use elefante_tools::{ToolExecutor, ToolResult, definitions as tool_definitions};
 use futures_util::{StreamExt, future::join_all};
@@ -38,9 +38,16 @@ impl RunConfig {
 }
 
 /// Observable loop output. Frontends decide how each event is rendered.
+///
+/// Only renderable output appears here. Reasoning replay state
+/// ([`Event::ReasoningDetails`]) is accumulated into the assistant message so
+/// the next request can return it unmodified, and is deliberately never
+/// surfaced as an [`OutputEvent`]: replaying it is a protocol obligation,
+/// displaying it is not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputEvent {
-    ThinkingDelta(String),
+    /// A display fragment of the model's reasoning. Safe to render.
+    ReasoningDelta(String),
     TextDelta(String),
     ToolStarted {
         id: String,
@@ -58,6 +65,12 @@ pub struct RunOutcome {
     pub stop_reason: StopReason,
     pub rounds: usize,
     pub text: String,
+    /// Token and cost totals summed across every round of the run.
+    ///
+    /// The provider reports usage on its own schedule — for `OpenRouter`, after the
+    /// stop event — so this is accumulated by draining each stream to completion
+    /// rather than by reading a single terminal event.
+    pub usage: Usage,
 }
 
 #[derive(Debug, Error)]
@@ -105,15 +118,17 @@ impl RoundAccumulator {
         }
     }
 
-    fn push_thinking(&mut self, thinking: String, signature: String) {
-        self.blocks.push(ContentBlock::Thinking {
-            thinking,
-            signature,
-        });
-    }
-
-    fn push_redacted_thinking(&mut self, data: String) {
-        self.blocks.push(ContentBlock::RedactedThinking { data });
+    /// Records reasoning replay state on the assistant turn.
+    ///
+    /// The blocks are stored verbatim and in arrival order: the provider
+    /// requires them back unmodified and unreordered. Adjacent batches are
+    /// appended to the open reasoning block so a single assistant turn keeps
+    /// one contiguous run, which preserves order either way.
+    fn push_reasoning(&mut self, details: Vec<ReasoningDetail>) {
+        match self.blocks.last_mut() {
+            Some(ContentBlock::Reasoning { details: existing }) => existing.extend(details),
+            _ => self.blocks.push(ContentBlock::Reasoning { details }),
+        }
     }
 
     fn start_tool(&mut self, id: String, name: String) -> Result<(), LoopError> {
@@ -190,6 +205,7 @@ struct CompletedRound {
     calls: Vec<ToolCall>,
     text: String,
     stop_reason: StopReason,
+    usage: Usage,
 }
 
 /// Run a bounded provider/tool conversation from one user prompt.
@@ -219,6 +235,7 @@ where
     }];
     let definitions = provider_tool_definitions();
     let mut full_text = String::new();
+    let mut run_usage = Usage::default();
 
     for round_index in 0..config.max_rounds {
         let request = Request {
@@ -231,12 +248,14 @@ where
         };
         let completed = receive_round(provider, request, &mut emit).await?;
         full_text.push_str(&completed.text);
+        run_usage.accumulate(completed.usage);
 
         if completed.stop_reason == StopReason::Refusal {
             return Ok(RunOutcome {
                 stop_reason: completed.stop_reason,
                 rounds: round_index + 1,
                 text: full_text,
+                usage: run_usage,
             });
         }
 
@@ -252,6 +271,7 @@ where
                 stop_reason: completed.stop_reason,
                 rounds: round_index + 1,
                 text: full_text,
+                usage: run_usage,
             });
         }
         if completed.calls.is_empty() {
@@ -296,17 +316,13 @@ where
     let mut stream = provider.stream(request);
     let mut accumulator = RoundAccumulator::new();
     let mut stop_reason = None;
+    let mut round_usage = Usage::default();
 
     while let Some(event) = stream.next().await {
         match event? {
-            Event::ThinkingDelta(delta) => emit(OutputEvent::ThinkingDelta(delta)),
-            Event::ThinkingBlockComplete {
-                thinking,
-                signature,
-            } => accumulator.push_thinking(thinking, signature),
-            Event::RedactedThinkingBlockComplete { data } => {
-                accumulator.push_redacted_thinking(data);
-            }
+            Event::ReasoningDelta(delta) => emit(OutputEvent::ReasoningDelta(delta)),
+            // Replay state, not display: accumulated for the next request, never emitted.
+            Event::ReasoningDetails(details) => accumulator.push_reasoning(details),
             Event::TextDelta(delta) => {
                 emit(OutputEvent::TextDelta(delta.clone()));
                 accumulator.push_text(delta);
@@ -327,7 +343,7 @@ where
                 accumulator.push_tool_input(&id, &delta);
             }
             Event::ToolUseComplete { id, input } => accumulator.complete_tool(&id, input)?,
-            Event::Usage(_) => {}
+            Event::Usage(usage) => round_usage.accumulate(usage),
             Event::Stop(reason) => {
                 if stop_reason.replace(reason).is_some() {
                     return Err(LoopError::Protocol(
@@ -346,6 +362,7 @@ where
             calls: Vec::new(),
             text: String::new(),
             stop_reason,
+            usage: round_usage,
         });
     }
     let (assistant_content, calls, text) = accumulator.finish()?;
@@ -354,6 +371,7 @@ where
         calls,
         text,
         stop_reason,
+        usage: round_usage,
     })
 }
 

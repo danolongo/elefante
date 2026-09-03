@@ -5,11 +5,37 @@ use std::{
 
 use elefante_core::{LoopError, OutputEvent, RunConfig, run_agent_loop};
 use elefante_provider::{
-    Capabilities, ContentBlock, Event, ModelId, Provider, ProviderError, Request, StopReason,
+    Capabilities, ContentBlock, Event, ModelId, Provider, ProviderError, ReasoningDetail, Request,
+    StopReason, Usage,
 };
 use elefante_tools::ToolExecutor;
 use futures_util::{StreamExt, stream};
 use serde_json::json;
+
+/// The exact reasoning blocks the scripted provider emits. The provider
+/// requires this sequence back unmodified and unreordered, so the same value
+/// is used to script the stream and to assert what the next request carries.
+fn scripted_reasoning() -> Vec<ReasoningDetail> {
+    vec![
+        ReasoningDetail {
+            kind: "reasoning.text".to_owned(),
+            raw: json!({
+                "type": "reasoning.text",
+                "text": "focused edit summary",
+                "signature": "opaque-signature",
+                "index": 0,
+            }),
+        },
+        ReasoningDetail {
+            kind: "reasoning.encrypted".to_owned(),
+            raw: json!({
+                "type": "reasoning.encrypted",
+                "data": "opaque-redacted-payload",
+                "index": 1,
+            }),
+        },
+    ]
+}
 
 struct ScriptedProvider {
     rounds: Mutex<VecDeque<Vec<Event>>>,
@@ -59,11 +85,8 @@ impl Provider for ScriptedProvider {
 fn scripted_edit_rounds() -> Vec<Vec<Event>> {
     vec![
         vec![
-            Event::ThinkingDelta("I will make the focused edit.".to_owned()),
-            Event::ThinkingBlockComplete {
-                thinking: "focused edit summary".to_owned(),
-                signature: "opaque-signature".to_owned(),
-            },
+            Event::ReasoningDelta("I will make the focused edit.".to_owned()),
+            Event::ReasoningDetails(scripted_reasoning()),
             Event::ToolUseStart {
                 id: "edit-1".to_owned(),
                 name: "edit".to_owned(),
@@ -116,8 +139,16 @@ async fn scripted_provider_edits_repo_and_pairs_all_parallel_results() {
     assert_eq!(outcome.stop_reason, StopReason::EndTurn);
     assert_eq!(outcome.text, "Done.");
     assert!(output.iter().any(
-        |event| matches!(event, OutputEvent::ThinkingDelta(text) if text.contains("focused"))
+        |event| matches!(event, OutputEvent::ReasoningDelta(text) if text.contains("focused"))
     ));
+    assert_eq!(
+        output
+            .iter()
+            .filter(|event| matches!(event, OutputEvent::ReasoningDelta(_)))
+            .count(),
+        1,
+        "replay-only reasoning details must never reach the renderer"
+    );
     assert!(
         output
             .iter()
@@ -139,13 +170,14 @@ async fn scripted_provider_edits_repo_and_pairs_all_parallel_results() {
     assert_eq!(result_messages.len(), 1, "all results share one message");
     assert_eq!(result_messages[0].content.len(), 2);
     let assistant_message = &requests[1].messages[1];
-    assert!(matches!(
-        &assistant_message.content[0],
-        ContentBlock::Thinking {
-            thinking,
-            signature,
-        } if thinking == "focused edit summary" && signature == "opaque-signature"
-    ));
+    let ContentBlock::Reasoning { details } = &assistant_message.content[0] else {
+        panic!("reasoning must lead the replayed assistant turn");
+    };
+    assert_eq!(
+        details,
+        &scripted_reasoning(),
+        "reasoning blocks must replay unmodified and unreordered"
+    );
     assert!(matches!(
         &assistant_message.content[1],
         ContentBlock::ToolUse { id, .. } if id == "edit-1"
@@ -231,4 +263,70 @@ async fn stream_without_stop_is_a_protocol_error() {
     .await;
 
     assert!(matches!(result, Err(LoopError::Protocol(_))));
+}
+
+#[tokio::test]
+async fn usage_is_summed_across_rounds_and_survives_arriving_after_stop() {
+    let repository = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repository.path()).unwrap();
+
+    // OpenRouter reports usage on the chunk *after* finish_reason, so each round
+    // here places Usage behind Stop. A loop that stopped draining at Stop would
+    // silently report zero tokens and no cost.
+    let (provider, _) = ScriptedProvider::new(vec![vec![
+        Event::TextDelta("first".to_owned()),
+        Event::Stop(StopReason::EndTurn),
+        Event::Usage(Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            reasoning_tokens: 4,
+            cached_input_tokens: 60,
+            cache_write_tokens: 40,
+            cost: Some(0.25),
+        }),
+    ]]);
+
+    let outcome = run_agent_loop(
+        &provider,
+        &executor,
+        "Prompt",
+        RunConfig::new("scripted-model"),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.usage.input_tokens, 100);
+    assert_eq!(outcome.usage.cached_input_tokens, 60);
+    assert_eq!(outcome.usage.reasoning_tokens, 4);
+    assert_eq!(outcome.usage.cost, Some(0.25));
+}
+
+#[test]
+fn usage_accumulate_sums_tokens_and_keeps_unreported_cost_distinct_from_zero() {
+    let mut total = Usage::default();
+    assert_eq!(total.cost, None);
+
+    // A report with no cost must not invent one: "not reported" and "reported as
+    // zero" are different facts, and M5 attribution depends on telling them apart.
+    total.accumulate(Usage {
+        input_tokens: 10,
+        cached_input_tokens: 5,
+        ..Usage::default()
+    });
+    assert_eq!(total.input_tokens, 10);
+    assert_eq!(total.cost, None);
+
+    total.accumulate(Usage {
+        input_tokens: 7,
+        cost: Some(0.5),
+        ..Usage::default()
+    });
+    total.accumulate(Usage {
+        cost: Some(0.25),
+        ..Usage::default()
+    });
+    assert_eq!(total.input_tokens, 17);
+    assert_eq!(total.cached_input_tokens, 5);
+    assert_eq!(total.cost, Some(0.75));
 }

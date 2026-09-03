@@ -37,7 +37,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. Pluggable vector slot left open. |
 | Storage | User graph in `~/.elefante`, project graph in `<repo>/.elefante/`, all gitignored | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |
-| Providers | Anthropic and OpenRouter, as peers | Neither is privileged, neither is a fallback for the other. The trait reports `Capabilities` and the core degrades features rather than erroring. |
+| Provider | OpenRouter only | One transport, one auth, one code path. Reaching Claude via `anthropic/claude-opus-5` means this narrows the *code*, not the *models*. `Capabilities` survives and matters more, now resolved per model. |
 | Staleness detection | Deterministic metrics, **not** a `"working"` sentinel token | See "Rejected: response sentinel". |
 
 ---
@@ -51,7 +51,7 @@ elefante/
   docs/MILESTONES.md         # per-milestone completion record
   crates/
     elefante-rpc/            # wire types shared by daemon and client (no deps on others)
-    elefante-provider/       # Provider trait + Capabilities; anthropic, openrouter
+    elefante-provider/       # Provider trait + Capabilities; sse decoder, openrouter
     elefante-guard/          # PathPolicy, BashClassifier, Scrubber, Critic
     elefante-tools/          # read, write, edit, glob, grep, bash, memory_search
     elefante-mem/            # graph store, indexer, retrieval, cache
@@ -77,9 +77,23 @@ Key crates: `tokio 1.53`, `reqwest 0.13`, `rusqlite 0.40` (bundled + FTS5), `tre
 
 ---
 
-## Providers
+## Provider
 
-Two peers. Neither is the "real" one. The user selects per role. Feature surfaces differ, so the trait reports capabilities and the core adapts:
+One transport: **OpenRouter**. OpenAI-compatible `/chat/completions`, SSE, single key,
+base `https://openrouter.ai/api/v1`.
+
+Two impls doubled the transport surface of a harness whose value is elsewhere — memory,
+guard, critics. Since OpenRouter reaches Claude anyway (`anthropic/claude-opus-5`), dropping
+the Anthropic impl narrows the *code*, not the *models*. Adversarial review still runs on a
+different vendor's model; it just no longer needs a second integration to do it.
+
+**What is given up**, recorded so it is not rediscovered later: Anthropic-native request
+shapes (`output_config.effort`, `thinking.display`, native `cache_control` placement for
+non-Anthropic upstreams), and a proxy hop on every request. Cache behaviour becomes
+model-dependent rather than guaranteed.
+
+**What survives:** reasoning control, verbatim reasoning replay, prompt caching with real
+hit metrics, structured outputs, parallel tool calls.
 
 ```rust
 struct Capabilities {
@@ -93,37 +107,45 @@ trait Provider: Send + Sync {
 }
 ```
 
-Capability differences are **descriptive, not a ranking**. The core degrades on every axis: no cache breakpoints when `prompt_caching` is false; memory injected as a normal user-turn block when `mid_conversation_system` is false; findings parsed leniently when `structured_output` is false. A provider is never sent a field it does not declare.
+`Capabilities` survives the collapse to one provider and **matters more, not less**: within
+OpenRouter, per-model variance is larger than the old cross-provider variance was. Resolution
+is prefix matching on the model slug, defaulting to all-false for unrecognised slugs — an
+unknown model must never silently receive fields it cannot handle.
 
-| | Anthropic | OpenRouter |
-|---|---|---|
-| Transport | `POST /v1/messages`, SSE | OpenAI-compatible `/chat/completions`, SSE |
-| Model reach | Claude family | 100s across vendors |
-| Credentials | `x-api-key` | single key |
-| Thinking / effort | full | varies by upstream model |
-| Caching + metrics | full | partial, model-dependent |
+Degradation stays at the *mapping* boundary inside the impl, so `elefante-core` never learns
+provider shape. `Capabilities` gains core-side callers later, where the branch is genuinely
+core's: `mid_conversation_system` for memory placement (M2/M3) and `structured_output` for
+critic findings (M4).
 
-### Anthropic
+### Wire facts that constrain the design
 
-Rust has no official Anthropic SDK, so this is raw HTTP (`reqwest` + SSE) against `POST /v1/messages`, headers `x-api-key` + `anthropic-version: 2023-06-01`. API facts that constrain the design:
+- **Reasoning** — request `reasoning: {effort}` maps 1:1 onto the internal `Effort` enum
+  (`low|medium|high|xhigh|max`). Responses carry `reasoning_details[]` in three shapes
+  (`reasoning.text`, `reasoning.summary`, `reasoning.encrypted`).
+- **Reasoning replay is strict.** The sequence of reasoning blocks must be returned
+  unmodified and unreordered. Blocks are therefore stored verbatim as opaque JSON rather
+  than parsed into typed variants — an unknown future `reasoning.*` type must round-trip,
+  and a typed enum would silently violate the rule instead of erroring.
+- **Caching** — `cache_control` breakpoints on Anthropic/Vertex/Azure/Bedrock upstreams.
+  Hits verified with `usage.prompt_tokens_details.cached_tokens`; writes with
+  `cache_write_tokens`.
+- **Cost is reported directly** as `usage.cost`, so M5 attribution stops being a price-table
+  calculation.
+- **Tool calls** stream as `delta.tool_calls[]` accumulating by **array index** — `id` and
+  `function.name` on the first fragment only, `function.arguments` as string fragments.
+- **Structured outputs** via `response_format: {type: "json_schema", json_schema: {...}}`.
+- `: OPENROUTER PROCESSING` comment keep-alives must be ignored, and `data: [DONE]`
+  terminates the stream.
 
-- **Thinking budgets are removed.** `{type: "enabled", budget_tokens: N}` returns **400** on Opus 5 / Sonnet 5 / Opus 4.8 / 4.7. Use `thinking: {type: "adaptive"}` + `output_config: {effort: "low"|"medium"|"high"|"xhigh"|"max"}`. Effort is the per-turn depth knob.
-- **`thinking.display` defaults to `"omitted"` on Opus 5.** Send `display: "summarized"` or reasoning never streams and the TUI shows a long silent pause.
-- **Mid-conversation system messages** — append `{"role": "system", ...}` to `messages[]` (Opus 5 / Opus 4.8; **not** Sonnet 5). The correct channel for injecting memory and critic findings **without invalidating the cached prefix**, and prompt-injection-safe. Must follow a `user` message and be last or followed by an `assistant` turn.
-- **Prompt caching** renders `tools` → `system` → `messages`; any byte change invalidates everything after. Max 4 breakpoints. Verify with `usage.cache_read_input_tokens`.
-- **Structured outputs** via `output_config: {format: {...}}`; `strict: true` on tools requires `additionalProperties: false` + `required`.
-- **No assistant prefill** on Opus 5 (400). **`stop_reason: "refusal"`** must be checked before reading `content`.
-- Streaming required for large `max_tokens`. Parse tool inputs with a real JSON parser — escaping varies.
-
-### OpenRouter
-
-OpenAI-compatible `/chat/completions`, SSE, single key. Broadest reach and the simpler impl. Caveats are honest rather than disqualifying: no Anthropic-native cache breakpoints or hit metrics, and thinking/effort varies by upstream model — so `Capabilities` is resolved **per model** here, not per provider.
-
-Tool-call semantics differ (`tool_calls` with stringified JSON arguments vs. `tool_use` blocks with parsed input). The provider crate normalizes both onto one internal message/tool type so neither wire format leaks into `elefante-core`.
+Full request/response contract: [`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md).
 
 ### Role configuration
 
-Roles are provider-agnostic and configured, not hardcoded — **author**, **critic**, **bash triage** each name a `(provider, model, effort)` triple in `~/.elefante/config.toml`, overridable per project. Starting config: author = Opus 5 @ `xhigh`; critic = a *different vendor's* model (this is what makes review adversarial rather than self-agreeing); triage = anything cheap and fast. Anthropic reference pricing per 1M in/out: `claude-opus-5` $5/$25 (1M ctx) · `claude-sonnet-5` $2/$10 (1M) · `claude-haiku-4-5` $1/$5 (200K).
+Roles are provider-agnostic and configured, not hardcoded — **author**, **critic**, **bash triage** each name a `(provider, model, effort)` triple in `~/.elefante/config.toml`, overridable per project.
+
+With one provider a role is just `(model, effort)`. M0 ships only `OPENROUTER_MODEL` + `ELEFANTE_EFFORT`; the `config.toml` role table arrives when a second role actually exists — the bash triage critic in M4. Building it in M0 would be configuration with one consumer.
+
+Starting config: author = `anthropic/claude-opus-5` @ `xhigh`; critic = a *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage = anything cheap and fast. Per-model pricing no longer needs a local table — `usage.cost` comes back on every response.
 
 ---
 
@@ -198,19 +220,21 @@ core::assemble_context(user_msg, open_files, budget) →
 - `mid_conversation_system: true` → memory appended as `{"role": "system"}` in `messages[]`. **The cached prefix survives.**
 - `false` → memory prepended to the user turn's content. Correct, just less cache-efficient.
 
-**4. Request construction** (`core` → `provider`) — `core` builds a provider-agnostic `Request { system, tools, messages, role }`. The provider maps it to wire format, applying only capabilities it declares, and places cache breakpoints itself (Anthropic: end of system, end of tool list). `core` never writes provider-specific fields.
+**4. Request construction** (`core` → `provider`) — `core` builds a provider-agnostic `Request { system, tools, messages, role }`. The provider maps it to wire format, applying only capabilities it declares, and places cache breakpoints itself (end of the system block, when the resolved model declares `prompt_caching`). `core` never writes provider-specific fields.
 
 **5. Stream** — provider yields a normalized `Event`:
 
 ```rust
 enum Event {
-    ThinkingDelta(String), TextDelta(String),
+    ReasoningDelta(String),                  // renderable
+    ReasoningDetails(Vec<ReasoningDetail>),  // replay state; never rendered
+    TextDelta(String),
     ToolUseStart { id, name }, ToolUseInputDelta(String), ToolUseComplete { id, input: Value },
     Usage(Usage), Stop(StopReason),
 }
 ```
 
-`core` forwards each as an RPC notification *and* accumulates the assistant message. Two consumers, one pass.
+`core` forwards each as an RPC notification *and* accumulates the assistant message. Two consumers, one pass. The split between renderable reasoning deltas and non-renderable replay state is load-bearing: replay blocks must be echoed back verbatim on the next request, and a frontend that renders them would invite a user to think they are ordinary output.
 
 **6. Tool dispatch** on `stop_reason == tool_use` — the most interaction-dense step:
 
@@ -227,7 +251,7 @@ for each tool_use block  ──►  guard::check(&call) ──┬─► Allow   
 
 Three details that are easy to get wrong and expensive to fix later:
 
-- **All results must return in a single user message.** Splitting them across messages trains the model out of parallel tool calls.
+- **All results must be emitted consecutively, before the next assistant turn.** OpenAI-shaped APIs need one `{role:"tool"}` message per result, so a batch is several messages rather than one — but it must never be split across turns, which trains the model out of parallel tool calls. Order must match the `tool_calls` that produced them.
 - **A failed tool still returns a result** with `is_error: true`. Dropping it desynchronizes `tool_use_id` pairing and the next request 400s.
 - **`guard::scrub` runs on every result**, including denials and errors — it is the layer that catches what the path policy cannot.
 
@@ -364,7 +388,7 @@ Lives in `core`, fed by turn observations, emitted as `session.stale`:
 | Signal | Why it matters |
 |---|---|
 | `input_tokens / context_window` | the blunt one |
-| `cache_read_input_tokens / input_tokens` | a collapsing hit rate means a silent invalidator |
+| `cached_input_tokens / input_tokens` | a collapsing hit rate means a silent invalidator |
 | turns since compaction | |
 | **repeated reads of a file already in context** | the earliest real signal — the model has lost track of what it knows |
 | tool error rate, edit retry rate | degradation shows here before it shows in prose |
@@ -388,13 +412,26 @@ Each has a **Baseline** (what must exist) and a **Gate** (what must pass before 
 
 ### M0 — Loop
 
-**Baseline.** Workspace skeleton. `Provider` trait + `Capabilities` + Anthropic impl (SSE, adaptive thinking, effort, caching, refusal handling). Agent loop with the seven tools, plain stdout, no TUI. **`PathPolicy` and the deterministic half of the bash classifier ship here** — an ungated bash tool should never exist, even in a prototype.
+**Baseline.** Workspace skeleton. `Provider` trait + `Capabilities` + a single OpenRouter impl (OpenAI-compatible SSE, per-model capability resolution, `reasoning` control and verbatim replay, `tool_calls` normalization, prompt caching where the upstream supports it). Transport-generic SSE decoder in its own module. Agent loop with the seven tools, plain stdout, no TUI. **`PathPolicy` and the deterministic half of the bash classifier ship here** — an ungated bash tool should never exist, even in a prototype.
+
+*The Anthropic impl was written first and then removed* — see [`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md) for the patch and the frozen type contract. Doing this inside M0 rather than later matters because **M1 puts the neutral types on the RPC wire**; changing them after M1 would mean revising a published protocol instead of a private enum.
+
+The decision it forced, now settled: reasoning blocks are stored **verbatim as opaque JSON** (`ReasoningDetail { kind, raw }`), not parsed into typed variants. OpenRouter's replay rule requires the block sequence to return unmodified and unreordered, so an unknown future `reasoning.*` type must round-trip — a typed enum would silently violate the rule rather than erroring.
 
 **Gate.**
 - Bash classifier fixture table: commands → expected `Allow`/`Deny`/`Escalate`, including compound commands (`ls && rm -rf /` must classify as the `rm`), pipes, subshells, and command substitution. Includes obfuscation cases asserted as **known-not-caught**, so the test documents the limit rather than implying coverage.
 - `PathPolicy` canonicalization: `./x/../.env`, a symlink pointing at `.env`, `.env.local`, and a grep whose *pattern* would match secret content — all denied.
 - Secret fixture: an `.env` containing an `sk-ant-`-shaped string. Read, glob, and grep all deny; `cat .env` is gated; the scrubber redacts it from a bash result that reaches it another way.
-- Provider: `usage.cache_read_input_tokens > 0` on the second request of a session (zero means a silent invalidator). No request ever constructs `budget_tokens`. `display: "summarized"` yields non-empty thinking deltas.
+- Cache: `usage.prompt_tokens_details.cached_tokens > 0` on the second identical request of a session — zero means a silent invalidator. Hermetic fixture proves parsing; the live check stays credentialed and separate.
+- Requests carry name-sorted tools with stable key order — an unsorted tool list silently invalidates the cache every turn, which is exactly the bug this catches.
+- A model that does not declare reasoning support receives no `reasoning` field at all.
+- Streaming edge cases: frames split mid-boundary, mixed line endings, `: OPENROUTER PROCESSING` keep-alives ignored, `data: [DONE]` terminates, unknown future event types ignored.
+- `delta.tool_calls[]` accumulate by **array index** — `id`/`name` on the first fragment only, `arguments` concatenated then parsed. Malformed accumulated JSON is a hard error, never a silent `{}`.
+- `reasoning_details` round-trips byte-identical through a tool continuation.
+- Two parallel `tool_calls` produce two consecutive `{role:"tool"}` messages in call order.
+- An unrecognised model slug yields all-false capabilities and a request carrying no `reasoning` field.
+- No request carries a field the resolved model does not declare — no `reasoning`, no `cache_control`.
+- A missing `OPENROUTER_API_KEY` produces a named, graceful error rather than a transport failure.
 - End-to-end: run against this repo, request a trivial edit, confirm the tool loop completes and the edit lands.
 
 ### M1 — Daemon + TUI
@@ -432,23 +469,24 @@ Each has a **Baseline** (what must exist) and a **Gate** (what must pass before 
 - Compact a long transcript, then assert a fact from the dropped region is still retrievable from the graph.
 - **M0–M2 gates still green.**
 
-### M4 — Critics + OpenRouter
+### M4 — Critics
 
-**Baseline.** `Critic` trait; bash escalation; plan and diff critics with structured findings; bounded revision loop; findings → memory. OpenRouter impl lands here, since running a critic on a different vendor's model is its first real consumer.
+**Baseline.** `Critic` trait; bash escalation; plan and diff critics with structured findings; bounded revision loop; findings → memory. A critic runs on a different vendor's model by changing a slug — no second integration — so this milestone is single-concern.
 
 **Gate.**
 - Seed a diff with a known defect: the diff critic returns a `Finding` citing the correct file, and the revision loop terminates at the round cap rather than spiraling.
-- The *same* critic request through both providers returns schema-valid findings — the real test that capability degradation works rather than that one provider is privileged.
-- No provider receives a field it does not declare (nothing Anthropic-only reaches OpenRouter unless the resolved model declares support).
-- Absent provider key produces a named, graceful error — either provider is optional.
+- The *same* critic request returns schema-valid findings on a model that declares `structured_output` and on one that does not — proving lenient parsing actually degrades rather than erroring.
+- Findings the user accepts or rejects reach the graph as nodes.
 - **M0–M3 gates still green.**
 
 ### M5 — Token analysis
 
-**Baseline.** Per-turn accounting from `usage`, cache-hit reporting, standing prompt overhead, staleness signals, cost attribution by role.
+**Baseline.** Per-turn accounting from `usage`, cache-hit reporting, standing prompt overhead, staleness signals, cost attribution by role. Cost comes from `usage.cost` on each response rather than a local price table — the provider reports what the generation actually cost, including cache discounts, so there is no table to keep current.
 
 **Gate.**
-- Reported cost matches a hand-computed figure from recorded `usage` for a scripted session.
+- Reported session cost equals the sum of per-response `usage.cost` for a scripted session against recorded fixtures.
+- Cache reporting distinguishes `cached_input_tokens` (reads) from `cache_write_tokens` (writes); a session with zero reads across repeated identical prefixes is surfaced as a warning, not silently.
+- `reasoning_tokens` are attributed separately from `output_tokens`, so effort changes are visible in the accounting.
 - Standing system-prompt overhead is reported and is **under the ~400-token target** — the number that makes conviction #1 enforced rather than aspirational.
 - Staleness signals fire on a synthetic session built to trigger each one.
 - **M0–M4 gates still green.**
@@ -460,7 +498,7 @@ Each has a **Baseline** (what must exist) and a **Gate** (what must pass before 
 Noted now so the architecture accommodates them, not built yet:
 
 - **tmux subagent execution and nested sessions** — the daemon is already the shared backend; subagents become additional registry sessions, each rendered in its own pane.
-- **Multi-model routing policy** — automatic selection by specialization / intelligence / cost. Both providers ship by M4, so the reach exists; the deferred part is the policy that picks per task rather than per configured role.
+- **Multi-model routing policy** — automatic selection by specialization / intelligence / cost. One provider reaching hundreds of models means the reach exists from M0; the deferred part is the policy that picks per task rather than per configured role. `usage.cost` on every response makes the cost input real rather than estimated.
 - **Self-authored skills** (user- and project-level) and self-improving workflow — builds on the M3 learned-memory write path.
 - **Hooks and plugins.**
 - **Full graph schema and relation semantics** — dedicated design pass before M2 ships.

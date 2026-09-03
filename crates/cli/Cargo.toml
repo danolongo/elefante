@@ -16,5 +16,8 @@ elefante-provider = { path = "../provider" }
 elefante-tools = { path = "../tools" }
 tokio.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

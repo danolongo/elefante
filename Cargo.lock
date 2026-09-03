@@ -231,6 +231,7 @@ dependencies = [
  "elefante-core",
  "elefante-provider",
  "elefante-tools",
+ "tempfile",
  "tokio",
 ]
 

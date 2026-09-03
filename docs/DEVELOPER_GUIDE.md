@@ -60,14 +60,14 @@ elefante/
 │   ├── M0-PROVIDER-MIGRATION.md    frozen contract for the single-provider rewrite
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/
-    ├── elefante-cli/              `elefante` terminal binary
-    ├── elefante-core/             provider/tool conversation loop
-    ├── elefante-provider/         normalized model API + OpenRouter transport
-    ├── elefante-guard/            path, shell, and secret-output policy
-    ├── elefante-tools/            schemas and syscall-facing tool executor
-    ├── elefante-rpc/              M1 protocol scaffold
-    ├── elefante-srv/              M1 daemon scaffold
-    └── elefante-mem/              M2 memory scaffold
+    ├── cli/                       `elefante` terminal binary
+    ├── core/                      provider/tool conversation loop
+    ├── provider/                  normalized model API + OpenRouter transport
+    ├── guard/                     path, shell, and secret-output policy
+    ├── tools/                     schemas and syscall-facing tool executor
+    ├── rpc/                       M1 protocol scaffold
+    ├── srv/                       M1 daemon scaffold
+    └── mem/                       M2 memory scaffold
 ```
 
 All crates inherit Rust 2024 edition, the minimum Rust version, dependency versions, and
@@ -539,7 +539,7 @@ Test ownership follows behavior:
   chunking, `[DONE]` and keep-alive handling, `tool_calls` accumulation by index, malformed tool
   JSON, verbatim `reasoning_details` replay, consecutive tool-result messages, usage including
   cached-input tokens, refusals, and forward-compatible events.
-- `elefante-core/tests/loop.rs` uses a scripted provider to test a complete edit loop,
+- `crates/core/tests/loop.rs` uses a scripted provider to test a complete edit loop,
   parallel result pairing, refusal, and malformed/incomplete streams without network access.
 
 The provider's always-on transport tests bind a loopback TCP listener. If a sandbox rejects

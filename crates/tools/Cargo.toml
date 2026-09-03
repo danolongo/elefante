@@ -1,14 +1,16 @@
 [package]
-name = "elefante-core"
+name = "elefante-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-elefante-provider = { path = "../elefante-provider" }
-elefante-tools = { path = "../elefante-tools" }
-futures-util.workspace = true
+elefante-guard = { path = "../guard" }
+globset.workspace = true
+ignore.workspace = true
+regex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

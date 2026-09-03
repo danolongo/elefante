@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/elefante-cli",
-    "crates/elefante-core",
-    "crates/elefante-guard",
-    "crates/elefante-mem",
-    "crates/elefante-provider",
-    "crates/elefante-rpc",
-    "crates/elefante-srv",
-    "crates/elefante-tools",
+    "crates/cli",
+    "crates/core",
+    "crates/guard",
+    "crates/mem",
+    "crates/provider",
+    "crates/rpc",
+    "crates/srv",
+    "crates/tools",
 ]
 resolver = "2"
 

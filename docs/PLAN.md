@@ -50,14 +50,14 @@ elefante/
   docs/PLAN.md               # this document
   docs/MILESTONES.md         # per-milestone completion record
   crates/
-    elefante-rpc/            # wire types shared by daemon and client (no deps on others)
-    elefante-provider/       # Provider trait + Capabilities; sse decoder, openrouter
-    elefante-guard/          # PathPolicy, BashClassifier, Scrubber, Critic
-    elefante-tools/          # read, write, edit, glob, grep, bash, memory_search
-    elefante-mem/            # graph store, indexer, retrieval, cache
-    elefante-core/           # session, turn loop, context assembly, staleness, compaction
-    elefante-srv/            # daemon binary: socket, session registry
-    elefante-cli/            # `elefante` binary: spawns daemon, launches client
+    rpc/                     # wire types shared by daemon and client (no deps on others)
+    provider/                # Provider trait + Capabilities; sse decoder, openrouter
+    guard/                   # PathPolicy, BashClassifier, Scrubber, Critic
+    tools/                   # read, write, edit, glob, grep, bash, memory_search
+    mem/                     # graph store, indexer, retrieval, cache
+    core/                    # session, turn loop, context assembly, staleness, compaction
+    srv/                     # daemon binary: socket, session registry
+    cli/                     # `elefante` binary: spawns daemon, launches client
   tui/                       # Bun + @opentui/core client (TypeScript)
 ```
 

@@ -147,6 +147,33 @@ With one provider a role is just `(model, effort)`. M0 ships only `OPENROUTER_MO
 
 Starting config: author = `anthropic/claude-opus-5` @ `xhigh`; critic = a *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage = anything cheap and fast. Per-model pricing no longer needs a local table — `usage.cost` comes back on every response.
 
+### First-run key setup
+
+**Planned, not built.** Today the harness requires `OPENROUTER_API_KEY` to be exported
+before launch, and `.env.example` in the repo root is an interim convenience for that.
+
+The intended behaviour: on first launch with no key resolvable, the harness **prompts the
+user for an OpenRouter key** and stores it under `~/.elefante/`, outside any working tree.
+Three reasons this is the right shape rather than a nicety:
+
+- A key in `<repo>/.env` sits inside the tree the agent edits. Elefante's own path policy
+  already refuses to read it, which is correct but means the file exists purely to be
+  stepped around. Storing the key in `~/.elefante/` removes it from the blast radius
+  instead of guarding it there.
+- It removes the only setup step between cloning and a working harness. Everything else has
+  a default.
+- The key never enters a repo, so it cannot be committed, and `.env.example` can be deleted.
+
+**Lands in M1**, because it needs an interactive transport — the same daemon/TUI channel
+that carries bash-approval prompts. A prompt has nowhere to render before then. Until it
+ships, a missing key must keep producing the named, graceful error M0's gate requires,
+never a bare transport failure.
+
+Open questions for the M1 design pass: file permissions and format for the stored key
+(`0600`, and whether it belongs in `config.toml` or a separate credentials file); whether
+to offer the OS keychain; and whether an already-set `OPENROUTER_API_KEY` environment
+variable should win over the stored key (it should — env beats config everywhere else here).
+
 ---
 
 ## Process topology
@@ -436,13 +463,15 @@ The decision it forced, now settled: reasoning blocks are stored **verbatim as o
 
 ### M1 — Daemon + TUI
 
-**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, summarized thinking, tool calls, and approval prompts.
+**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. **First-run key setup** (see above) rides on the same interactive channel.
 
 **Gate.**
 - Kill and reconnect a client mid-turn: `session.attach` replays state and the turn completes with output intact.
 - Two clients attached to one session both render the same stream.
 - Interrupt cancels in-flight tools, and already-completed tool results still appear in history (no `tool_use_id` desync — assert the next request does not 400).
 - Socket is mode `0600`; daemon exits after idle timeout with zero clients.
+- First launch with no key resolvable prompts for one, stores it under `~/.elefante/` at mode `0600`, and never writes it into a working tree. An already-set `OPENROUTER_API_KEY` wins over the stored value.
+- A model that reasons at length while emitting no renderable text does not present as a frozen UI — the failure the old `thinking.display` note warned about.
 - **M0 gate still green.**
 
 ### M2 — Repo cache + mechanical graph

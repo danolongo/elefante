@@ -552,7 +552,7 @@ requests. Run it explicitly against a slug whose upstream supports prompt cachin
 
 ```sh
 export OPENROUTER_API_KEY="..."
-export OPENROUTER_TEST_MODEL="anthropic/claude-opus-5"
+export OPENROUTER_MODEL="anthropic/claude-opus-5"
 cargo test -p elefante-provider live_second_identical_request_reads_prompt_cache -- --ignored
 ```
 

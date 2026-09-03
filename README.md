@@ -49,6 +49,36 @@ Environment defaults are `OPENROUTER_MODEL` (default `anthropic/claude-opus-5`),
 Command-line values take precedence where both forms exist. Models are named by OpenRouter
 slug, so reaching a different vendor is a different slug rather than a different transport.
 
+### Environment file
+
+Elefante reads configuration from the process environment; it does not load a `.env` file
+itself. Keep one for your shell to source, structured like this:
+
+```sh
+# Required. https://openrouter.ai/keys
+OPENROUTER_API_KEY=sk-or-v1-...
+
+# Optional — all have defaults.
+OPENROUTER_MODEL=anthropic/claude-opus-5
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+ELEFANTE_EFFORT=xhigh
+```
+
+Two properties of this file are deliberate rather than incidental:
+
+- **`.env` is gitignored, and Elefante's own path policy refuses to read it.** The agent
+  editing this repository cannot open the file holding its own key. `.env.example` is
+  refused for the same reason — the policy matches the `.env.` prefix, and carving an
+  exception into a secret deny-list is how holes start.
+- **The key never needs to reach the model's context.** It is read from the environment at
+  process start, so no tool result and no memory row should ever contain it. The scrubber
+  redacts `sk-or-v1-` and `sk-ant-` shapes from every tool result as a second line of
+  defence, in case a key reaches Elefante by some path the policy did not anticipate.
+
+`.env.example` in the repository root is an interim convenience. It goes away once the
+harness prompts for a key on first launch and stores it outside the working tree — see
+[`docs/PLAN.md`](docs/PLAN.md) § First-run key setup.
+
 ## Safety model
 
 Filesystem tools are restricted to the current working directory, known secret paths are

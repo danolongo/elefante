@@ -9,6 +9,7 @@
 # Credentials and private key material
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 
@@ -16,3 +17,6 @@
 .DS_Store
 *.swp
 *.swo
+
+# Claude Code local overrides
+.claude/settings.local.json

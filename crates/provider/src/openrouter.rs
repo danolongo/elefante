@@ -77,6 +77,12 @@ impl OpenRouterProvider {
 
         if !request.tools.is_empty() {
             body.insert("tools".into(), tools_json(&request.tools));
+            // Confine routing to endpoints that honour every parameter sent.
+            // Without this an endpoint may silently drop `tools`: the model
+            // answers in prose, the loop finds no tool calls and stops after one
+            // round, and the agent does nothing while appearing to work. Turning
+            // that silent no-op into a routing failure is worth one field.
+            body.insert("provider".into(), json!({ "require_parameters": true }));
         }
         if capabilities.effort {
             if let Some(effort) = request.effort {
@@ -215,6 +221,24 @@ const PROFILES: &[ModelProfile] = &[
     ModelProfile {
         prefix: "openai/o",
         capabilities: upstream(true),
+    },
+    // The auto router, which also covers `openrouter/auto-beta` by prefix.
+    //
+    // Not a guess: the catalogue entry for this slug declares `tools`,
+    // `reasoning`, `reasoning_effort`, and `structured_outputs` itself. Caching
+    // is the one axis left off, because auto's pricing carries no
+    // `input_cache_read` — the routed model may or may not cache, and the
+    // metadata says nothing either way.
+    ModelProfile {
+        prefix: "openrouter/auto",
+        capabilities: Capabilities {
+            adaptive_thinking: true,
+            effort: true,
+            prompt_caching: false,
+            mid_conversation_system: true,
+            structured_output: true,
+            cache_metrics: false,
+        },
     },
 ];
 
@@ -586,6 +610,7 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "xhigh");
         assert_eq!(body["stream"], true);
         assert_eq!(body["usage"]["include"], true);
+        assert_eq!(body["provider"]["require_parameters"], true);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(body["tools"][1]["function"]["name"], "write");
@@ -605,6 +630,65 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&body).unwrap(),
             serde_json::to_string(&provider.request_body(&request)).unwrap()
+        );
+    }
+
+    #[test]
+    fn auto_router_gets_reasoning_but_not_caching_and_covers_the_beta_slug() {
+        let provider = OpenRouterProvider::new("test-key");
+
+        for slug in ["openrouter/auto", "openrouter/auto-beta"] {
+            let capabilities = provider.capabilities(&ModelId::from(slug));
+            assert!(capabilities.adaptive_thinking, "{slug} declares reasoning");
+            assert!(capabilities.effort, "{slug} declares reasoning_effort");
+            assert!(
+                capabilities.structured_output,
+                "{slug} declares structured_outputs"
+            );
+            // Auto's pricing carries no input_cache_read, so caching is unknown
+            // rather than absent; we do not send breakpoints on a guess.
+            assert!(!capabilities.prompt_caching, "{slug} has no cache pricing");
+        }
+
+        let request = Request {
+            model: ModelId::from("openrouter/auto"),
+            max_tokens: 1024,
+            system: vec!["stable system".to_owned()],
+            tools: vec![ToolDefinition::new(
+                "read",
+                "read",
+                json!({ "type": "object" }),
+            )],
+            messages: vec![Message::text(Role::User, "hello")],
+            effort: Some(Effort::High),
+        };
+        let body = provider.request_body(&request);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "no cache breakpoint without declared caching"
+        );
+    }
+
+    #[test]
+    fn require_parameters_is_sent_only_alongside_tools() {
+        let provider = OpenRouterProvider::new("test-key");
+        let request = Request {
+            model: ModelId::from("anthropic/claude-opus-5"),
+            max_tokens: 1024,
+            system: Vec::new(),
+            tools: Vec::new(),
+            messages: vec![Message::text(Role::User, "hello")],
+            effort: None,
+        };
+
+        assert!(
+            provider.request_body(&request).get("provider").is_none(),
+            "a request with no tools has no parameter to be dropped"
         );
     }
 

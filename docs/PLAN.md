@@ -174,6 +174,83 @@ Open questions for the M1 design pass: file permissions and format for the store
 to offer the OS keychain; and whether an already-set `OPENROUTER_API_KEY` environment
 variable should win over the stored key (it should — env beats config everywhere else here).
 
+### Model selection
+
+**Planned, not built.** A model is currently chosen by typing a slug into `OPENROUTER_MODEL`,
+which requires knowing the catalogue by heart and gives no view of cost. The intended
+behaviour is an interactive picker listing the models the user can actually reach, with
+pricing shown before the choice is made.
+
+**The catalogue must come from `GET /api/v1/models/user`, authenticated with the user's key
+— not the public `GET /api/v1/models`.** The user-scoped endpoint filters by that account's
+provider preferences, privacy settings, and guardrails. The public list would happily offer
+models the user's own account then refuses, which turns a configuration choice into a runtime
+failure. Paginate via `links.next`; the catalogue runs to hundreds of entries.
+
+**Default is `openrouter/auto`**, with a `?` affordance explaining the cost, because auto is
+the one row whose price cannot be printed: it routes each prompt among a curated set and
+**bills at the rate of whichever model it selects**, so its cost is variable by request rather
+than a number. The explanation should say that plainly, and should also head off the common
+misreading that the `:free` variant is free — it is not.
+
+**Pricing display.** `pricing.prompt` and `pricing.completion` are strings in **USD per
+token**; multiply by 1e6 for the conventional $/1M figures. Two rules follow:
+
+- This table is for *choosing*, never for accounting. Actual spend is read from `usage.cost`
+  on each response, which already accounts for cache discounts and the model auto actually
+  picked. Computing cost from the price table would drift from the bill.
+- `pricing` also carries `input_cache_read` and `input_cache_write`, which is the honest way
+  to show that a cheap-looking model without caching can cost more in a long agent session
+  than a pricier one with it.
+
+**Show `supported_parameters`, filter by default, but do not hide.** Supplying tool
+definitions is necessary and not sufficient: the model still has to *emit* `tool_calls`. One
+never trained for function calling describes its intent in prose instead, the loop sees no
+tool calls, terminates after a round, and the agent quietly does nothing. The infrastructure
+is fine — the model cannot drive it. So a model not listing `tools` is worth flagging.
+
+It is not worth *hiding*, though. `supported_parameters` is advisory metadata rather than a
+guarantee, OpenRouter's own routing already biases toward tool-capable endpoints, and a
+picker that silently omits rows misrepresents the catalogue the user is paying for. Default
+the filter on, make it a toggle, and say why a row is excluded.
+
+`reasoning` support belongs in the row too, since it decides whether the effort setting does
+anything. This is also where an unrecognised slug's conservative all-false capability
+resolution becomes visible to the user rather than silently degrading.
+
+Cache the fetched catalogue under `~/.elefante/` with a TTL, keyed by the API key: it is
+large, it changes slowly, and refetching hundreds of entries to redraw a menu is waste.
+
+### Capabilities from metadata, not prefixes
+
+The current resolver matches hardcoded slug prefixes and falls back to all-false. That was
+the right shape when nothing could be looked up, but the catalogue the picker fetches
+already carries every axis, so the prefix table should become the **offline fallback** and
+metadata the primary source:
+
+| Capability | Derived from |
+|---|---|
+| `adaptive_thinking` | `supported_parameters` contains `reasoning` |
+| `effort` | `supported_parameters` contains `reasoning_effort` |
+| `structured_output` | `supported_parameters` contains `structured_outputs` |
+| `prompt_caching`, `cache_metrics` | `pricing.input_cache_read` is present — no `supported_parameters` entry exists for caching, so pricing is the only signal |
+| `mid_conversation_system` | transport property; always true |
+
+This removes the maintenance treadmill of tracking new slugs by hand, and it is accurate per
+model rather than per family. The prefix table stays for the cold-start and offline cases,
+where guessing conservatively still beats failing.
+
+`pricing.prompt == "-1"` is the sentinel for **variable pricing** — how the picker detects
+that a row has no fixed price, generically, rather than special-casing a slug by name.
+
+**Depends on the interactive channel**, like first-run key setup, and naturally follows it —
+key first, then model. Until it exists, `OPENROUTER_MODEL` remains the way to choose.
+
+Open questions for the design pass: whether to show all reachable models or a curated
+shortlist with a "show everything" toggle; whether the picker sets a project default, a user
+default, or both; and whether to surface `top_provider.is_moderated`, which changes behaviour
+in ways a coding user would want to know about before choosing.
+
 ---
 
 ## Process topology
@@ -458,6 +535,8 @@ The decision it forced, now settled: reasoning blocks are stored **verbatim as o
 - Two parallel `tool_calls` produce two consecutive `{role:"tool"}` messages in call order.
 - An unrecognised model slug yields all-false capabilities and a request carrying no `reasoning` field.
 - No request carries a field the resolved model does not declare — no `reasoning`, no `cache_control`.
+- Every request carrying `tools` also carries `provider: {require_parameters: true}`, and a request with no tools does not. Without it an endpoint may silently drop `tools`, and the loop then finds no tool calls and stops after one round — the agent does nothing while appearing to work.
+- `openrouter/auto` (and `openrouter/auto-beta`, by prefix) resolves to reasoning and structured output but **not** caching: the catalogue declares `reasoning`/`reasoning_effort`/`structured_outputs` for that slug, and its pricing carries no `input_cache_read`, so caching is unknown rather than absent and no breakpoint is sent on a guess.
 - A missing `OPENROUTER_API_KEY` produces a named, graceful error rather than a transport failure.
 - End-to-end: run against this repo, request a trivial edit, confirm the tool loop completes and the edit lands.
 
@@ -527,7 +606,7 @@ The decision it forced, now settled: reasoning blocks are stored **verbatim as o
 Noted now so the architecture accommodates them, not built yet:
 
 - **tmux subagent execution and nested sessions** — the daemon is already the shared backend; subagents become additional registry sessions, each rendered in its own pane.
-- **Multi-model routing policy** — automatic selection by specialization / intelligence / cost. One provider reaching hundreds of models means the reach exists from M0; the deferred part is the policy that picks per task rather than per configured role. `usage.cost` on every response makes the cost input real rather than estimated.
+- **Multi-model routing policy** — automatic selection by specialization / intelligence / cost, building on the interactive model picker (see § Model selection), which is where a user's reachable catalogue and its real prices first become available to the harness. One provider reaching hundreds of models means the reach exists from M0; the deferred part is the policy that picks per task rather than per configured role. `usage.cost` on every response makes the cost input real rather than estimated.
 - **Self-authored skills** (user- and project-level) and self-improving workflow — builds on the M3 learned-memory write path.
 - **Hooks and plugins.**
 - **Full graph schema and relation semantics** — dedicated design pass before M2 ships.

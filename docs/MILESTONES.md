@@ -92,14 +92,42 @@ ring is dead code).
 **Deferred.** `session.list` waits for the tmux fanout work. Session snapshots remain
 unbounded, as the contract documents — open question 1.
 
-**Amended.** MSRV raised 1.85 → 1.89 for dependency-free directory locking. Bun is now a hard
-runtime requirement, not only a test dependency: the interactive client will not launch
-without it. `PLAN.md`'s turn lifecycle gained a status marker distinguishing shipped
-behaviour from design — reading that diagram as description is what produced the first draft's
-unachievable guarantees.
+**Amended.** MSRV raised 1.85 → 1.89 for dependency-free directory locking, then corrected to
+1.90 on 2026-09-06 — see below. Bun is now a hard runtime requirement, not only a test
+dependency: the interactive client will not launch without it. `PLAN.md`'s turn lifecycle
+gained a status marker distinguishing shipped behaviour from design — reading that diagram as
+description is what produced the first draft's unachievable guarantees.
 
 ---
 
-_Next: M2 — repo cache and mechanical graph. Two M1 questions remain open and should be
-settled first: how Bun is distributed to users, and the CI relationship between `cargo test`
-and `bun test`._
+## Post-M1 — CI and the lockfile (2026-09-06)
+
+Settled the second of the two questions M1 left open. The first — Bun distribution — is
+decided in principle and deferred in practice: `bun build --compile` produces a working
+69.2 MB self-contained binary with the native `libopentui.dylib` embedded, at no startup cost
+(80 ms, against 70 ms interpreted). CI now runs that compile on every push so the option stays
+open, but the packaging work waits for a release.
+
+**One lockfile.** `tui/package-lock.json` removed, `tui/bun.lock` committed. With both present
+`bun install --frozen-lockfile` and `npm ci` each report a successful frozen install and
+produce different trees, silently; `bun.lock` shadows `package-lock.json` completely, to the
+point that a corrupt npm lockfile is simply never read. Gitignoring `bun.lock` instead is
+worse — the untracked local file shadows the committed one, so dependency bumps reach CI and
+not developers. Reasoning and measurements in [`LOCKFILE.md`](./LOCKFILE.md).
+
+**CI exists now.** There was none — `cargo test` was as unautomated as `bun test`. `ci.yml`
+runs fmt, clippy, the Rust suite, an MSRV floor check, the TypeScript suite, and the compile
+smoke test on Linux and macOS. `credentialed.yml` runs the two billable live tests behind
+`workflow_dispatch` only. Five gate items live solely in `bun test`, two of them regression
+guards for defects that shipped: issue #4's render site, and the connect-before-renderer seam
+(`e23eb6d`).
+
+**The MSRV floor was already false.** The new `msrv` job failed on its first run: the
+workspace declared `rust-version = "1.89"` but `tree-sitter@0.27.0` requires 1.90, so it had
+never built on its own declared floor. Corrected to 1.90 and verified. `README.md` still said
+1.85, two revisions stale. *This is the argument for the job in one paragraph — a declared
+floor nobody compiles against is a comment.*
+
+---
+
+_Next: M2 — repo cache and mechanical graph._

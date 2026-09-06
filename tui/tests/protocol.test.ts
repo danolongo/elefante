@@ -3,7 +3,7 @@ import { createServer, type Socket } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
+import { connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
 import { note, snapshot, stream } from "./fixtures";
 
 test("NDJSON handles every byte split including UTF-8, escaped newline and multiple frames", () => {
@@ -138,3 +138,30 @@ async function waitFor(predicate: () => boolean) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
   throw new Error("Timed out waiting for RPC");
 }
+
+test("a missing daemon socket explains the remedy instead of surfacing ENOENT alone", async () => {
+  const rpc = new RpcClient();
+  const missing = join(tmpdir(), `elefante-absent-${process.pid}.sock`);
+
+  const failure = await connectOrExplain(rpc, missing);
+
+  expect(failure).not.toBeNull();
+  expect(failure).toContain(missing);
+  // The remedy is the point: this client never spawns the daemon, so a user who
+  // ran it directly needs to be told what does.
+  expect(failure).toContain("Run `elefante`");
+});
+
+test("a reachable socket connects and reports no failure", async () => {
+  const path = join(tmpdir(), `elefante-present-${process.pid}.sock`);
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(path, resolve));
+
+  const rpc = new RpcClient();
+  try {
+    expect(await connectOrExplain(rpc, path)).toBeNull();
+  } finally {
+    rpc.close();
+    server.close();
+  }
+});

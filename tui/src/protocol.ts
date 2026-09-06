@@ -219,3 +219,20 @@ export class RpcClient {
     } else this.dispatch(parseNotification(value));
   }
 }
+
+/// Connects before the caller takes over the terminal.
+///
+/// Returns `null` on success, or a message explaining the failure in terms the
+/// user can act on. A raw `connect ENOENT /path` says nothing about the fact
+/// that this client never spawns the daemon — `elefante` does.
+export async function connectOrExplain(rpc: RpcClient, socketPath: string): Promise<string | null> {
+  try {
+    await rpc.connect(socketPath);
+    return null;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `elefante: no daemon listening at ${socketPath}\n`
+      + "Run `elefante` to start one; this client does not spawn it.\n"
+      + `(${detail})`;
+  }
+}

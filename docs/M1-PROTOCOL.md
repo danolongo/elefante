@@ -651,6 +651,12 @@ passed on a broken implementation; those are corrected here and the correction i
   was a render-site defect — a component reading two fields and concatenating them at draw
   time reproduces it while passing every other item here.*
 - Two reducers fed one event sequence reach deep-equal state.
+- A client started against a socket with no daemon fails **before** the renderer is
+  constructed, naming the socket path and the remedy. *This path is the seam between the two
+  test surfaces — component tests render with no socket, daemon tests drive the wire with no
+  renderer — so nothing crossed it until a user hit it. Connecting first is what makes it
+  safe: a failure that has not touched the terminal has no state to restore and no
+  capability probes outstanding to leak their replies into the user's shell.*
 - A turn that reasons for 5 s while emitting no `text.delta` leaves reducer state with a
   non-null `thinking_since` and a reasoning-token count. *Given an observable, because
   "does not appear frozen" is not assertable.*

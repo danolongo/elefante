@@ -71,7 +71,7 @@ owning history across turns, cancellation-safe tool pairing, and lifecycle event
 something distinct from `Deny`. Daemon-only CLI with a stream-separated renderer. Bun/OpenTUI
 client with a pure protocol layer and reducer (`tui/`).
 
-**Gate.** 118 hermetic Rust tests, 21 TypeScript tests (271 assertions), and both credentialed
+**Gate.** 118 hermetic Rust tests, 23 TypeScript tests (275 assertions), and both credentialed
 checks — including `live_edit_lands_in_a_scratch_repository`, which had to be re-run because
 the CLI's entire execution path changed from in-process to daemon-and-socket. Clippy under
 `-D warnings`, `cargo fmt --check`, and `tsc --noEmit` all clean.

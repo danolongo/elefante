@@ -2,7 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RpcClient, RpcError } from "./protocol";
+import { RpcClient, RpcError, connectOrExplain } from "./protocol";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
 import { App } from "./ui/App";
 import type { ModalProps } from "./ui/Modal";
@@ -12,6 +12,18 @@ const args = process.argv.slice(2);
 const option = (name: string) => { const index = args.indexOf(name); return index === -1 ? undefined : args[index + 1]; };
 const setting = (name: string) => option(`--${name}`) ?? process.env[`ELEFANTE_${name.toUpperCase().replaceAll("-", "_")}`];
 const rpc = new RpcClient();
+
+// Connect before taking over the terminal. `createCliRenderer` fires capability
+// probes (OSC colour queries, tmux passthrough); if the connect then failed and
+// we tore the renderer down mid-handshake, the terminal's replies would arrive
+// after the process had gone and land in the user's shell as typed input.
+// Failing here leaves the terminal untouched, so there is nothing to restore.
+const connectFailure = await connectOrExplain(rpc, socketPath);
+if (connectFailure !== null) {
+  console.error(connectFailure);
+  process.exit(1);
+}
+
 const renderer = await createCliRenderer({ exitOnCtrlC: false });
 const root = createRoot(renderer);
 let state = initialSession("", option("--cwd") ?? process.cwd(), setting("model"), setting("effort"));
@@ -75,7 +87,6 @@ async function recover() {
 rpc.onDisconnect = error => { connected = false; message = error.message; draw(); void recover(); };
 process.once("SIGTERM", exit);
 try {
-  await rpc.connect(socketPath);
   connected = true;
   const existing = option("--session");
   const created = existing ? { session_id: existing, seq: 0 } : await rpc.request<{ session_id: string; seq: number }>("session.create", { cwd: state.cwd, ...(state.model ? { model: state.model } : {}), ...(state.effort ? { effort: state.effort } : {}), ...(setting("max-rounds") ? { max_rounds: Number(setting("max-rounds")) } : {}), ...(setting("max-tokens") ? { max_tokens: Number(setting("max-tokens")) } : {}) });

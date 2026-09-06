@@ -651,6 +651,12 @@ passed on a broken implementation; those are corrected here and the correction i
   was a render-site defect — a component reading two fields and concatenating them at draw
   time reproduces it while passing every other item here.*
 - Two reducers fed one event sequence reach deep-equal state.
+- A client started against a socket with no daemon fails **before** the renderer is
+  constructed, naming the socket path and the remedy. *This path is the seam between the two
+  test surfaces — component tests render with no socket, daemon tests drive the wire with no
+  renderer — so nothing crossed it until a user hit it. Connecting first is what makes it
+  safe: a failure that has not touched the terminal has no state to restore and no
+  capability probes outstanding to leak their replies into the user's shell.*
 - A turn that reasons for 5 s while emitting no `text.delta` leaves reducer state with a
   non-null `thinking_since` and a reasoning-token count. *Given an observable, because
   "does not appear frozen" is not assertable.*
@@ -676,8 +682,17 @@ Deliberately unsettled; decide and record here when reached.
 
 1. Does the TUI ship a scrollback view of completed turns, or only the live turn plus a
    compact history? Affects snapshot size in long sessions.
-2. Bun runtime distribution — assume `bun` on PATH, or vendor it? Affects whether
-   `elefante` works on a machine without Bun installed.
+2. ~~Bun runtime distribution — assume `bun` on PATH, or vendor it?~~ **Decided 2026-09-06:
+   vendor, via `bun build --compile`, but not yet.** Measured: a 69.2 MB self-contained
+   binary, `libopentui.dylib` embedded at `/$bunfs/root/`, 80 ms startup against 70 ms
+   interpreted — so latency does not bear on the choice. Ships 12.3 MB → 81.5 MB, but the
+   user-side footprint *falls* from ~143 MB (12.3 Rust + 59 Bun + 72 `node_modules`), because
+   the bundler drops dev dependencies the developer install carries. The packaging work waits
+   for a release; what is decided now is the constraint it implies, because that constrains
+   M2+ client code: **the TUI must stay compile-able** — no runtime `node_modules` lookups,
+   no dynamic imports of paths absent at bundle time. CI enforces it with a compile and smoke
+   run on every push, on Linux and macOS. Cross-compiling is deliberately not used: it embeds
+   the host's native library unless the target's optional dependency is installed.
 3. Tool lifecycle events are dropped entirely by the M0 CLI, so a run gives no sign that
    tools ran. M1 routes them to `stderr` in the headless client and to transcript rows in
    the TUI, so this likely needs no further change — noted so it is checked against the

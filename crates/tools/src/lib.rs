@@ -1,6 +1,6 @@
 //! The permanent M0 tool surface.
 
-use elefante_guard::{BashClassifier, PathPolicy, Scrubber, Verdict};
+use elefante_guard::{PathPolicy, Scrubber};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -10,6 +10,26 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
+
+/// Tokio reaps the direct child on cancellation; this guard also terminates descendants.
+/// `std` offers process-group creation but no safe group-signal API, so use the system
+/// kill utility with a fixed signal and a numeric process-group ID (never a shell).
+#[cfg(unix)]
+struct BashProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for BashProcessGroup {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
 
 /// Provider-neutral tool metadata. `definitions` returns these in name order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,7 +74,6 @@ pub struct ToolExecutor {
     root: PathBuf,
     policy: PathPolicy,
     scrubber: Scrubber,
-    bash_classifier: BashClassifier,
 }
 
 impl ToolExecutor {
@@ -70,7 +89,6 @@ impl ToolExecutor {
             root: policy.root().to_path_buf(),
             policy,
             scrubber: Scrubber::new(),
-            bash_classifier: BashClassifier::new(),
         })
     }
 
@@ -224,30 +242,29 @@ impl ToolExecutor {
             Ok(input) => input,
             Err(result) => return result,
         };
-        let decision = self.bash_classifier.classify(&input.command);
-        match decision.verdict {
-            Verdict::Deny => {
-                return ToolResult::error(format!("bash denied by policy: {}", decision.rule));
-            }
-            Verdict::Escalate => {
-                // M0 has no approval transport, so escalation is deliberately non-executing.
-                return ToolResult::error(format!(
-                    "bash requires approval (unavailable in M0): {}",
-                    decision.rule
-                ));
-            }
-            Verdict::Allow => {}
-        }
-        let output = match Command::new("bash")
+        let mut command = Command::new("bash");
+        command
+            .kill_on_drop(true)
             .arg("-lc")
             .arg(&input.command)
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-        {
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => return ToolResult::error(format!("bash failed: {error}")),
+        };
+        #[cfg(unix)]
+        let mut group = BashProcessGroup(child.id());
+        let result = child.wait_with_output().await;
+        #[cfg(unix)]
+        if result.is_ok() {
+            group.0 = None;
+        }
+        let output = match result {
             Ok(output) => output,
             Err(error) => return ToolResult::error(format!("bash failed: {error}")),
         };

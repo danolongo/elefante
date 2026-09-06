@@ -228,17 +228,16 @@ name = "elefante-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "elefante-core",
- "elefante-provider",
- "elefante-tools",
+ "elefante-rpc",
+ "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
 name = "elefante-core"
 version = "0.1.0"
 dependencies = [
+ "elefante-guard",
  "elefante-provider",
  "elefante-tools",
  "futures-util",
@@ -246,6 +245,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -284,6 +284,7 @@ dependencies = [
 name = "elefante-rpc"
 version = "0.1.0"
 dependencies = [
+ "elefante-provider",
  "serde",
  "serde_json",
 ]
@@ -292,8 +293,18 @@ dependencies = [
 name = "elefante-srv"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-stream",
  "elefante-core",
+ "elefante-provider",
  "elefante-rpc",
+ "elefante-tools",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1463,6 +1474,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

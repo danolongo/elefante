@@ -1,14 +1,14 @@
-//! Wire-level primitives shared by future daemon and client implementations.
+//! The M1 JSON-RPC-shaped wire contract and bounded NDJSON framing.
+mod framing;
+mod notification;
+mod request;
+mod snapshot;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+pub use elefante_provider::{StopReason, Usage};
+pub use framing::*;
+pub use notification::*;
+pub use request::*;
+pub use snapshot::*;
 
-/// JSON-RPC-shaped request envelope. M1 will add the method catalog and transport.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RequestEnvelope {
-    pub jsonrpc: String,
-    pub id: Value,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
+pub const SESSION_RING_CAPACITY: usize = 4096;
+pub const CLIENT_QUEUE_CAPACITY: usize = 256;

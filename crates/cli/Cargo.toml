@@ -11,10 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-elefante-core = { path = "../core" }
-elefante-provider = { path = "../provider" }
-elefante-tools = { path = "../tools" }
-tokio.workspace = true
+elefante-rpc = { path = "../rpc" }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

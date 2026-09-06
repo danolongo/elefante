@@ -1,0 +1,144 @@
+# Hermetic gates only. Nothing here spends money or needs a secret; the credentialed
+# checks live in `credentialed.yml` behind workflow_dispatch.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Pinned deliberately. Unpinned tooling is how a green run stops meaning what it meant last
+  # week — the same reasoning that gives this repo exactly one lockfile. The Rust pin lives in
+  # the `rust` job below rather than here, because `uses:` takes no expressions.
+  # See docs/LOCKFILE.md.
+  BUN_VERSION: 1.4.2
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, not `stable`. With clippy::pedantic at warn and -D warnings, a floating
+      # toolchain turns CI red on someone else's PR whenever Rust ships a new lint — which
+      # happened on this workflow's very first run, on code that had not changed. This tag is
+      # the single place to bump; `lints` below says what a bump would cost first.
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace --no-fail-fast
+
+  # Advisory only. Pinning above buys reproducibility at the cost of never hearing about a new
+  # lint until someone bumps the pin; this job pays that back by reporting what current stable
+  # thinks, with no power to fail the run — continue-on-error means the workflow stays green
+  # whatever happens here, so its result is a to-do to read, never a merge blocker. Bump the
+  # pin above when you want to act on what it says.
+  lints:
+    name: lints (stable, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lints
+      - name: version
+        run: cargo clippy --version
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: msrv (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo.toml declares rust-version = "1.90". Without this job that declaration is a
+      # comment: stable compiles fine while the declared floor does not. It was wrong the
+      # first time this job ran — declared 1.89, but tree-sitter 0.27 requires 1.90.
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-targets
+
+  tui:
+    name: tui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      # Verifies against tui/bun.lock, the one committed lockfile. This is only meaningful
+      # because package-lock.json was removed — with both present, bun and npm each report a
+      # successful frozen install while producing different trees. See docs/LOCKFILE.md.
+      - name: install
+        working-directory: tui
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        working-directory: tui
+        run: bunx tsc --noEmit
+      # Five M1 gate items live only here: the reducer keeping reasoning and answer in
+      # separate fields, the transcript rendering them separately (issue #4's regression
+      # guard), two reducers converging deep-equal, the no-daemon connect failing before the
+      # renderer is constructed (e23eb6d's regression guard), and thinking_since surviving a
+      # silent reasoning turn. None of them run under `cargo test`.
+      - name: test
+        working-directory: tui
+        run: bun test
+
+  package:
+    name: package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: install
+        working-directory: tui
+        run: bun install --frozen-lockfile
+      # Keeps the vendored-binary option open (M1-PROTOCOL.md open question 2) at ~0.4s per
+      # run. The client must stay compile-able: no runtime node_modules lookups, no dynamic
+      # imports of paths absent at bundle time. Retrofitting that after M2-M5 accumulate
+      # client code is the expensive version of this check.
+      - name: compile
+        working-directory: tui
+        run: bun build --compile src/main.tsx --outfile elefante-tui
+      # Built per-OS rather than cross-compiled on purpose: `--target=bun-linux-x64` from
+      # macOS embeds the host's darwin dylib unless the target's optionalDependency is
+      # installed. Each runner builds for itself and the question does not arise.
+      - name: smoke
+        working-directory: tui
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(ELEFANTE_SOCKET=/tmp/elefante-absent.sock ./elefante-tui 2>&1) || true
+          echo "$out"
+          # Asserts the binary starts, resolves its embedded native library, and reaches the
+          # connect-failure path. That path returns before the renderer exists, which is why
+          # this is assertable with no TTY.
+          grep -q "no daemon listening" <<<"$out"

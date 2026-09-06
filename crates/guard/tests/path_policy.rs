@@ -32,12 +32,78 @@ fn denies_traversal_and_secret_variants() {
         "private.key",
         ".ssh/config",
         ".aws/credentials",
+        ".elefante/credentials.toml",
     ] {
         assert!(
             matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
             "{path}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn denies_credentials_when_workspace_is_home_or_credential_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join(".elefante");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("credentials.toml"), "fake-key").unwrap();
+    std::os::unix::fs::symlink(".elefante/credentials.toml", root.path().join("alias")).unwrap();
+    assert!(matches!(
+        PathPolicy::new(root.path()).unwrap().resolve("alias"),
+        Err(PolicyError::Denied { .. })
+    ));
+    assert!(matches!(
+        PathPolicy::new(&dir).unwrap().resolve("credentials.toml"),
+        Err(PolicyError::Denied { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn denies_canonical_credentials_target_with_isolated_home() {
+    const CHILD: &str = "ELEFANTE_CREDENTIAL_POLICY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(matches!(
+            PathPolicy::new(&root).unwrap().resolve("ordinary.toml"),
+            Err(PolicyError::Denied { .. })
+        ));
+        assert_eq!(
+            elefante_guard::BashClassifier::new()
+                .classify_in("sed s/fake/changed/ ordinary.toml", &root)
+                .verdict,
+            elefante_guard::Verdict::Deny
+        );
+        return;
+    }
+    // A subprocess isolates HOME without unsafe process-wide environment mutation.
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".elefante")).unwrap();
+    fs::write(
+        root.path().join("ordinary.toml"),
+        "fake-secret-outside-scrubber-patterns",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../ordinary.toml",
+        root.path().join(".elefante/credentials.toml"),
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "denies_canonical_credentials_target_with_isolated_home",
+        ])
+        .env("HOME", root.path())
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[cfg(unix)]

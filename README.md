@@ -19,7 +19,8 @@ begun.
 
 Requirements:
 
-- Rust 1.85 or newer
+- Rust 1.90 or newer
+- Bun, for the interactive TUI only — the headless CLI does not need it. See `tui/README.md`
 - An OpenRouter API key supplied through the process environment
 
 Run the agent from the repository it should be allowed to modify:

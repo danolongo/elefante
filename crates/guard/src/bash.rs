@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::path::Path;
 use tree_sitter::{Node, Parser};
 
 /// Severity-ordered action for a shell command.
@@ -54,6 +55,12 @@ impl BashClassifier {
 
     #[must_use]
     pub fn classify(&self, source: &str) -> BashDecision {
+        self.classify_in(source, Path::new("."))
+    }
+
+    /// Classifies shell paths relative to the executor's workspace, including symlinks.
+    #[must_use]
+    pub fn classify_in(&self, source: &str, root: &Path) -> BashDecision {
         let mut parser = Parser::new();
         if parser
             .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -78,7 +85,7 @@ impl BashClassifier {
         }
 
         let mut decisions = Vec::new();
-        collect_decisions(tree.root_node(), source.as_bytes(), &mut decisions);
+        collect_decisions(tree.root_node(), source.as_bytes(), root, &mut decisions);
         if decisions.is_empty() {
             return BashDecision {
                 verdict: Verdict::Escalate,
@@ -106,26 +113,31 @@ impl BashClassifier {
     }
 }
 
-fn collect_decisions(node: Node<'_>, source: &[u8], decisions: &mut Vec<BashDecision>) {
+fn collect_decisions(
+    node: Node<'_>,
+    source: &[u8],
+    root: &Path,
+    decisions: &mut Vec<BashDecision>,
+) {
     if node.kind() == "command" {
         let text = node.utf8_text(source).unwrap_or_default();
-        decisions.push(classify_command(text));
+        decisions.push(classify_command(text, root));
     } else if node.kind() == "file_redirect"
-        && let Some(decision) = classify_file_redirect(node, source)
+        && let Some(decision) = classify_file_redirect(node, source, root)
     {
         decisions.push(decision);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_decisions(child, source, decisions);
+        collect_decisions(child, source, root, decisions);
     }
 }
 
-fn classify_file_redirect(node: Node<'_>, source: &[u8]) -> Option<BashDecision> {
+fn classify_file_redirect(node: Node<'_>, source: &[u8], root: &Path) -> Option<BashDecision> {
     if node
         .child_by_field_name("destination")
         .and_then(|destination| destination.utf8_text(source).ok())
-        .is_some_and(looks_like_secret_path)
+        .is_some_and(|value| looks_like_secret_path(value.trim_matches(['\'', '"']), root))
     {
         return Some(BashDecision {
             verdict: Verdict::Deny,
@@ -143,7 +155,7 @@ fn classify_file_redirect(node: Node<'_>, source: &[u8]) -> Option<BashDecision>
     })
 }
 
-fn classify_command(command: &str) -> BashDecision {
+fn classify_command(command: &str, root: &Path) -> BashDecision {
     let tokens = static_tokens(command);
     let Some(program) = tokens.first().map(String::as_str) else {
         return BashDecision {
@@ -165,8 +177,12 @@ fn classify_command(command: &str) -> BashDecision {
             rule: "environment-disclosure",
         };
     }
-    if matches!(basename, "cat" | "source" | ".")
-        && tokens.iter().skip(1).any(|arg| looks_like_secret_path(arg))
+    // Every program can transform or forward secrets; restricting this check to `cat`
+    // allows `sed`, `head`, or an interpreter to evade output scrubbing.
+    if tokens
+        .iter()
+        .skip(1)
+        .any(|arg| looks_like_secret_path(arg, root))
     {
         return BashDecision {
             verdict: Verdict::Deny,
@@ -354,19 +370,21 @@ fn static_tokens(command: &str) -> Vec<String> {
     tokens
 }
 
-fn looks_like_secret_path(value: &str) -> bool {
-    value.split('/').any(|part| {
-        part == ".env"
-            || part.starts_with(".env.")
-            || part == ".netrc"
-            || part == ".npmrc"
-            || part == ".git-credentials"
-            || part.starts_with("id_rsa")
-            || std::path::Path::new(part)
-                .extension()
-                .is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("pem") || extension.eq_ignore_ascii_case("key")
-                })
-    }) || value.contains(".ssh/")
-        || value.ends_with(".aws/credentials")
+fn looks_like_secret_path(value: &str, root: &Path) -> bool {
+    // Check both a raw argument and the value of an option such as `--file=path`.
+    let value = value.split_once('=').map_or(value, |(_, value)| value);
+    let path = Path::new(value);
+    if crate::path::built_in_secret_rule(path).is_some() {
+        return true;
+    }
+    let expanded = ["~/", "$HOME/", "${HOME}/"]
+        .into_iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .and_then(|suffix| std::env::var_os("HOME").map(|home| Path::new(&home).join(suffix)))
+        .unwrap_or_else(|| root.join(path));
+    crate::path::built_in_secret_rule(&expanded).is_some()
+        || expanded.canonicalize().is_ok_and(|canonical| {
+            crate::path::built_in_secret_rule(&canonical).is_some()
+                || crate::path::canonical_credentials().as_ref() == Some(&canonical)
+        })
 }

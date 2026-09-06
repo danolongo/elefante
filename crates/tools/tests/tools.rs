@@ -8,6 +8,54 @@ fn executor() -> (tempfile::TempDir, ToolExecutor) {
     (temp, executor)
 }
 
+#[tokio::test]
+async fn credential_file_is_never_read_or_returned_by_search() {
+    let (temp, executor) = executor();
+    fs::create_dir(temp.path().join(".elefante")).unwrap();
+    fs::write(
+        temp.path().join(".elefante/credentials.toml"),
+        "fake-secret-outside-scrubber-patterns",
+    )
+    .unwrap();
+    for (name, input) in [
+        ("read", json!({"path": ".elefante/credentials.toml"})),
+        ("grep", json!({"pattern": "fake-secret", "path": "."})),
+        ("glob", json!({"pattern": "**/*", "path": "."})),
+    ] {
+        let result = executor.execute(name, input).await;
+        assert!(
+            !result
+                .content
+                .contains("fake-secret-outside-scrubber-patterns")
+        );
+        if name == "read" {
+            assert!(result.is_error);
+        } else {
+            assert!(!result.content.contains("credentials.toml"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_executing_bash_kills_descendants_before_delayed_write() {
+    let (temp, executor) = executor();
+    let running = tokio::spawn(async move {
+        executor.execute("bash", json!({"command": "(printf ready > ready; sleep 0.5; printf leaked > delayed) & wait"})).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !temp.path().join("ready").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(!temp.path().join("delayed").exists());
+}
+
 #[test]
 fn definitions_are_stable_sorted_and_strict() {
     let first = definitions();
@@ -181,29 +229,13 @@ async fn write_does_not_follow_dangling_symlink_outside_workspace() {
 }
 
 #[tokio::test]
-async fn bash_gate_denies_and_escalates_without_execution() {
+async fn bash_executor_runs_commands_without_classifying() {
     let (temp, executor) = executor();
-    for command in ["cat .env", "rm marker", "env"] {
-        assert!(
-            executor
-                .execute("bash", json!({"command": command}))
-                .await
-                .is_error
-        );
-    }
-    let escalated = executor
+    let result = executor
         .execute("bash", json!({"command": "touch marker"}))
         .await;
-    assert!(escalated.is_error);
-    assert!(escalated.content.contains("approval"));
-    assert!(!temp.path().join("marker").exists());
-
-    let redirected = executor
-        .execute("bash", json!({"command": "printf changed > redirected"}))
-        .await;
-    assert!(redirected.is_error);
-    assert!(redirected.content.contains("approval"));
-    assert!(!temp.path().join("redirected").exists());
+    assert!(!result.is_error);
+    assert!(temp.path().join("marker").exists());
 }
 
 #[tokio::test]

@@ -88,10 +88,10 @@ impl OpenRouterProvider {
             // that silent no-op into a routing failure is worth one field.
             body.insert("provider".into(), json!({ "require_parameters": true }));
         }
-        if capabilities.effort {
-            if let Some(effort) = request.effort {
-                body.insert("reasoning".into(), json!({ "effort": effort }));
-            }
+        if capabilities.effort
+            && let Some(effort) = request.effort
+        {
+            body.insert("reasoning".into(), json!({ "effort": effort }));
         }
         Value::Object(body)
     }
@@ -439,10 +439,10 @@ impl OpenRouterEventParser {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first());
-        if let Some(choice) = choice {
-            if !self.stopped {
-                self.push_delta_events(choice.get("delta"), &mut events)?;
-            }
+        if let Some(choice) = choice
+            && !self.stopped
+        {
+            self.push_delta_events(choice.get("delta"), &mut events)?;
         }
         if let Some(usage) = payload.get("usage") {
             let usage = usage_from(usage);
@@ -453,18 +453,17 @@ impl OpenRouterEventParser {
         if let Some(reason) = choice
             .and_then(|choice| choice.get("finish_reason"))
             .and_then(Value::as_str)
+            && !self.stopped
         {
-            if !self.stopped {
-                self.stopped = true;
-                if reason == "content_filter" {
-                    // A refusal supersedes any incomplete tool call. Nothing from the
-                    // rejected partial call may enter replay history.
-                    self.tool_calls.clear();
-                } else {
-                    events.extend(self.complete_tool_calls()?);
-                }
-                events.push(Event::Stop(stop_reason(reason)));
+            self.stopped = true;
+            if reason == "content_filter" {
+                // A refusal supersedes any incomplete tool call. Nothing from the
+                // rejected partial call may enter replay history.
+                self.tool_calls.clear();
+            } else {
+                events.extend(self.complete_tool_calls()?);
             }
+            events.push(Event::Stop(stop_reason(reason)));
         }
         Ok(events)
     }
@@ -477,24 +476,24 @@ impl OpenRouterEventParser {
         let Some(delta) = delta else {
             return Ok(());
         };
-        if let Some(text) = delta.get("reasoning").and_then(Value::as_str) {
-            if !text.is_empty() {
-                events.push(Event::ReasoningDelta(text.to_owned()));
-            }
+        if let Some(text) = delta.get("reasoning").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            events.push(Event::ReasoningDelta(text.to_owned()));
         }
-        if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
-            if !details.is_empty() {
-                // Forwarded verbatim and in arrival order; the loop concatenates
-                // consecutive batches into one reasoning block per turn.
-                events.push(Event::ReasoningDetails(
-                    details.iter().cloned().map(ReasoningDetail::new).collect(),
-                ));
-            }
+        if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array)
+            && !details.is_empty()
+        {
+            // Forwarded verbatim and in arrival order; the loop concatenates
+            // consecutive batches into one reasoning block per turn.
+            events.push(Event::ReasoningDetails(
+                details.iter().cloned().map(ReasoningDetail::new).collect(),
+            ));
         }
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                events.push(Event::TextDelta(text.to_owned()));
-            }
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            events.push(Event::TextDelta(text.to_owned()));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {

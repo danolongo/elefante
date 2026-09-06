@@ -56,7 +56,7 @@ fn documents_known_not_caught_obfuscation() {
         classifier.classify("eval \"r\"\"m file\"").verdict,
         Verdict::Allow
     );
-    for known_not_caught in ["grep SECRET .e''nv", "sed -n 1p .e''nv"] {
+    for known_not_caught in ["grep SECRET \"$secret_path\"", "sed -n 1p \"$secret_path\""] {
         assert_eq!(
             classifier.classify(known_not_caught).verdict,
             Verdict::Allow,
@@ -64,4 +64,40 @@ fn documents_known_not_caught_obfuscation() {
         );
     }
     assert!(!BashClassifier::known_gaps().is_empty());
+}
+
+#[test]
+fn denies_credentials_for_readers_transformers_and_redirects() {
+    for command in [
+        "cat ~/.elefante/credentials.toml",
+        "head $HOME/.elefante/credentials.toml",
+        "sed 's/sk-ant/changed/' ${HOME}/.elefante/credentials.toml",
+        "tr a b < '.elefante/credentials.toml'",
+        "base64 .elefante/credentials.toml",
+        "grep SECRET .e''nv",
+        "sed -n 1p .e''nv",
+    ] {
+        assert_eq!(
+            BashClassifier::new().classify(command).verdict,
+            Verdict::Deny,
+            "{command}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn denies_workspace_relative_symlink_to_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".elefante")).unwrap();
+    std::fs::write(root.path().join(".elefante/credentials.toml"), "fake-key").unwrap();
+    std::os::unix::fs::symlink(".elefante/credentials.toml", root.path().join("alias")).unwrap();
+    for command in ["head alias", "sed s/fake/changed/ alias", "tr a b < alias"] {
+        assert_eq!(
+            BashClassifier::new()
+                .classify_in(command, root.path())
+                .verdict,
+            Verdict::Deny
+        );
+    }
 }

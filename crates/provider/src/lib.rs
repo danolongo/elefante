@@ -280,6 +280,7 @@ pub enum StopReason {
     MaxTokens,
     Refusal,
     StopSequence,
+    Interrupted,
     Other(String),
 }
 

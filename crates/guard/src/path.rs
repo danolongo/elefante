@@ -12,6 +12,7 @@ const POLICY_NAME: &str = "secret-path-policy";
 pub struct PathPolicy {
     root: PathBuf,
     extra_denied: GlobSet,
+    credentials: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -75,7 +76,11 @@ impl PathPolicy {
                 pattern: "<set>".to_owned(),
                 message: error.to_string(),
             })?;
-        Ok(Self { root, extra_denied })
+        Ok(Self {
+            root,
+            extra_denied,
+            credentials: canonical_credentials(),
+        })
     }
 
     #[must_use]
@@ -106,7 +111,7 @@ impl PathPolicy {
         // Check the lexical path before following symlinks. Otherwise a path whose name is
         // itself protected (for example `.env`) could be made to point at an innocuous target.
         let lexical_relative = normalized.strip_prefix(&self.root).unwrap_or(&normalized);
-        self.check_denied(input, lexical_relative)?;
+        self.check_denied(input, &normalized, lexical_relative)?;
 
         let (ancestor, suffix) =
             closest_existing_ancestor(&normalized).map_err(|source| PolicyError::Resolve {
@@ -132,12 +137,23 @@ impl PathPolicy {
         }
 
         let relative = resolved.strip_prefix(&self.root).unwrap_or(&resolved);
-        self.check_denied(input, relative)?;
+        self.check_denied(input, &resolved, relative)?;
         Ok(resolved)
     }
 
-    fn check_denied(&self, input: &Path, relative: &Path) -> Result<(), PolicyError> {
-        if let Some(rule) = built_in_secret_rule(relative) {
+    fn check_denied(
+        &self,
+        input: &Path,
+        absolute: &Path,
+        relative: &Path,
+    ) -> Result<(), PolicyError> {
+        if self.credentials.as_deref() == Some(absolute) {
+            return Err(PolicyError::Denied {
+                path: input.display().to_string(),
+                rule: ".elefante/credentials.toml",
+            });
+        }
+        if let Some(rule) = built_in_secret_rule(absolute) {
             return Err(PolicyError::Denied {
                 path: input.display().to_string(),
                 rule,
@@ -151,6 +167,15 @@ impl PathPolicy {
         }
         Ok(())
     }
+}
+
+pub(crate) fn canonical_credentials() -> Option<PathBuf> {
+    std::env::var_os("HOME").and_then(|home| {
+        Path::new(&home)
+            .join(".elefante/credentials.toml")
+            .canonicalize()
+            .ok()
+    })
 }
 
 fn closest_existing_ancestor(
@@ -193,7 +218,7 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
+pub(crate) fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
     let components = path
         .components()
         .filter_map(|component| match component {
@@ -208,6 +233,9 @@ fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
         }
         if *component == ".aws" && components.get(index + 1) == Some(&"credentials") {
             return Some(".aws/credentials");
+        }
+        if *component == ".elefante" && components.get(index + 1) == Some(&"credentials.toml") {
+            return Some(".elefante/credentials.toml");
         }
         if *component == ".env" || component.starts_with(".env.") {
             return Some(".env or .env.*");

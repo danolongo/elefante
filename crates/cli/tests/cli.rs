@@ -10,13 +10,18 @@ use std::process::{Command, Output};
 /// and with every relevant variable cleared so an operator's real environment
 /// cannot make the test pass or fail by accident.
 fn run(args: &[&str], set: &[(&str, &str)]) -> Output {
+    let isolated = tempfile::tempdir().expect("isolated daemon home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_elefante"));
     command
         .args(args)
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("OPENROUTER_BASE_URL")
         .env_remove("OPENROUTER_MODEL")
-        .env_remove("ELEFANTE_EFFORT");
+        .env_remove("ELEFANTE_EFFORT")
+        .env_remove("ELEFANTE_STUB_PROVIDER")
+        .env("HOME", isolated.path())
+        .env("ELEFANTE_SOCKET", isolated.path().join("run/elefante.sock"))
+        .env("ELEFANTE_IDLE_SECS", "1");
     for (key, value) in set {
         command.env(key, value);
     }
@@ -97,6 +102,12 @@ fn live_edit_lands_in_a_scratch_repository() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_elefante"));
     command
         .current_dir(workspace.path())
+        .env(
+            "ELEFANTE_SOCKET",
+            workspace.path().join("run/elefante.sock"),
+        )
+        .env("ELEFANTE_IDLE_SECS", "1")
+        .env_remove("ELEFANTE_STUB_PROVIDER")
         .env("OPENROUTER_API_KEY", api_key)
         // Bound what this test can spend. The production defaults (16k tokens,
         // high effort) are sized for real work; a one-word edit needs neither,
@@ -124,4 +135,27 @@ fn live_edit_lands_in_a_scratch_repository() {
         contents.contains("goodbye") && !contents.contains("hello"),
         "edit did not land, file reads: {contents:?}\nstderr: {stderr}"
     );
+}
+
+#[test]
+fn headless_stream_keeps_reasoning_out_of_redirected_stdout() {
+    let isolated = tempfile::tempdir().expect("isolated daemon");
+    let script = isolated.path().join("events.json");
+    std::fs::write(&script, r#"[{"ReasoningDelta":"Let me "},{"ReasoningDelta":"think."},{"TextDelta":"The "},{"TextDelta":"answer.\n"},{"Stop":"end_turn"}]"#).unwrap();
+    let output = run(
+        &["answer"],
+        &[
+            ("ELEFANTE_STUB_PROVIDER", script.to_str().unwrap()),
+            ("NO_COLOR", "1"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"The answer.\n");
+    assert_eq!(output.stderr, b"Let me think.\n");
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(!output.stderr.contains(&0x1b));
 }

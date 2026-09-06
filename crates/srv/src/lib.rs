@@ -1,4 +1,12 @@
-//! Daemon transport and session registry are implemented in M1.
+//! Unix-socket daemon, durable session state, and bounded client delivery.
 
-/// Marker used by callers to distinguish the scaffold from an active daemon.
-pub const MILESTONE: &str = "M1";
+mod credentials;
+mod queue;
+mod server;
+mod stub;
+
+pub use server::{DaemonConfig, run, run_from_env, socket_path};
+
+pub const RING_CAPACITY: usize = 4096;
+pub const CLIENT_QUEUE_CAPACITY: usize = 256;
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;

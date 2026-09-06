@@ -1,0 +1,86 @@
+import { createCliRenderer } from "@opentui/core";
+import { createRoot } from "@opentui/react";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { RpcClient, RpcError } from "./protocol";
+import { initialSession, reduceSession, restoreSnapshot } from "./session";
+import { App } from "./ui/App";
+import type { ModalProps } from "./ui/Modal";
+
+const socketPath = process.env.ELEFANTE_SOCKET ?? join(process.env.XDG_RUNTIME_DIR ?? join(homedir(), ".elefante", "run"), "elefante.sock");
+const args = process.argv.slice(2);
+const option = (name: string) => { const index = args.indexOf(name); return index === -1 ? undefined : args[index + 1]; };
+const setting = (name: string) => option(`--${name}`) ?? process.env[`ELEFANTE_${name.toUpperCase().replaceAll("-", "_")}`];
+const rpc = new RpcClient();
+const renderer = await createCliRenderer({ exitOnCtrlC: false });
+const root = createRoot(renderer);
+let state = initialSession("", option("--cwd") ?? process.cwd(), setting("model"), setting("effort"));
+let connected = false;
+let message: string | null = null;
+let keyNeeded = false;
+let busy = false;
+let submitting = false;
+let retryPrompt = "";
+let stopped = false;
+let reconnecting = false;
+let timer: ReturnType<typeof setInterval>;
+const exit = () => { stopped = true; clearInterval(timer); rpc.close(); renderer.destroy(); };
+const fail = (error: unknown) => { message = error instanceof Error ? error.message : String(error); draw(); };
+async function prompt(text: string) {
+  if (submitting) return;
+  submitting = true;
+  state = { ...state, pending_prompt: text };
+  message = null;
+  draw();
+  try { await rpc.request("session.prompt", { session_id: state.session_id, text }); }
+  catch (error) {
+    if (error instanceof RpcError && error.code === -32004) { keyNeeded = true; retryPrompt = text; }
+    else fail(error);
+  }
+  submitting = false;
+  draw();
+}
+function draw() {
+  if (stopped) return;
+  const approval = state.active_turn?.pending_approvals[0];
+  let modal: ModalProps | null = null;
+  if (keyNeeded) modal = { kind: "key", busy, onKey: async key => {
+    busy = true; draw();
+    try { await rpc.request("key.set", { api_key: key }); keyNeeded = false; await prompt(retryPrompt); }
+    catch (error) { fail(error); }
+    finally { busy = false; draw(); }
+  } };
+  else if (approval) modal = { kind: "approval", approval, busy, onDecision: async decision => {
+    busy = true; draw();
+    try { await rpc.request("session.resolve_approval", { session_id: state.session_id, approval_id: approval.approval_id, decision }); }
+    catch (error) { fail(error); }
+    finally { busy = false; draw(); }
+  } };
+  root.render(<App state={state} now={Date.now()} connected={connected} submitting={submitting} message={message ?? state.error} modal={modal} onSubmit={text => void prompt(text)} onInterrupt={() => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }} onExit={exit} />);
+}
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+async function recover() {
+  if (reconnecting || stopped) return;
+  reconnecting = true;
+  while (!stopped && !connected) {
+    await delay(250);
+    try { await rpc.reconnect(socketPath); connected = true; message = null; }
+    catch (error) {
+      if (error instanceof RpcError && error.code === -32001) { message = "Session no longer exists. Restart elefante to create a new session."; break; }
+    }
+  }
+  reconnecting = false;
+  draw();
+}
+rpc.onDisconnect = error => { connected = false; message = error.message; draw(); void recover(); };
+process.once("SIGTERM", exit);
+try {
+  await rpc.connect(socketPath);
+  connected = true;
+  const existing = option("--session");
+  const created = existing ? { session_id: existing, seq: 0 } : await rpc.request<{ session_id: string; seq: number }>("session.create", { cwd: state.cwd, ...(state.model ? { model: state.model } : {}), ...(state.effort ? { effort: state.effort } : {}), ...(setting("max-rounds") ? { max_rounds: Number(setting("max-rounds")) } : {}), ...(setting("max-tokens") ? { max_tokens: Number(setting("max-tokens")) } : {}) });
+  state = { ...state, session_id: created.session_id, seq: created.seq };
+  await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort); draw(); });
+  timer = setInterval(draw, 250);
+  draw();
+} catch (error) { exit(); console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }

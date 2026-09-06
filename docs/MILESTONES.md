@@ -61,4 +61,45 @@ Default model moved to `anthropic/claude-sonnet-5` to keep credentialed runs che
 
 ---
 
-_Next: M1 — daemon, RPC protocol, and OpenTUI client. Frozen contract in [`M1-PROTOCOL.md`](./M1-PROTOCOL.md); no implementation started._
+## M1 — Daemon + TUI            (completed 2026-09-05)
+
+**Shipped.** Typed wire protocol with NDJSON framing, snapshots, and coalescing
+(`elefante-rpc`). Unix-socket daemon with session registry, resume, fanout, backpressure,
+credential storage, approvals, and a stub provider (`elefante-srv`). Persistent `Session`
+owning history across turns, cancellation-safe tool pairing, and lifecycle events
+(`elefante-core`). The bash gate moved from `tools` into `core`, so `Escalate` finally means
+something distinct from `Deny`. Daemon-only CLI with a stream-separated renderer. Bun/OpenTUI
+client with a pure protocol layer and reducer (`tui/`).
+
+**Gate.** 118 hermetic Rust tests, 21 TypeScript tests (271 assertions), and both credentialed
+checks — including `live_edit_lands_in_a_scratch_repository`, which had to be re-run because
+the CLI's entire execution path changed from in-process to daemon-and-socket. Clippy under
+`-D warnings`, `cargo fmt --check`, and `tsc --noEmit` all clean.
+
+**The contract was split before implementation, and that is why this landed cleanly.** An
+adversarial review of the first M1 draft found four blocking defects sharing one root cause:
+the wire had been specified before the core types it derives from. Every notification was
+unproducible from the shipped `OutputEvent`; the session type it presupposed did not exist;
+the interrupt guarantee was unachievable against `join_all`. Splitting into `M1-CORE.md` and
+`M1-PROTOCOL.md` cost one review and fixed all four before a line was written.
+
+Two gate items existed only because that review found they would pass on a broken
+implementation, and both proved load-bearing: the stub provider **validates**
+`tool_use`/`tool_result` pairing (without it the pairing assertion is vacuous), and attach
+asserts `kind == "resumed"` (without it an always-snapshot implementation passes while the
+ring is dead code).
+
+**Deferred.** `session.list` waits for the tmux fanout work. Session snapshots remain
+unbounded, as the contract documents — open question 1.
+
+**Amended.** MSRV raised 1.85 → 1.89 for dependency-free directory locking. Bun is now a hard
+runtime requirement, not only a test dependency: the interactive client will not launch
+without it. `PLAN.md`'s turn lifecycle gained a status marker distinguishing shipped
+behaviour from design — reading that diagram as description is what produced the first draft's
+unachievable guarantees.
+
+---
+
+_Next: M2 — repo cache and mechanical graph. Two M1 questions remain open and should be
+settled first: how Bun is distributed to users, and the CI relationship between `cargo test`
+and `bun test`._

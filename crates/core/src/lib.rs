@@ -1,15 +1,28 @@
 //! Provider-neutral agent loop for the first usable Elefante milestone.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
+use elefante_guard::{BashClassifier, Verdict};
 use elefante_provider::{
     ContentBlock, Effort, Event, Message, ModelId, Provider, ProviderError, ReasoningDetail,
     Request, Role, StopReason, ToolDefinition, Usage,
 };
 use elefante_tools::{ToolExecutor, ToolResult, definitions as tool_definitions};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{StreamExt, future::BoxFuture};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinSet,
+};
+pub use tokio_util::sync::CancellationToken;
 
 /// The stable standing instructions. Safety and filesystem policy live in code.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly.";
@@ -44,24 +57,44 @@ impl RunConfig {
 /// the next request can return it unmodified, and is deliberately never
 /// surfaced as an [`OutputEvent`]: replaying it is a protocol obligation,
 /// displaying it is not.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
+    TurnStarted,
     /// A display fragment of the model's reasoning. Safe to render.
     ReasoningDelta(String),
     TextDelta(String),
     ToolStarted {
         id: String,
         name: String,
+        input_preview: String,
     },
     ToolFinished {
         id: String,
         name: String,
         is_error: bool,
+        output_preview: String,
+        duration_ms: u64,
+    },
+    ApprovalRequested {
+        approval_id: String,
+        command: String,
+        rule: &'static str,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        approved: bool,
+    },
+    TurnFinished {
+        stop_reason: StopReason,
+        usage: Usage,
+    },
+    Error {
+        message: String,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RunOutcome {
+pub struct TurnOutcome {
     pub stop_reason: StopReason,
     pub rounds: usize,
     pub text: String,
@@ -71,6 +104,240 @@ pub struct RunOutcome {
     /// stop event — so this is accumulated by draining each stream to completion
     /// rather than by reading a single terminal event.
     pub usage: Usage,
+}
+
+/// Compatibility name for single-turn callers.
+pub type RunOutcome = TurnOutcome;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Approved,
+    Denied,
+    Cancelled,
+}
+
+pub trait ApprovalSink: Send + Sync {
+    fn request<'a>(
+        &'a self,
+        id: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ApprovalOutcome>;
+}
+
+/// Headless callers cannot grant an escalation.
+pub struct DenyApprovalSink;
+
+impl ApprovalSink for DenyApprovalSink {
+    fn request<'a>(
+        &'a self,
+        _id: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ApprovalOutcome> {
+        Box::pin(async { ApprovalOutcome::Denied })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateDecision {
+    Allow,
+    Deny { rule: &'static str },
+    Escalate { rule: &'static str, command: String },
+}
+
+#[derive(Clone)]
+pub struct ToolGate {
+    classifier: BashClassifier,
+    approvals: Arc<dyn ApprovalSink>,
+}
+
+impl Default for ToolGate {
+    fn default() -> Self {
+        Self::new(Arc::new(DenyApprovalSink))
+    }
+}
+
+impl ToolGate {
+    #[must_use]
+    pub fn new(approvals: Arc<dyn ApprovalSink>) -> Self {
+        Self {
+            classifier: BashClassifier::new(),
+            approvals,
+        }
+    }
+
+    #[must_use]
+    pub fn with_approval_sink(approvals: Arc<dyn ApprovalSink>) -> Self {
+        Self::new(approvals)
+    }
+
+    #[must_use]
+    pub fn check(&self, name: &str, input: &Value) -> GateDecision {
+        self.check_in(name, input, std::path::Path::new("."))
+    }
+
+    fn check_in(&self, name: &str, input: &Value, root: &std::path::Path) -> GateDecision {
+        if name != "bash" {
+            return GateDecision::Allow;
+        }
+        let Some(command) = input.get("command").and_then(Value::as_str) else {
+            return GateDecision::Deny {
+                rule: "invalid-bash-input",
+            };
+        };
+        let decision = self.classifier.classify_in(command, root);
+        match decision.verdict {
+            Verdict::Allow => GateDecision::Allow,
+            Verdict::Deny => GateDecision::Deny {
+                rule: decision.rule,
+            },
+            Verdict::Escalate => GateDecision::Escalate {
+                rule: decision.rule,
+                command: command.to_owned(),
+            },
+        }
+    }
+}
+
+pub struct Session {
+    messages: Vec<Message>,
+    config: RunConfig,
+    usage: Usage,
+}
+
+impl Session {
+    #[must_use]
+    pub fn new(config: RunConfig) -> Self {
+        Self {
+            messages: Vec::new(),
+            config,
+            usage: Usage::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    #[must_use]
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    /// Appends one user turn and retains its paired history for subsequent prompts.
+    ///
+    /// # Errors
+    /// Returns provider/protocol failures or exhaustion of the round limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prompt<F>(
+        &mut self,
+        provider: &dyn Provider,
+        tools: &ToolExecutor,
+        gate: &ToolGate,
+        prompt: impl Into<String>,
+        cancel: CancellationToken,
+        mut emit: F,
+    ) -> Result<TurnOutcome, LoopError>
+    where
+        F: FnMut(OutputEvent),
+    {
+        self.messages.push(Message::text(Role::User, prompt));
+        emit(OutputEvent::TurnStarted);
+        let mut usage = Usage::default();
+        let result = self
+            .run_turn(provider, tools, gate, &cancel, &mut usage, &mut emit)
+            .await;
+        self.usage.accumulate(usage);
+        let stop_reason = match &result {
+            Ok(outcome) => outcome.stop_reason.clone(),
+            Err(error) => {
+                emit(OutputEvent::Error {
+                    message: error.to_string(),
+                });
+                StopReason::Other("error".to_owned())
+            }
+        };
+        emit(OutputEvent::TurnFinished { stop_reason, usage });
+        result
+    }
+
+    async fn run_turn<F>(
+        &mut self,
+        provider: &dyn Provider,
+        tools: &ToolExecutor,
+        gate: &ToolGate,
+        cancel: &CancellationToken,
+        usage: &mut Usage,
+        emit: &mut F,
+    ) -> Result<TurnOutcome, LoopError>
+    where
+        F: FnMut(OutputEvent),
+    {
+        let definitions = provider_tool_definitions();
+        let mut full_text = String::new();
+        for round_index in 0..self.config.max_rounds {
+            let request = Request {
+                model: self.config.model.clone(),
+                max_tokens: self.config.max_tokens,
+                system: vec![self.config.system_prompt.clone()],
+                tools: definitions.clone(),
+                messages: self.messages.clone(),
+                effort: self.config.effort,
+            };
+            let completed = receive_round(provider, request, cancel, usage, emit).await?;
+            full_text.push_str(&completed.text);
+            // Validate pairing before publishing an assistant message to persistent history.
+            if completed.stop_reason == StopReason::ToolUse && completed.calls.is_empty() {
+                return Err(LoopError::Protocol(
+                    "provider stopped for tool use without emitting a tool call".to_owned(),
+                ));
+            }
+            if !completed.calls.is_empty() && completed.stop_reason != StopReason::ToolUse {
+                return Err(LoopError::Protocol(
+                    "provider emitted tool calls without a tool-use stop".to_owned(),
+                ));
+            }
+            if !completed.assistant_content.is_empty() {
+                self.messages.push(Message {
+                    role: Role::Assistant,
+                    content: completed.assistant_content,
+                });
+            }
+            if completed.stop_reason != StopReason::ToolUse {
+                return Ok(TurnOutcome {
+                    stop_reason: completed.stop_reason,
+                    rounds: round_index + 1,
+                    text: full_text,
+                    usage: *usage,
+                });
+            }
+            let results = execute_calls(tools, gate, &completed.calls, cancel, emit).await;
+            self.messages.push(Message {
+                role: Role::User,
+                content: completed
+                    .calls
+                    .iter()
+                    .zip(results)
+                    .map(|(call, result)| ContentBlock::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: result.content,
+                        is_error: result.is_error,
+                    })
+                    .collect(),
+            });
+            if cancel.is_cancelled() {
+                return Ok(TurnOutcome {
+                    stop_reason: StopReason::Interrupted,
+                    rounds: round_index + 1,
+                    text: full_text,
+                    usage: *usage,
+                });
+            }
+        }
+        Err(LoopError::RoundLimit {
+            max_rounds: self.config.max_rounds,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -205,7 +472,6 @@ struct CompletedRound {
     calls: Vec<ToolCall>,
     text: String,
     stop_reason: StopReason,
-    usage: Usage,
 }
 
 /// Run a bounded provider/tool conversation from one user prompt.
@@ -222,92 +488,28 @@ pub async fn run_agent_loop<F>(
     tools: &ToolExecutor,
     prompt: impl Into<String>,
     config: RunConfig,
-    mut emit: F,
+    emit: F,
 ) -> Result<RunOutcome, LoopError>
 where
     F: FnMut(OutputEvent),
 {
-    let mut messages = vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: prompt.into(),
-        }],
-    }];
-    let definitions = provider_tool_definitions();
-    let mut full_text = String::new();
-    let mut run_usage = Usage::default();
-
-    for round_index in 0..config.max_rounds {
-        let request = Request {
-            model: config.model.clone(),
-            max_tokens: config.max_tokens,
-            system: vec![config.system_prompt.clone()],
-            tools: definitions.clone(),
-            messages: messages.clone(),
-            effort: config.effort,
-        };
-        let completed = receive_round(provider, request, &mut emit).await?;
-        full_text.push_str(&completed.text);
-        run_usage.accumulate(completed.usage);
-
-        if completed.stop_reason == StopReason::Refusal {
-            return Ok(RunOutcome {
-                stop_reason: completed.stop_reason,
-                rounds: round_index + 1,
-                text: full_text,
-                usage: run_usage,
-            });
-        }
-
-        if !completed.assistant_content.is_empty() {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: completed.assistant_content,
-            });
-        }
-
-        if completed.stop_reason != StopReason::ToolUse {
-            return Ok(RunOutcome {
-                stop_reason: completed.stop_reason,
-                rounds: round_index + 1,
-                text: full_text,
-                usage: run_usage,
-            });
-        }
-        if completed.calls.is_empty() {
-            return Err(LoopError::Protocol(
-                "provider stopped for tool use without emitting a tool call".to_owned(),
-            ));
-        }
-
-        let results = execute_calls(tools, &completed.calls).await;
-        let mut result_blocks = Vec::with_capacity(results.len());
-        for (call, result) in completed.calls.iter().zip(results) {
-            emit(OutputEvent::ToolFinished {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                is_error: result.is_error,
-            });
-            result_blocks.push(ContentBlock::ToolResult {
-                tool_use_id: call.id.clone(),
-                content: result.content,
-                is_error: result.is_error,
-            });
-        }
-        messages.push(Message {
-            role: Role::User,
-            content: result_blocks,
-        });
-    }
-
-    Err(LoopError::RoundLimit {
-        max_rounds: config.max_rounds,
-    })
+    Session::new(config)
+        .prompt(
+            provider,
+            tools,
+            &ToolGate::default(),
+            prompt,
+            CancellationToken::new(),
+            emit,
+        )
+        .await
 }
 
 async fn receive_round<F>(
     provider: &dyn Provider,
     request: Request,
+    cancel: &CancellationToken,
+    usage: &mut Usage,
     emit: &mut F,
 ) -> Result<CompletedRound, LoopError>
 where
@@ -316,9 +518,21 @@ where
     let mut stream = provider.stream(request);
     let mut accumulator = RoundAccumulator::new();
     let mut stop_reason = None;
-    let mut round_usage = Usage::default();
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                // Incomplete tool calls have never been dispatched and cannot be replayed.
+                accumulator.blocks.retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+                return Ok(CompletedRound { assistant_content: accumulator.blocks, calls: Vec::new(),
+                    text: accumulator.text, stop_reason: StopReason::Interrupted });
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event? {
             Event::ReasoningDelta(delta) => emit(OutputEvent::ReasoningDelta(delta)),
             // Replay state, not display: accumulated for the next request, never emitted.
@@ -328,10 +542,6 @@ where
                 accumulator.push_text(delta);
             }
             Event::ToolUseStart { id, name } => {
-                emit(OutputEvent::ToolStarted {
-                    id: id.clone(),
-                    name: name.clone(),
-                });
                 accumulator.start_tool(id, name)?;
             }
             Event::ToolUseInputDelta(delta) => {
@@ -343,7 +553,7 @@ where
                 accumulator.push_tool_input(&id, &delta);
             }
             Event::ToolUseComplete { id, input } => accumulator.complete_tool(&id, input)?,
-            Event::Usage(usage) => round_usage.accumulate(usage),
+            Event::Usage(report) => usage.accumulate(report),
             Event::Stop(reason) => {
                 if stop_reason.replace(reason).is_some() {
                     return Err(LoopError::Protocol(
@@ -362,7 +572,6 @@ where
             calls: Vec::new(),
             text: String::new(),
             stop_reason,
-            usage: round_usage,
         });
     }
     let (assistant_content, calls, text) = accumulator.finish()?;
@@ -371,7 +580,6 @@ where
         calls,
         text,
         stop_reason,
-        usage: round_usage,
     })
 }
 
@@ -386,11 +594,239 @@ fn provider_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
-async fn execute_calls(tools: &ToolExecutor, calls: &[ToolCall]) -> Vec<ToolResult> {
-    join_all(
-        calls
-            .iter()
-            .map(|call| tools.execute(&call.name, call.input.clone())),
-    )
-    .await
+/// Client previews are bounded independently of model-facing tool results.
+fn preview(value: &str) -> String {
+    const LIMIT: usize = 2048;
+    const MARKER: &str = "\n… [truncated]";
+    if value.len() <= LIMIT {
+        return value.to_owned();
+    }
+    let mut end = LIMIT - MARKER.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &value[..end])
+}
+
+fn tool_error(content: impl Into<String>) -> ToolResult {
+    ToolResult {
+        content: content.into(),
+        is_error: true,
+    }
+}
+
+struct ToolEvent {
+    event: OutputEvent,
+    published: Option<oneshot::Sender<()>>,
+}
+
+async fn execute_one(
+    tools: ToolExecutor,
+    call: ToolCall,
+    decision: GateDecision,
+    approvals: Arc<dyn ApprovalSink>,
+    approval_slot: Arc<Mutex<()>>,
+    cancel: CancellationToken,
+    events: mpsc::UnboundedSender<ToolEvent>,
+) -> ToolResult {
+    match decision {
+        GateDecision::Deny { rule } => tool_error(format!("bash denied by policy: {rule}")),
+        GateDecision::Allow if cancel.is_cancelled() => tool_error("interrupted"),
+        GateDecision::Allow => tools.execute(&call.name, call.input).await,
+        GateDecision::Escalate { rule, command } => {
+            static APPROVAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+            let slot = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return tool_error("interrupted"),
+                slot = approval_slot.lock() => slot,
+            };
+            let id = format!(
+                "approval-{}",
+                APPROVAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let (published, publication) = oneshot::channel();
+            let _ = events.send(ToolEvent {
+                event: OutputEvent::ApprovalRequested {
+                    approval_id: id.clone(),
+                    command,
+                    rule,
+                },
+                published: Some(published),
+            });
+            // The callback registers the daemon's approval before the sink may resolve it.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return tool_error("interrupted"),
+                result = publication => if result.is_err() { return tool_error("interrupted"); },
+            }
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => ApprovalOutcome::Cancelled,
+                outcome = approvals.request(&id, &cancel) => outcome,
+            };
+            let approved = outcome == ApprovalOutcome::Approved && !cancel.is_cancelled();
+            let _ = events.send(ToolEvent {
+                event: OutputEvent::ApprovalResolved {
+                    approval_id: id,
+                    approved,
+                },
+                published: None,
+            });
+            drop(slot);
+            if approved {
+                tools.execute(&call.name, call.input).await
+            } else if outcome == ApprovalOutcome::Cancelled || cancel.is_cancelled() {
+                tool_error("interrupted")
+            } else {
+                tool_error("bash approval denied")
+            }
+        }
+    }
+}
+
+async fn execute_calls<F>(
+    tools: &ToolExecutor,
+    gate: &ToolGate,
+    calls: &[ToolCall],
+    cancel: &CancellationToken,
+    emit: &mut F,
+) -> Vec<ToolResult>
+where
+    F: FnMut(OutputEvent),
+{
+    let mut set = JoinSet::new();
+    let mut results = HashMap::new();
+    let mut finished = HashSet::new();
+    let mut pending = HashSet::new();
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let approval_slot = Arc::new(Mutex::new(()));
+    let started = Instant::now();
+    for (index, call) in calls.iter().enumerate() {
+        emit(OutputEvent::ToolStarted {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input_preview: preview(&call.input.to_string()),
+        });
+        let decision = gate.check_in(&call.name, &call.input, tools.root());
+        let tools = tools.clone();
+        let call = call.clone();
+        let approvals = Arc::clone(&gate.approvals);
+        let approval_slot = Arc::clone(&approval_slot);
+        let cancel = cancel.clone();
+        let events_tx = events_tx.clone();
+        set.spawn(async move {
+            let start = Instant::now();
+            let result = execute_one(
+                tools,
+                call,
+                decision,
+                approvals,
+                approval_slot,
+                cancel,
+                events_tx,
+            )
+            .await;
+            (
+                index,
+                result,
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        });
+    }
+    drop(events_tx);
+    while !set.is_empty() {
+        tokio::select! {
+            biased;
+            Some(event) = events_rx.recv() => {
+                publish_tool_event(event, &mut pending, emit);
+            }
+            () = cancel.cancelled() => {
+                set.abort_all();
+                // Joining after abort retains tasks that completed before cancellation.
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((index, result, duration)) = joined { results.insert(index, (result, duration)); }
+                }
+                break;
+            }
+            Some(joined) = set.join_next() => {
+                if let Ok((index, result, duration_ms)) = joined {
+                    let call = &calls[index];
+                    emit(OutputEvent::ToolFinished { id: call.id.clone(), name: call.name.clone(),
+                        is_error: result.is_error, output_preview: preview(&result.content), duration_ms });
+                    finished.insert(index);
+                    results.insert(index, (result, duration_ms));
+                }
+            }
+            else => break,
+        }
+    }
+    while let Ok(event) = events_rx.try_recv() {
+        publish_tool_event(event, &mut pending, emit);
+    }
+    for approval_id in pending {
+        emit(OutputEvent::ApprovalResolved {
+            approval_id,
+            approved: false,
+        });
+    }
+    finish_calls(calls, results, &finished, cancel, started, emit)
+}
+
+fn publish_tool_event<F: FnMut(OutputEvent)>(
+    event: ToolEvent,
+    pending: &mut HashSet<String>,
+    emit: &mut F,
+) {
+    match &event.event {
+        OutputEvent::ApprovalRequested { approval_id, .. } => {
+            pending.insert(approval_id.clone());
+        }
+        OutputEvent::ApprovalResolved { approval_id, .. } => {
+            pending.remove(approval_id);
+        }
+        _ => {}
+    }
+    emit(event.event);
+    if let Some(published) = event.published {
+        let _ = published.send(());
+    }
+}
+
+fn finish_calls<F>(
+    calls: &[ToolCall],
+    mut results: HashMap<usize, (ToolResult, u64)>,
+    finished: &HashSet<usize>,
+    cancel: &CancellationToken,
+    started: Instant,
+    emit: &mut F,
+) -> Vec<ToolResult>
+where
+    F: FnMut(OutputEvent),
+{
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let (result, duration_ms) = results.remove(&index).unwrap_or_else(|| {
+                (
+                    tool_error(if cancel.is_cancelled() {
+                        "interrupted"
+                    } else {
+                        "tool task failed"
+                    }),
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )
+            });
+            if !finished.contains(&index) {
+                emit(OutputEvent::ToolFinished {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: result.is_error,
+                    output_preview: preview(&result.content),
+                    duration_ms,
+                });
+            }
+            result
+        })
+        .collect()
 }

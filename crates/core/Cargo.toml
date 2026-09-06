@@ -6,12 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+elefante-guard = { path = "../guard" }
 elefante-provider = { path = "../provider" }
 elefante-tools = { path = "../tools" }
 futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

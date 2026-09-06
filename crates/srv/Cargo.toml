@@ -6,8 +6,24 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
 elefante-core = { path = "../core" }
 elefante-rpc = { path = "../rpc" }
+elefante-provider = { path = "../provider" }
+elefante-tools = { path = "../tools" }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "elefante-srv"
+path = "src/main.rs"
 
 [lints]
 workspace = true

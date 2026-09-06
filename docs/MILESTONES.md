@@ -128,6 +128,16 @@ never built on its own declared floor. Corrected to 1.90 and verified. `README.m
 1.85, two revisions stale. *This is the argument for the job in one paragraph — a declared
 floor nobody compiles against is a comment.*
 
+**And the toolchain was pinned only on one side.** The first CI run also failed `clippy`, on
+`collapsible_match` in `srv/src/stub.rs` — a lint that exists in the runner's clippy 1.98 and
+not in the 1.94 every local check had used, so no amount of local verification could have
+found it. The workflow pinned Bun and left Rust on `stable`, which with `clippy::pedantic` at
+warn and `-D warnings` means any Rust release can redden CI on an unrelated PR. Now pinned to
+1.98.1, with an advisory `lints` job on floating `stable` that reports new lints without
+power to fail the run. *Clippy's own suggestion was declined: it wanted the nested `if` folded
+into a match guard, and guards run during pattern selection, so `remove` would have mutated
+`pending` on arms that then did not match.*
+
 ---
 
 _Next: M2 — repo cache and mechanical graph._

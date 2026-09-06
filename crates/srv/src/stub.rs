@@ -93,20 +93,21 @@ pub(crate) fn validate_pairing(request: &Request) -> Result<(), ProviderError> {
     let mut pending = HashSet::new();
     for message in &request.messages {
         for block in &message.content {
-            match block {
+            // Each arm does its own bookkeeping and reports why it failed, if it did.
+            // Clippy offers to collapse the nested `if` into a match guard, but a guard runs
+            // during pattern selection, so `remove` would mutate `pending` even on arms that
+            // go on not to match.
+            let failure = match block {
                 ContentBlock::ToolUse { id, .. } => {
-                    if !pending.insert(id.clone()) {
-                        return Err(ProviderError::Protocol("duplicate tool_use id".into()));
-                    }
+                    (!pending.insert(id.clone())).then_some("duplicate tool_use id")
                 }
                 ContentBlock::ToolResult { tool_use_id, .. } => {
-                    if !pending.remove(tool_use_id) {
-                        return Err(ProviderError::Protocol(
-                            "unpaired or duplicate tool_result".into(),
-                        ));
-                    }
+                    (!pending.remove(tool_use_id)).then_some("unpaired or duplicate tool_result")
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(reason) = failure {
+                return Err(ProviderError::Protocol(reason.into()));
             }
         }
     }

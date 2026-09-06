@@ -6,27 +6,28 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M0: a provider-backed coding loop running in a plain terminal. The
-implemented vertical slice can:
+The repository is at M1: a provider-backed coding loop behind a daemon, driven by either a
+headless client or an OpenTUI terminal client. The implemented vertical slice can:
 
 - send a prompt and stable tool catalog to OpenRouter;
-- stream reasoning and text;
-- assemble provider events into replayable conversation history;
-- execute model-requested tools concurrently;
-- enforce path, shell, and output-scrubbing policy; and
-- continue the conversation until the provider ends the turn, refuses, or reaches a
-  configured round limit.
+- stream reasoning and text, separated end to end;
+- assemble provider events into replayable conversation history that persists across turns;
+- execute model-requested tools concurrently, and cancel them mid-flight;
+- enforce path, shell, and output-scrubbing policy, suspending for approval when the shell
+  classifier escalates;
+- serve many clients per session and many sessions per client, with resume after disconnect;
+  and
+- continue the conversation until the provider ends the turn, refuses, is interrupted, or
+  reaches a configured round limit.
 
-Several crates already exist as compile-safe scaffolds because their dependency boundaries
-are expensive to retrofit. They do not imply that later milestones have shipped:
+Crates that remain compile-safe scaffolds, because their dependency boundaries are expensive
+to retrofit. These do not imply that later milestones have shipped:
 
-- `elefante-rpc` contains only a request envelope; the M1 protocol is not implemented.
-- `elefante-srv` contains only an M1 marker; there is no daemon or session registry.
 - `elefante-mem` contains only an M2 availability marker; there is no database or graph.
-- There is no `tui/` directory yet.
 
-M0's hermetic gate is green. The credentialed OpenRouter cache-hit test and live repository
-edit have not run, so the milestone remains formally in progress.
+Both milestone gates are green, including the credentialed OpenRouter cache-hit test and the
+live repository edit. CI runs the hermetic gates on every push and the credentialed pair
+behind `workflow_dispatch`; see `.github/workflows/`.
 
 ## 2. Design principles
 
@@ -38,8 +39,8 @@ The implementation follows four project-level convictions:
 2. **Normalize at boundaries.** Core code works with provider-neutral requests, content,
    events, usage, and stop reasons. OpenRouter JSON and SSE details stay in the provider crate.
 3. **Make unsafe paths fail closed.** Filesystem aliases are resolved before access, shell
-   syntax is classified across the full parse tree, and unclassified mutation requires an
-   approval mechanism that M0 intentionally does not provide.
+   syntax is classified across the full parse tree, and unclassified mutation suspends for
+   an explicit approval rather than proceeding.
 4. **Treat milestones as gates.** A later milestone cannot use incomplete earlier behavior
    as accepted debt. The complete earlier gate must remain green.
 
@@ -64,8 +65,8 @@ elefante/
     ├── provider/                  normalized model API + OpenRouter transport
     ├── guard/                     path, shell, and secret-output policy
     ├── tools/                     schemas and syscall-facing tool executor
-    ├── rpc/                       M1 protocol scaffold
-    ├── srv/                       M1 daemon scaffold
+    ├── rpc/                       wire envelopes and framing
+    ├── srv/                       daemon, session registry, ring
     └── mem/                       M2 memory scaffold
 ```
 
@@ -95,10 +96,12 @@ elefante-rpc ──► no internal crate
 
 The binary is composition code. It parses arguments, reads environment configuration,
 constructs `OpenRouterProvider` and `ToolExecutor`, builds `RunConfig`, and calls
-`run_agent_loop`. It currently renders reasoning and text deltas through one match arm to stdout, which is the defect in issue #4: reasoning and answer print as one undelimited run. M1 replaces this path with a headless client that puts the answer on stdout and reasoning on stderr. Tool lifecycle
-events are available from core but are not rendered by the M0 terminal frontend.
+the daemon. It is a client: it spawns `elefante-srv` if none is listening, then streams a
+session over the socket. The answer goes to stdout and reasoning plus tool activity to
+stderr, which is what resolves issue #4 — the two can no longer render as one undelimited
+run, by construction rather than by formatting.
 
-Keep provider protocol parsing, policy, and orchestration out of this crate. M1 will replace
+Keep provider protocol parsing, policy, and orchestration out of this crate. Prefer
 this direct composition path with daemon/client startup behavior.
 
 ### `elefante-core`
@@ -159,36 +162,39 @@ passes are complete.
 
 ## 5. Runtime interaction
 
-One CLI invocation follows this path:
+Elefante runs as a **daemon plus clients**. The `elefante` binary is a client; `elefante-srv`
+holds the sessions. A client that finds no daemon spawns one and waits for it to bind, so
+this is invisible in normal use — but the split is what makes reconnect, interrupt, and
+multiple simultaneous clients possible at all.
 
 ```text
-prompt / stdin
-     │
-     ▼
-elefante-cli
-  ├─ reads flags and environment
-  ├─ roots ToolExecutor at current_dir()
-  └─ calls core::run_agent_loop
-           │
-           ▼
-      build normalized Request
-           │
-           ▼
-      Provider::stream ──► OpenRouter request JSON ─► SSE response
-           ▲                                         │
-           └──────────── normalized Event stream ◄───┘
-           │
-           ├─ reasoning/text delta ─► frontend callback
-           ├─ complete content block ──► assistant history
-           └─ stop_reason == tool_use
+elefante (headless)      TUI client (bun)
+        │                       │
+        └───────┬───────────────┘
+                │  newline-delimited JSON over a Unix socket
+                ▼
+          elefante-srv ── session registry
+                │           ├─ ring (4,096 events)  ← resume
+                │           └─ per-client queue (256) ← backpressure
+                ▼
+          core::Session ── history across turns
+                │
+                ▼
+      Provider::stream ──► OpenRouter request ─► SSE response
+        ▲                                        │
+        └──────── normalized Event stream ◄──────┘
+                │
+                ├─ reasoning/text delta ─► notification ─► every attached client
+                └─ stop_reason == tool_use
                           │
                           ▼
-                    concurrent tool batch
+                  concurrent tool batch (JoinSet, cancellable)
                           │
              ┌────────────┴─────────────┐
              ▼                          ▼
        guard decision              tool syscall
              │                          │
+       Escalate ─► approval.requested   │
              └────────────┬─────────────┘
                           ▼
                     scrub every result
@@ -198,6 +204,208 @@ elefante-cli
                           │
                           └──────────────► next provider round
 ```
+
+### Transport
+
+Unix domain socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to
+`~/.elefante/run/elefante.sock`. `ELEFANTE_SOCKET` overrides the path, and test isolation
+depends on it.
+
+**Access is enforced by a `0700` parent directory, created before the socket.**
+`UnixListener::bind` applies the process umask and there is no safe API to bind with an
+explicit mode; the umask route needs `libc::umask`, which is `unsafe`, and the workspace sets
+`unsafe_code = "forbid"`. Chmod-after-bind leaves a window. A private directory closes it
+with no `unsafe`.
+
+**Framing is newline-delimited JSON** — one value per line, `\n` terminated, UTF-8, no
+embedded raw newlines (`serde_json` escapes them inside strings, which is what makes the
+framing safe). A line longer than 8 MiB is a protocol error and closes the connection.
+
+**JSON-RPC-*shaped*, not JSON-RPC 2.0 conformant.** Requests and responses follow the 2.0
+member layout, but notifications carry top-level `seq`, `turn_id`, and `session_id`, which
+strict 2.0 does not permit. That is deliberate — they are routing and ordering metadata every
+consumer needs before it looks at `params` — but it means **an off-the-shelf JSON-RPC library
+will not round-trip our notifications**. Both sides hand-roll the envelope.
+
+### Sequencing
+
+```jsonc
+{ "session_id": "s1", "seq": 413, "turn_id": "t7", "method": "text.delta", "params": { } }
+```
+
+- **`session_id` is mandatory on every notification.** A client may attach to several sessions
+  on one connection and `seq` is per-session; without it a merged stream reads `413, 7, 414, 8`
+  and trips the gap rule on every alternation.
+- `seq` is **monotonic per session**, starting at 1, never reused, never reset — across turns
+  and across reconnects. `session.create` returns 0, so the first event is 1.
+- `turn_id` groups events; "the third event of turn 7" is counted client-side, so there is no
+  second counter to keep in sync.
+- Events outside a turn carry `turn_id: null`.
+
+A gap in `seq` means the client missed something and must resynchronise. It must never be read
+as "nothing happened."
+
+### Method set
+
+Client → server:
+
+| Method | Params | Result |
+|---|---|---|
+| `session.create` | `{ cwd, model?, effort?, max_rounds?, max_tokens? }` | `{ session_id, seq }` |
+| `session.prompt` | `{ session_id, text }` | `{ turn_id }` — notifications follow |
+| `session.interrupt` | `{ session_id }` | `{}` |
+| `session.attach` | `{ session_id, since?: number }` | see **Attach and resume** |
+| `session.close` | `{ session_id }` | `{}` |
+| `session.resolve_approval` | `{ session_id, approval_id, decision: "allow" \| "deny" }` | `{}` |
+| `key.set` | `{ api_key }` | `{}` — first-run setup |
+
+`session.create` validates `cwd`: it must exist, be a directory, and be canonicalisable. A
+long-lived daemon that roots a `ToolExecutor` at any path a caller names is a larger blast
+radius than a CLI confined to `env::current_dir()`.
+
+`session.close` exists because sessions otherwise accumulate for the daemon's lifetime, each
+holding a ring plus full history. Closing is idempotent and cancels a live turn first.
+
+Server → client notifications:
+
+| Method | Params |
+|---|---|
+| `turn.started` | `{}` |
+| `reasoning.delta` | `{ text }` |
+| `text.delta` | `{ text }` |
+| `tool.started` | `{ tool_call_id, name, input_preview }` |
+| `tool.finished` | `{ tool_call_id, is_error, output_preview, duration_ms }` |
+| `approval.requested` | `{ approval_id, command, rule }` |
+| `approval.resolved` | `{ approval_id, approved }` |
+| `turn.finished` | `{ stop_reason, usage }` |
+| `session.error` | `{ message }` — turn ended abnormally, always followed by `turn.finished` |
+
+`approval.requested` carries **no `reason`**: `BashDecision` has `verdict` and `rule` only, and
+a prose reason is the M4 triage-critic verdict.
+
+`approval.resolved` is required by fanout — with several clients attached, one resolves the
+prompt and the rest must dismiss their modal.
+
+Reasoning *replay* state (`ReasoningDetails`) is never sent to clients. It exists so the next
+request can echo it verbatim; rendering it would present internal replay tokens as output.
+
+**`stop_reason` is a union.** `StopReason` derives `rename_all = "snake_case"`, so
+`Other(String)` serialises as the **object** `{"other": "..."}`, not a string:
+
+```jsonc
+"end_turn" | "tool_use" | "max_tokens" | "refusal" | "stop_sequence"
+  | "interrupted" | { "other": string }
+```
+
+**`usage`** carries all six fields, always present, `cost` nullable — `cost: null` means *not
+reported*, which is distinct from `0.0`:
+
+```jsonc
+{ "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+  "cached_input_tokens": 0, "cache_write_tokens": 0, "cost": 0.0 | null }
+```
+
+**Previews are cut at 2 KiB** on a UTF-8 character boundary, never mid-codepoint, with the
+removed span replaced by exactly `\n… [truncated]`.
+
+### Attach and resume
+
+`session.attach` has three outcomes and a client must handle all three:
+
+1. **Resumed** — `since` is still inside the ring:
+   `{ "kind": "resumed", "from": 413, "events": [ ... ] }`
+2. **Snapshot** — `since` omitted, or older than the oldest buffered event:
+   `{ "kind": "snapshot", "seq": 981, "snapshot": { ... } }`
+3. **Unknown session** — a normal JSON-RPC error.
+
+`since` is **exclusive**: `since: 412` yields `from: 413`. `events[]` elements are complete
+notification envelopes, identical to live delivery — one shape, one parser.
+
+**The snapshot case must never be silent.** A daemon that answers a stale `since` with recent
+events produces a transcript with an invisible hole.
+
+**The daemon holds notification delivery on a connection from the moment an `attach` for that
+session arrives until the response has been written.** Without that rule a notification at
+`seq: 415` can arrive before a result carrying 413–416, and a client deduping on a high-water
+mark discards 413 and 414 as already-seen. **Client-side dedupe is therefore a seen-set over
+the resume window, not a watermark** — a watermark cannot distinguish "already applied" from
+"arrived out of order."
+
+The snapshot is materialised state, not an event log: `session_id`, `seq`, `cwd`, `model`,
+completed `turns[]`, and `active_turn` (null when idle). Tool entries use **one shape
+everywhere** — `{ tool_call_id, name, state, is_error }` — in both, so the reducer never
+branches on where it found the value. `state` is `"running" | "ok" | "error" | "cancelled"`.
+
+### The ring and the two buffers
+
+These are different things, and conflating them breaks resume.
+
+**Session ring** — 4,096 events, the source of truth for resume. Stores events *as emitted*,
+each with its own `seq`, and is **never coalesced**, because `since: 412` must address a real
+event.
+
+**Per-client output queue** — 256 events, where backpressure is handled. Under pressure it
+coalesces adjacent deltas *of the same method*, and a merged event carries **`seq_from` and
+`seq_to`** rather than a single `seq`:
+
+```jsonc
+{ "session_id": "s1", "seq_from": 495, "seq_to": 500, "turn_id": "t7",
+  "method": "text.delta", "params": { "text": "..." } }
+```
+
+The range is what distinguishes a merge from a drop. Carrying only the highest `seq` would make
+every coalesce look like a gap and trip the client's own resynchronise rule during normal
+operation.
+
+**Coalescing never crosses channels.** A `reasoning.delta` is never merged into an adjacent
+`text.delta`. Merging across channels would destroy the reasoning/answer distinction *in the
+transport*, and only under load — so issue #4 would reappear as an intermittent defect no
+render-site fix could reach. A queue fed `reasoning, reasoning, text, text` emits **two**
+events, not one. Discrete events — `tool.started`, `tool.finished`, `approval.requested`,
+`turn.finished` — are never merged or dropped.
+
+Coalescing only helps on runs of the same method, so a turn interleaving
+`text, tool.started, text, tool.finished` coalesces nothing and a hung client on that workload
+falls through to eviction. That is a known limit: merging across a discrete event would reorder
+it, and reordering `tool.started` against the text explaining it is worse than dropping a client
+that has stopped reading.
+
+When a queue overflows even after coalescing, the daemon **closes the connection** and forgets
+the client. It does not send `session.error` first — a client whose queue is overflowing cannot
+receive it, and `session.error` promises a following `turn.finished`, which is not true here.
+The connection closing *is* the signal; the session is unaffected.
+
+### Session lifecycle
+
+- **Prompt** takes the session's turn lock. A second prompt while a turn is live is **rejected,
+  not queued** — silent queueing makes an interrupted session behave unpredictably.
+- **Attach/detach** is many clients per session and many sessions per client. Detaching changes
+  nothing about execution.
+- **A turn continues with zero clients attached.** If every terminal dies mid-turn, tools keep
+  running and events keep landing in the ring. That is what makes "reconnect and the turn
+  completes intact" achievable.
+- **Idle exit** happens after an idle period with no clients *and* no active turns; checking
+  only the client count would make the daemon kill its own work. Defaults to 15 minutes, set by
+  `ELEFANTE_IDLE_SECS`.
+- **Interrupt** cancels the in-flight provider stream and aborts the tool `JoinSet`. Tools that
+  already completed still return their results, so every `tool_use` keeps exactly one matching
+  `tool_result` — an unpaired id makes the next request 400. The turn ends with
+  `turn.finished { stop_reason: "interrupted" }`.
+
+### Error model
+
+Standard JSON-RPC error objects, application codes in the `-32000` range:
+
+| Code | Meaning |
+|---|---|
+| `-32001` | Unknown session |
+| `-32002` | Turn already in progress |
+| `-32003` | `since` exceeds the session's current `seq` — the client claims events that do not exist. A `since` that merely predates the ring is **not** an error; it returns a snapshot. |
+| `-32004` | No API key configured — client should prompt and call `key.set` |
+| `-32005` | Unknown approval id, or approval already resolved |
+
+Transport and provider failures *inside* a turn are not RPC errors — the request already
+succeeded. They arrive as `session.error` followed by `turn.finished`.
 
 ### Round construction
 
@@ -308,8 +516,9 @@ Stop reasons normalize as `stop` → `EndTurn`, `tool_calls` → `ToolUse`, `len
 
 `Usage` tracks input, output, reasoning, cached-input, and cache-write tokens plus an optional
 `cost` in real dollars reported by the provider. `cached_input_tokens` is the cache-hit signal.
-M0 parses usage but does not yet aggregate or display it; that belongs to M5, where the
-reported `cost` replaces a local price-table calculation.
+Usage is parsed and reported on `turn.finished`, but not aggregated into cost or staleness
+reporting; that belongs to M5, where the reported `cost` replaces a local price-table
+calculation.
 
 ### Core result types
 
@@ -342,8 +551,9 @@ and distinguishes outside-root, denied-secret, resolution, and custom-pattern fa
 
 ### RPC scaffold
 
-`RequestEnvelope` currently models only `jsonrpc`, `id`, `method`, and `params`. Do not infer
-M1 method or notification stability from this placeholder.
+The wire envelopes live here. A notification carries no `id` and adds top-level `seq`,
+`turn_id`, and `session_id`, so it cannot be represented by a request envelope; section 5 is
+the contract.
 
 ## 7. OpenRouter transport details
 
@@ -424,7 +634,7 @@ The seven tools are intentionally permanent prompt cost, so additions require a 
 | `glob` | `pattern`, optional `path` | Lists matching allowed files deterministically. |
 | `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. |
 | `bash` | `command` | Executes only commands classified `Allow`. |
-| `memory_search` | `query` | Deterministic M2-not-available error in M0. |
+| `memory_search` | `query` | Deterministic M2-not-available error. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk
@@ -466,8 +676,10 @@ severe result:
   are denied; and
 - write-capable shell redirections escalate, even when attached to `echo` or `printf`.
 
-M0 has no approval channel, so `Escalate` returns a deterministic error and does not execute.
-M1 may suspend for approval, but it must reuse the same classifier result rather than bypass it.
+`Escalate` suspends the tool call and emits `approval.requested`; the decision arrives as
+`session.resolve_approval`. A `Deny` never reaches that channel at all — it is terminal, and a
+denied command emits no approval request. Any future approval path must reuse the same
+classifier result rather than bypass it.
 
 Static shell analysis cannot understand runtime aliases, generated program names, `eval`, or
 every interpreter payload. The classifier deliberately documents known-not-caught cases; do
@@ -560,8 +772,9 @@ declares `prompt_caching`. It passes when the second identical request reports n
 `cached_input_tokens`. The hermetic suite proves the *parsing* of that field; this gate proves
 the cache actually hit.
 
-Do not record M0 complete until this check reports a nonzero cache read on the second request
-and a live agent request lands a trivial, reviewed edit in this repository.
+A milestone is not complete until this check reports a nonzero cache read on the second
+request and a live agent request lands a trivial, reviewed edit. Both run in CI through
+`.github/workflows/credentialed.yml`.
 
 ## 12. Making changes safely
 
@@ -593,7 +806,7 @@ flow. The single boundary is what makes “every result is scrubbed” auditable
 7. Test malformed chunks, provider errors, refusal, tool-result continuation, and capability
    degradation.
 
-OpenRouter is the only transport as of M0, and the `Provider` trait exists to keep wire types
+OpenRouter is the only transport, and the `Provider` trait exists to keep wire types
 out of core rather than to host a second implementation. Prefer a different model slug to a
 second transport: OpenRouter already reaches other vendors' models, which is what lets
 adversarial review run on a different vendor without a second integration. Adding a transport
@@ -636,17 +849,29 @@ When behavior changes, update:
 
 ## 14. Known limitations and next boundaries
 
-- M0 approvals are non-interactive: `Escalate` is a safe error, not a prompt.
 - `memory_search` has no backing graph until M2.
 - Usage is parsed but not accumulated into cost/staleness reporting until M5.
-- There is no daemon, socket, session registry, reconnect, interrupt, or multi-client support.
-- There is no OpenTUI client.
 - There is no model-backed critic.
+- `session.list` waits for the tmux fanout work, so a client cannot enumerate sessions it did
+  not create.
 - The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
   time-of-check/time-of-use filesystem races.
 
 These limitations are milestone boundaries. Implement them through the corresponding plan
 and gate rather than hiding partial versions behind existing APIs.
+
+### Open protocol questions
+
+Two questions the wire contract left deliberately unsettled. Decide and record them here.
+
+1. **Snapshot growth is unbounded per session.** Full assistant text is retained per completed
+   turn — tool bodies are not, only previews — so a snapshot is bounded per turn but not per
+   session, and turn count has no limit. Whether the TUI ships a scrollback view of completed
+   turns or only the live turn plus a compact history decides this, because it decides what a
+   snapshot has to carry.
+2. **Whether `tool.started` should stream argument fragments.** It currently fires once with a
+   complete `input_preview`. Streaming arguments would show tool inputs building in real time,
+   at the cost of a much noisier event stream.
 
 ## 15. Troubleshooting
 
@@ -655,11 +880,11 @@ and gate rather than hiding partial versions behind existing APIs.
 Export the key into the process environment. Do not create a repository `.env`; it is ignored
 by Git and denied by Elefante's own path policy.
 
-### `bash requires approval (unavailable in M0)`
+### `bash requires approval`
 
-The classifier returned `Escalate`. Use a narrower existing tool (`read`, `write`, `edit`,
-`glob`, or `grep`) or wait for the M1 approval transport. Do not broaden the shell allowlist
-just to make a task convenient.
+The classifier returned `Escalate`, so the call is suspended pending an approval. Answer the
+prompt, or use a narrower existing tool (`read`, `write`, `edit`, `glob`, or `grep`). Do not
+broaden the shell allowlist just to make a task convenient.
 
 ### `secret-path-policy: ...`
 
@@ -668,7 +893,7 @@ Move non-secret fixture data to an allowed path; never rename real credentials t
 
 ### `memory_search is unavailable until milestone M2`
 
-This is expected M0 behavior. Repository inspection currently uses `read`, `glob`, and `grep`.
+This is expected. Repository inspection currently uses `read`, `glob`, and `grep`.
 
 ### Provider stream ends with a protocol error
 

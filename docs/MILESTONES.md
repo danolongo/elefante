@@ -81,7 +81,9 @@ adversarial review of the first M1 draft found four blocking defects sharing one
 the wire had been specified before the core types it derives from. Every notification was
 unproducible from the shipped `OutputEvent`; the session type it presupposed did not exist;
 the interrupt guarantee was unachievable against `join_all`. Splitting into `M1-CORE.md` and
-`M1-PROTOCOL.md` cost one review and fixed all four before a line was written.
+`M1-PROTOCOL.md` cost one review and fixed all four before a line was written. Both documents
+were retired once the code shipped — the wire contract they carried now lives in
+[`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5.
 
 Two gate items existed only because that review found they would pass on a broken
 implementation, and both proved load-bearing: the stub provider **validates**
@@ -149,6 +151,17 @@ supplying something the declared inputs did not, and each was invisible to any a
 careful local checking. *This is what CI buys that discipline cannot — not a second opinion,
 but a machine with no memory of what we happened to build last week.* Worth holding onto for
 M2, which adds a cache layer whose whole job is to make local state survive between runs.
+
+**The M1 contracts were retired.** `M1-CORE.md` and `M1-PROTOCOL.md` are deleted. The core
+types they froze are now embodied in code and needed no second home, but the wire contract did:
+the daemon and the TypeScript client speak that format across a process boundary, so it moved
+into [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5 — transport, sequencing, method set,
+attach and resume, the ring and the two buffers, session lifecycle, and the error codes. The
+two questions the contract left open moved to §14. *Retiring them exposed how far the guide had
+drifted: it still announced "the repository is at M0", "there is no daemon", and "there is no
+OpenTUI client", and told readers to wait for an approval transport that had shipped. A
+reference that describes a version of the project nobody is running is worse than none, so it
+was corrected in the same pass.*
 
 ---
 

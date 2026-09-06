@@ -49,8 +49,8 @@ elefante/
   Cargo.toml                 # workspace
   docs/PLAN.md               # this document
   docs/MILESTONES.md         # per-milestone completion record
-  docs/M1-CORE.md            # frozen core types; prerequisite for the protocol
-  docs/M1-PROTOCOL.md        # frozen wire contract, derived from M1-CORE
+  docs/DEVELOPER_GUIDE.md    # shipped behaviour, incl. the wire contract (§5)
+  docs/LOCKFILE.md           # why tui/ commits exactly one lockfile
   crates/
     rpc/                     # wire types shared by daemon and client (no deps on others)
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
@@ -285,7 +285,7 @@ Newline-delimited JSON, JSON-RPC 2.0 shaped, bidirectional over one unix socket.
 
 Every notification carries a monotonic per-session `seq` and a `turn_id`. `session.attach` takes an optional `since` and returns either resumed deltas or a full snapshot — never a silent gap. That is what lets a second client, or a reconnecting one after a crash, render a session already in flight; building it in from the start is far cheaper than retrofitting it once the TUI assumes it owns the session.
 
-**The method set, wire types, snapshot shape, error codes, ring sizing, and backpressure rules are frozen in [`M1-PROTOCOL.md`](./M1-PROTOCOL.md).** That document is the single source of truth for the protocol; this section covers only why it is shaped that way.
+**The method set, wire types, snapshot shape, error codes, ring sizing, and backpressure rules are specified in [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5.** That section is the single source of truth for the protocol; this one covers only why it is shaped that way.
 
 ---
 
@@ -330,11 +330,10 @@ enum Event {
 
 **6. Tool dispatch** on `stop_reason == tool_use` — the most interaction-dense step.
 
-> **Status: designed, not yet shipped.** M0 dispatches with `join_all` and classifies bash
-> *inside* `tools`, not through `guard::check` here. Both are M1 work, specified in
-> [`M1-CORE.md`](./M1-CORE.md) §3–4. The diagram below is the target, and reading it as
-> description is what produced a protocol draft promising interrupt guarantees the code
-> could not keep.
+> **Status: shipped in M1.** Dispatch is a `JoinSet` and bash is classified through
+> `guard::check` in `core`, not inside `tools`. This diagram was the target while it was still
+> design; reading it as description back then is what produced a protocol draft promising
+> interrupt guarantees the code could not keep.
 
 ```
 for each tool_use block  ──►  guard::check(&call) ──┬─► Allow    ─► tools::execute
@@ -540,7 +539,7 @@ The decision it forced, now settled: reasoning blocks are stored **verbatim as o
 
 **Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. The CLI stops running the loop in process and becomes a client — one-shot prompts use a headless client, which doubles as the daemon's test harness. **First-run key setup** rides on the same channel.
 
-Frozen contracts: [`M1-CORE.md`](./M1-CORE.md) then [`M1-PROTOCOL.md`](./M1-PROTOCOL.md), in that order — the wire is derived from the core types and cannot be specified before them. Their gates are authoritative; the items below are the summary.
+Shipped. The wire contract now lives in [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5, and the gate that proved it is recorded in [`MILESTONES.md`](./MILESTONES.md); the items below are the summary. The contract was drafted as two documents — core types first, then the wire derived from them — because an adversarial review found the reverse order had produced four blocking defects. Both were retired once the code carried the same information.
 
 M1 also lands three things M0 left as design rather than code: `guard::check` moves from `tools` into `core`'s dispatch so approval has somewhere to suspend, dispatch becomes a `JoinSet` so an interrupt can keep completed tool results, and `run_agent_loop` becomes a `Session` that owns history across turns.
 

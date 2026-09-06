@@ -89,5 +89,6 @@ that also changes the analysis. It did not in 1.4.2.
 - CI installs with `bun install --frozen-lockfile` (`.github/workflows/ci.yml`), which is
   meaningful only because the lockfile it verifies against is the one committed here.
 - Bun distribution — whether the client ships as a compiled binary rather than requiring Bun
-  on PATH — is [`M1-PROTOCOL.md`](./M1-PROTOCOL.md) open question 2. That decision does not
-  affect this one: `bun build --compile` bundles from the same resolved tree.
+  on PATH — is settled in [`MILESTONES.md`](./MILESTONES.md): vendor via `bun build --compile`,
+  deferred to a release. That decision does not affect this one: `bun build --compile` bundles
+  from the same resolved tree.

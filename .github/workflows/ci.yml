@@ -121,7 +121,7 @@ jobs:
       - name: install
         working-directory: tui
         run: bun install --frozen-lockfile
-      # Keeps the vendored-binary option open (M1-PROTOCOL.md open question 2) at ~0.4s per
+      # Keeps the vendored-binary option open (see MILESTONES.md) at ~0.4s per
       # run. The client must stay compile-able: no runtime node_modules lookups, no dynamic
       # imports of paths absent at bundle time. Retrofitting that after M2-M5 accumulate
       # client code is the expensive version of this check.

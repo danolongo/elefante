@@ -59,7 +59,7 @@ elefante/
 │   ├── PLAN.md                    design of record and milestone gates
 │   ├── MILESTONES.md              completion record
 │   └── DEVELOPER_GUIDE.md         this guide
-└── crates/
+└── crates/                     every crate carries its own README.md
     ├── cli/                       `elefante` terminal binary
     ├── core/                      provider/tool conversation loop
     ├── provider/                  normalized model API + OpenRouter transport
@@ -76,21 +76,95 @@ workspace lints from the root manifest. `unsafe` code is forbidden. Clippy's `al
 
 ## 4. Crate responsibilities and dependency direction
 
-The current internal dependency graph is:
+### The system as it stands
+
+Three processes, one socket, one outbound connection. Section 5 traces a single turn through
+this; here it is as structure — which crate lives where, and what crosses each boundary.
 
 ```text
-elefante-cli ──► elefante-core ──► elefante-provider
-      │                 │
-      │                 └────────► elefante-tools ──► elefante-guard
-      ├────────► elefante-provider
-      └────────► elefante-tools
+  ── clients ──────────────────────────────────────────────────────────────────
 
-elefante-srv ──► elefante-core
-      └────────► elefante-rpc
+   elefante  (bin)                        tui/  (Bun + OpenTUI)
+   ├─ elefante-cli    StreamRenderer      ├─ protocol.ts   framing, seq window
+   │                  stdout = answer     ├─ session.ts    pure reducer, no I/O
+   │                  stderr = reasoning  └─ ui/*.tsx      components
+   └─ elefante-rpc    wire types             (speaks the wire; links no Rust)
+             │                                        │
+             └───────────────────┬────────────────────┘
+                                 │  NDJSON, one value per line, ≤ 8 MiB
+                                 │  Unix socket inside a 0700 directory
+  ── daemon ─────────────────────▼─────────────────────────────────────────────
 
-elefante-mem ──► elefante-guard
-elefante-rpc ──► no internal crate
+   elefante-srv  (bin)
+   ├─ server.rs        listener · session registry · ring 4096 · dispatch
+   ├─ queue.rs         per-client queue 256; coalesces same-method deltas only
+   ├─ credentials.rs   0700 directories, 0600 key file
+   └─ stub.rs          scripted Provider for tests; validates tool pairing
+             │
+             ├──► elefante-rpc ──► elefante-provider   re-exports StopReason, Usage
+             │                                         so wire and loop cannot drift
+             │
+             └──► elefante-core     Session · turn loop · ToolGate · JoinSet
+                       │            owns history across turns
+                       │
+                       ├──► elefante-guard      PathPolicy · BashClassifier · Scrubber
+                       │                        decides; never performs
+                       │
+                       ├──► elefante-tools ──► elefante-guard
+                       │         │             7 schemas; every path through the
+                       │         │             policy, every result scrubbed at
+                       │         ▼             one exit point
+                       │    filesystem · bash -lc in its own process group
+                       │
+                       └──► elefante-provider   Provider trait · SSE decoder
+                                 │              normalized Event stream
+                                 ▼
+                            HTTPS + SSE ──► OpenRouter
+
+  ── linked by nothing ────────────────────────────────────────────────────────
+
+   elefante-mem        4-line scaffold. Its edge to guard is declared but unused,
+                       reserved for the Scrubber on the M2 write path.
 ```
+
+Three things are visible here that a dependency list cannot show.
+
+**The wire has two independent implementations.** A Rust client and a TypeScript client speak
+it, sharing no code — which is why the contract lives in `elefante-rpc` and section 5 rather
+than inside either client, and why a change to it lands on both sides or lands broken.
+
+**There are exactly two egress points.** Everything that leaves this system leaves through
+`tools` (filesystem and `bash`) or `provider` (HTTPS). Both sit below `core`, and `guard` sits
+beside them depending on nothing — so the policy layer is exercisable with no filesystem, no
+network, and no subprocess, and there is no third path to audit.
+
+**The daemon is the only process that holds state.** Clients render; they do not remember.
+Kill every one of them mid-turn and the ring, the history, and the running tools are untouched.
+
+### Dependency direction
+
+The internal graph, precisely:
+
+```text
+elefante-guard      ──► (nothing)      pure policy; the graph's floor
+elefante-provider   ──► (nothing)
+
+elefante-tools      ──► guard
+elefante-mem        ──► guard                        (declared, not yet used)
+elefante-rpc        ──► provider                     (re-exports StopReason, Usage)
+elefante-core       ──► guard, provider, tools
+elefante-srv        ──► core, rpc, provider, tools   the daemon; top of the graph
+elefante-cli        ──► rpc                          a client: it does not link core
+```
+
+Two edges are worth stating outright, because both look like mistakes and are not. **`cli`
+depends only on `rpc`** — it talks to the daemon over a socket and runs no turn in process,
+which is what makes "reconnect and the turn completes intact" true. And **`rpc` depends on
+`provider`** solely to re-export `StopReason` and `Usage`, so the wire and the agent loop cannot
+drift apart; the cost is that `rpc` is not a true leaf.
+
+Each crate carries a `README.md` with its module map, entry points, invariants, and how to test
+it alone. The subsections below are the overview; the READMEs are the detail.
 
 ### `elefante-cli`
 
@@ -154,11 +228,17 @@ classifier; every success and error result passes through `Scrubber`.
 Do not add an alternate read, write, process, glob, or search path that bypasses this crate's
 policy calls.
 
+### `elefante-rpc` and `elefante-srv`
+
+Both shipped in M1 and are covered by its gate. `rpc` holds the wire types shared by daemon and
+client; `srv` is the daemon itself — socket, session registry, ring, and bounded delivery.
+Section 5 is the contract they implement.
+
 ### Scaffold crates
 
-`elefante-rpc`, `elefante-srv`, and `elefante-mem` preserve the intended workspace topology
-without implementing M1/M2 early. Their APIs can change freely until their milestone design
-passes are complete.
+`elefante-mem` alone remains a scaffold: four lines, one const, and no dependents anywhere in
+the workspace. It preserves the topology so the M2 edges do not have to be retrofitted. Its API
+can change freely until that milestone's design pass is complete.
 
 ## 5. Runtime interaction
 
@@ -843,6 +923,9 @@ gate proved, anything deliberately deferred, and any plan amendment.
 When behavior changes, update:
 
 - nearby Rust documentation and tests;
+- the crate's own `README.md` when its module layout, public entry points, invariants, or test
+  layout changed — it quotes file line counts and specific line numbers, which is what makes it
+  checkable and also what makes it rot;
 - this developer guide if a public model, interaction, invariant, or workflow changed;
 - the README if setup, user-visible behavior, or project status changed; and
 - the design/milestone documents when their respective contracts require it.

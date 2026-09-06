@@ -41,6 +41,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --no-fail-fast
+      # Catches a ninth crate added without one. It cannot catch a stale README — that needs
+      # the rustdoc include_str! wiring noted in docs/DEVELOPER_GUIDE.md §13.
+      - name: crate readmes exist
+        run: |
+          set -euo pipefail
+          missing=0
+          for c in crates/*/; do
+            [ -f "$c/README.md" ] || { echo "missing: $c/README.md"; missing=1; }
+          done
+          exit $missing
 
   # Advisory only. Pinning above buys reproducibility at the cost of never hearing about a new
   # lint until someone bumps the pin; this job pays that back by reporting what current stable

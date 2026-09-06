@@ -4,16 +4,17 @@ Elefante is a small, modifiable coding-agent harness. Its current implementation
 Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
 seven guarded tools, and policy enforced in code rather than in a long system prompt.
 
-The long-term design adds a daemon, OpenTUI client, graph-backed project memory,
-adversarial critics, and token analysis. Those features are deliberately milestone-gated;
-the repository currently contains the M0 loop and compile-safe scaffolds for later crates.
+The daemon and OpenTUI client have shipped. The long-term design adds graph-backed project
+memory, adversarial critics, and token analysis. Those features are deliberately milestone-gated;
+`elefante-mem` is the one remaining compile-safe scaffold.
 
 ## Project status
 
-M0 is implemented and all hermetic checks pass. Formal milestone completion still requires
-the two credentialed checks described in [`docs/MILESTONES.md`](docs/MILESTONES.md): a real
-prompt-cache hit through OpenRouter and a live edit against this repository. M1 work has not
-begun.
+M0 and M1 are complete, with both gates green — 118 hermetic Rust tests, 23 TypeScript tests,
+and the two credentialed checks described in [`docs/MILESTONES.md`](docs/MILESTONES.md): a real
+prompt-cache hit through OpenRouter and a live edit in a scratch repository. CI runs the
+hermetic gates on every push and the credentialed pair on dispatch. M2 — repo cache and
+mechanical graph — has not begun.
 
 ## Quick start
 
@@ -84,8 +85,8 @@ harness prompts for a key on first launch and stores it outside the working tree
 
 Filesystem tools are restricted to the current working directory, known secret paths are
 denied, shell commands are parsed before execution, and every tool result is scrubbed for
-common credential shapes. Commands requiring approval do not execute in M0 because the
-interactive approval transport arrives with the M1 daemon/TUI.
+common credential shapes. A command the classifier escalates suspends and waits for an
+explicit approval; one it denies never runs at all.
 
 This is a safety gate, not an operating-system sandbox. Run Elefante in a repository and
 account whose filesystem and process permissions match the intended blast radius.
@@ -103,6 +104,10 @@ The provider transport tests open a loopback-only mock HTTP server. Restricted e
 environments may need to permit local socket binding.
 
 Start with the [developer guide](docs/DEVELOPER_GUIDE.md) for crate responsibilities,
-runtime data flow, data models, safety invariants, extension workflows, and testing. The
-[design of record](docs/PLAN.md) describes future milestones; the
+runtime data flow, the wire contract, data models, safety invariants, extension workflows, and
+testing. The [design of record](docs/PLAN.md) describes future milestones; the
 [milestone record](docs/MILESTONES.md) reports what has actually passed its gate.
+
+If you are about to edit one crate rather than understand the system, read that crate's own
+`README.md` — each carries its module map, entry points, invariants, and how to test it
+alone.

@@ -138,6 +138,18 @@ power to fail the run. *Clippy's own suggestion was declined: it wanted the nest
 into a match guard, and guards run during pattern selection, so `remove` would have mutated
 `pending` on arms that then did not match.*
 
+**Three findings, one shape.** The credentialed run then failed a third time, for a third
+reason: `cargo test -p elefante-cli` builds only that package, but the CLI spawns
+`elefante-srv` — a binary from another crate — as a sibling of its own executable. Every local
+`target/` had one left over from a `--workspace` build, so the test could not fail here.
+
+All three defects were the same defect. A false MSRV floor, a lint absent from a six-month-old
+local clippy, and a binary present only by accident: each was a local environment quietly
+supplying something the declared inputs did not, and each was invisible to any amount of
+careful local checking. *This is what CI buys that discipline cannot — not a second opinion,
+but a machine with no memory of what we happened to build last week.* Worth holding onto for
+M2, which adds a cache layer whose whole job is to make local state survive between runs.
+
 ---
 
 _Next: M2 — repo cache and mechanical graph._

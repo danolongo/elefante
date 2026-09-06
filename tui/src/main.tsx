@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { RpcClient, RpcError, connectOrExplain } from "./protocol";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
-import { App } from "./ui/App";
+import { Root } from "./ui/Root";
+import { publish } from "./store";
 import type { ModalProps } from "./ui/Modal";
 
 const socketPath = process.env.ELEFANTE_SOCKET ?? join(process.env.XDG_RUNTIME_DIR ?? join(homedir(), ".elefante", "run"), "elefante.sock");
@@ -68,7 +69,9 @@ function draw() {
     catch (error) { fail(error); }
     finally { busy = false; draw(); }
   } };
-  root.render(<App state={state} now={Date.now()} connected={connected} submitting={submitting} message={message ?? state.error} modal={modal} onSubmit={text => void prompt(text)} onInterrupt={() => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }} onExit={exit} />);
+  // Publish, never re-render: `root.render()` remounts the tree on every call, so calling it
+  // per update leaked one keypress listener each time — four a second, unbounded.
+  publish({ state, now: Date.now(), connected, submitting, message: message ?? state.error, modal, onSubmit: text => void prompt(text), onInterrupt: () => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }, onExit: exit });
 }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function recover() {
@@ -93,5 +96,6 @@ try {
   state = { ...state, session_id: created.session_id, seq: created.seq };
   await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort); draw(); });
   timer = setInterval(draw, 250);
-  draw();
+  draw();                 // seeds the store before the first read
+  root.render(<Root />);  // exactly once, for the life of the process
 } catch (error) { exit(); console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }

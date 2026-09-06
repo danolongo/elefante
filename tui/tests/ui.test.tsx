@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import { act } from "react";
 import { testRender } from "@opentui/react/test-utils";
+import { createRoot } from "@opentui/react";
+import { createTestRenderer } from "@opentui/core/testing";
+import { publish } from "../src/store";
+import { Root } from "../src/ui/Root";
+import type { AppProps } from "../src/ui/App";
 import { initialSession, reduceSession } from "../src/session";
 import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
@@ -73,4 +78,28 @@ test("input submits and Ctrl+C emits interrupt without exiting", async () => {
     expect(prompts).toEqual(["hello"]);
     await act(async () => setup.mockInput.pressCtrlC()); expect(interrupts).toBe(1); expect(exits).toBe(0);
   } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("repeated updates register keypress listeners once, not once per update", async () => {
+  const { renderer } = await createTestRenderer({ width: 80, height: 20 });
+  const view = (now: number): AppProps => ({
+    state: initialSession("s"), now, connected: true, message: null, modal: null,
+    onSubmit: () => {}, onInterrupt: () => {}, onExit: () => {},
+  });
+  publish(view(0));
+  const root = createRoot(renderer as never);
+  root.render(<Root />);
+  const handler = (renderer as never as { keyInput: { listenerCount(name: string): number } }).keyInput;
+  const listeners = () => handler.listenerCount("keypress");
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+  await settle();                 // the listener registers in an effect, not during render
+  const initial = listeners();
+
+  // The leak this guards: root.render() remounts rather than reconciling, so driving updates
+  // through it added one listener per call — four a second on the live timer, never released.
+  for (let i = 1; i <= 40; i++) publish(view(i));
+  await settle();
+
+  expect(initial).toBeGreaterThan(0);
+  expect(listeners()).toBe(initial);
+  renderer.destroy();
 });

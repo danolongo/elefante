@@ -1,8 +1,11 @@
 # Elefante TUI
 
-M1 requires Bun on PATH; it does not vendor a runtime. Run `npm install` (or `bun install`),
-then `bun run src/main.tsx`. The Rust CLI starts the daemon before launching this entrypoint.
-`ELEFANTE_SOCKET` selects an isolated daemon; `--session ID` attaches an existing session.
+Bun is required on PATH; this client does not vendor a runtime, and npm is not an
+alternative — `@opentui/core` loads its native library through Bun's FFI, so Node cannot run
+this client at all. Run `bun install`, then `bun run src/main.tsx`. `bun.lock` is the
+authoritative lockfile; see `../docs/LOCKFILE.md` for why there is exactly one. The Rust CLI
+starts the daemon before launching this entrypoint. `ELEFANTE_SOCKET` selects an isolated
+daemon; `--session ID` attaches an existing session.
 The entrypoint also accepts `--cwd`, `--model`, `--effort`, `--max-rounds`, and `--max-tokens`.
 Model, effort and limits also accept `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`,
 `ELEFANTE_MAX_ROUNDS`, and `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.

@@ -52,7 +52,7 @@ commands waits on the daemon and TUI, as planned — the classifier decides, but
 nowhere to render a prompt yet.
 
 **Amended.** The provider baseline was reversed mid-milestone from two peer providers to
-OpenRouter alone ([`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md)), which settled how
+OpenRouter alone, which settled how
 reasoning blocks are represented: verbatim opaque JSON, because the replay rule requires
 unknown future block types to round-trip. `PLAN.md` also gained the model-picker and
 first-run key-setup designs, the plan to derive capabilities from catalogue metadata rather
@@ -61,4 +61,4 @@ Default model moved to `anthropic/claude-sonnet-5` to keep credentialed runs che
 
 ---
 
-_Next: M1 — daemon, RPC protocol, and OpenTUI client._
+_Next: M1 — daemon, RPC protocol, and OpenTUI client. Frozen contract in [`M1-PROTOCOL.md`](./M1-PROTOCOL.md); no implementation started._

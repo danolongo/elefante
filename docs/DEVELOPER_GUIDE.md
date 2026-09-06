@@ -57,7 +57,6 @@ elefante/
 ├── docs/
 │   ├── PLAN.md                    design of record and milestone gates
 │   ├── MILESTONES.md              completion record
-│   ├── M0-PROVIDER-MIGRATION.md    frozen contract for the single-provider rewrite
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/
     ├── cli/                       `elefante` terminal binary
@@ -96,7 +95,7 @@ elefante-rpc ──► no internal crate
 
 The binary is composition code. It parses arguments, reads environment configuration,
 constructs `OpenRouterProvider` and `ToolExecutor`, builds `RunConfig`, and calls
-`run_agent_loop`. It renders reasoning and text deltas directly to stdout. Tool lifecycle
+`run_agent_loop`. It currently renders reasoning and text deltas through one match arm to stdout, which is the defect in issue #4: reasoning and answer print as one undelimited run. M1 replaces this path with a headless client that puts the answer on stdout and reasoning on stderr. Tool lifecycle
 events are available from core but are not rendered by the M0 terminal frontend.
 
 Keep provider protocol parsing, policy, and orchestration out of this crate. M1 will replace

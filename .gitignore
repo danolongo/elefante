@@ -4,7 +4,6 @@
 
 # Local Elefante and development-agent state
 /.elefante/
-/.omx/
 
 # Credentials and private key material
 .env
@@ -18,5 +17,6 @@
 *.swp
 *.swo
 
-# Claude Code local overrides
-.claude/settings.local.json
+# Dev
+.claude/
+/.omx/

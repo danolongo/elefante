@@ -49,6 +49,8 @@ elefante/
   Cargo.toml                 # workspace
   docs/PLAN.md               # this document
   docs/MILESTONES.md         # per-milestone completion record
+  docs/M1-CORE.md            # frozen core types; prerequisite for the protocol
+  docs/M1-PROTOCOL.md        # frozen wire contract, derived from M1-CORE
   crates/
     rpc/                     # wire types shared by daemon and client (no deps on others)
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
@@ -137,7 +139,7 @@ critic findings (M4).
 - `: OPENROUTER PROCESSING` comment keep-alives must be ignored, and `data: [DONE]`
   terminates the stream.
 
-Full request/response contract: [`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md).
+Full request/response mapping, as shipped: [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) § OpenRouter transport details.
 
 ### Role configuration
 
@@ -279,25 +281,11 @@ Socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to `~/.elefante/run/ele
 
 ## The RPC protocol (`elefante-rpc`)
 
-Newline-delimited JSON, JSON-RPC 2.0 shaped, bidirectional. Requests carry ids; streaming uses server→client notifications because the TUI needs sub-frame latency and polling would jitter.
+Newline-delimited JSON, JSON-RPC 2.0 shaped, bidirectional over one unix socket. Requests carry ids; streaming uses server→client notifications, because the TUI needs sub-frame latency and polling would jitter.
 
-**Client → server (requests):**
+Every notification carries a monotonic per-session `seq` and a `turn_id`. `session.attach` takes an optional `since` and returns either resumed deltas or a full snapshot — never a silent gap. That is what lets a second client, or a reconnecting one after a crash, render a session already in flight; building it in from the start is far cheaper than retrofitting it once the TUI assumes it owns the session.
 
-| Method | Params | Returns |
-|---|---|---|
-| `session.create` | `{ cwd, roles? }` | `{ session_id }` |
-| `session.prompt` | `{ session_id, parts }` | `{ turn_id }` (streams follow) |
-| `session.interrupt` | `{ session_id }` | `{}` |
-| `session.resolve_approval` | `{ approval_id, decision }` | `{}` |
-| `session.list` / `session.attach` | `{}` / `{ session_id }` | registry view / replay of state |
-| `memory.search` | `{ session_id, query }` | `{ nodes }` — for UI inspection |
-| `stats.session` | `{ session_id }` | token/cost accounting |
-
-**Server → client (notifications):**
-
-`turn.started` · `thinking.delta` · `text.delta` · `tool.started` · `tool.finished` · `approval.requested` · `critic.findings` · `turn.finished { stop_reason, usage }` · `session.stale { signals }`
-
-`session.attach` returning a **replay of current state** (not just an ack) is what allows a second client — or a reconnecting one after a crash — to render a session already in flight. Building that in from the start is much cheaper than adding it once the TUI assumes it owns the session.
+**The method set, wire types, snapshot shape, error codes, ring sizing, and backpressure rules are frozen in [`M1-PROTOCOL.md`](./M1-PROTOCOL.md).** That document is the single source of truth for the protocol; this section covers only why it is shaped that way.
 
 ---
 
@@ -340,7 +328,13 @@ enum Event {
 
 `core` forwards each as an RPC notification *and* accumulates the assistant message. Two consumers, one pass. The split between renderable reasoning deltas and non-renderable replay state is load-bearing: replay blocks must be echoed back verbatim on the next request, and a frontend that renders them would invite a user to think they are ordinary output.
 
-**6. Tool dispatch** on `stop_reason == tool_use` — the most interaction-dense step:
+**6. Tool dispatch** on `stop_reason == tool_use` — the most interaction-dense step.
+
+> **Status: designed, not yet shipped.** M0 dispatches with `join_all` and classifies bash
+> *inside* `tools`, not through `guard::check` here. Both are M1 work, specified in
+> [`M1-CORE.md`](./M1-CORE.md) §3–4. The diagram below is the target, and reading it as
+> description is what produced a protocol draft promising interrupt guarantees the code
+> could not keep.
 
 ```
 for each tool_use block  ──►  guard::check(&call) ──┬─► Allow    ─► tools::execute
@@ -358,6 +352,8 @@ Three details that are easy to get wrong and expensive to fix later:
 - **All results must be emitted consecutively, before the next assistant turn.** OpenAI-shaped APIs need one `{role:"tool"}` message per result, so a batch is several messages rather than one — but it must never be split across turns, which trains the model out of parallel tool calls. Order must match the `tool_calls` that produced them.
 - **A failed tool still returns a result** with `is_error: true`. Dropping it desynchronizes `tool_use_id` pairing and the next request 400s.
 - **`guard::scrub` runs on every result**, including denials and errors — it is the layer that catches what the path policy cannot.
+
+**`Escalate` is inert until M1.** It and `Deny` both return a non-executing error today, so the third verdict does not yet mean anything distinct. M1 is when it is cashed — if approval slips again, collapse the enum rather than carry a state that pretends to mean something. The two are different *modalities*, not severities: `Deny` is terminal and no critic or flag clears it, while `Escalate` is a question whose answer may be yes. That is what stops an approve button appearing on `rm -rf /`.
 
 **Approval flow (Escalate):** `core` emits `approval.requested` with the command, the rule that fired, and — in auto mode — a `guard::Critic` verdict from the triage model. The turn suspends on a `oneshot` channel. `session.resolve_approval` or the critic's verdict resolves it. An interrupt cancels the whole `JoinSet`, and already-completed tool results are still returned so history stays consistent.
 
@@ -518,7 +514,7 @@ Each has a **Baseline** (what must exist) and a **Gate** (what must pass before 
 
 **Baseline.** Workspace skeleton. `Provider` trait + `Capabilities` + a single OpenRouter impl (OpenAI-compatible SSE, per-model capability resolution, `reasoning` control and verbatim replay, `tool_calls` normalization, prompt caching where the upstream supports it). Transport-generic SSE decoder in its own module. Agent loop with the seven tools, plain stdout, no TUI. **`PathPolicy` and the deterministic half of the bash classifier ship here** — an ungated bash tool should never exist, even in a prototype.
 
-*The Anthropic impl was written first and then removed* — see [`M0-PROVIDER-MIGRATION.md`](./M0-PROVIDER-MIGRATION.md) for the patch and the frozen type contract. Doing this inside M0 rather than later matters because **M1 puts the neutral types on the RPC wire**; changing them after M1 would mean revising a published protocol instead of a private enum.
+*The Anthropic impl was written first and then removed.* Doing this inside M0 rather than later matters because **M1 puts the neutral types on the RPC wire**; changing them after M1 would mean revising a published protocol instead of a private enum.
 
 The decision it forced, now settled: reasoning blocks are stored **verbatim as opaque JSON** (`ReasoningDetail { kind, raw }`), not parsed into typed variants. OpenRouter's replay rule requires the block sequence to return unmodified and unreordered, so an unknown future `reasoning.*` type must round-trip — a typed enum would silently violate the rule rather than erroring.
 
@@ -542,7 +538,13 @@ The decision it forced, now settled: reasoning blocks are stored **verbatim as o
 
 ### M1 — Daemon + TUI
 
-**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. **First-run key setup** (see above) rides on the same interactive channel.
+**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. The CLI stops running the loop in process and becomes a client — one-shot prompts use a headless client, which doubles as the daemon's test harness. **First-run key setup** rides on the same channel.
+
+Frozen contracts: [`M1-CORE.md`](./M1-CORE.md) then [`M1-PROTOCOL.md`](./M1-PROTOCOL.md), in that order — the wire is derived from the core types and cannot be specified before them. Their gates are authoritative; the items below are the summary.
+
+M1 also lands three things M0 left as design rather than code: `guard::check` moves from `tools` into `core`'s dispatch so approval has somewhere to suspend, dispatch becomes a `JoinSet` so an interrupt can keep completed tool results, and `run_agent_loop` becomes a `Session` that owns history across turns.
+
+The headless client splits streams: **`stdout` is the answer, `stderr` is reasoning, tool activity, and errors.** Issue #4 recorded the current CLI rendering reasoning and answer through one match arm, producing an undelimited wall of prose. Splitting by stream removes that class of bug by construction — a redirected `stdout` has no reasoning in it to distinguish — rather than relying on formatting to keep them apart.
 
 **Gate.**
 - Kill and reconnect a client mid-turn: `session.attach` replays state and the turn completes with output intact.

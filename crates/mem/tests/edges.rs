@@ -194,6 +194,7 @@ fn edges_survive_a_crash_after_the_content_committed_but_before_they_were_derive
     let options = IndexOptions {
         batch_files: 1_000,
         hooks: Arc::new(CrashOnce(AtomicBool::new(true))),
+        ..IndexOptions::default()
     };
     assert!(tree.refresh_with(&options).is_err());
     // The window: every file and import is in the graph, no edge is, and the flag says so.

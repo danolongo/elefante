@@ -309,6 +309,7 @@ fn a_crash_between_the_graph_commit_and_the_cache_write_converges_on_the_next_ru
     let options = IndexOptions {
         batch_files: 2,
         hooks: Arc::new(CrashAfterFirstGraphCommit(AtomicBool::new(true))),
+        ..IndexOptions::default()
     };
     let crashed = tree.refresh_with(&options);
     assert!(matches!(crashed, Err(MemError::Aborted(_))));

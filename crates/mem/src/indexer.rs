@@ -12,11 +12,13 @@ use std::{
 };
 
 use crate::{
+    cochange::{self, CoChangeConfig},
     diff::diff,
     error::MemError,
     extract::{self, Extraction, Language, cache},
     graph::{self, Applied, Batch, FileUpdate},
     hash::hash_files,
+    schema,
     state::{self, StateRow},
     stats::Counters,
     store::Store,
@@ -48,6 +50,7 @@ impl Hooks for NoHooks {}
 pub struct IndexOptions {
     /// Files per `memory.db` commit. Each commit is one generation bump.
     pub batch_files: usize,
+    pub cochange: CoChangeConfig,
     pub hooks: Arc<dyn Hooks>,
 }
 
@@ -55,6 +58,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             batch_files: 200,
+            cochange: CoChangeConfig::default(),
             hooks: Arc::new(NoHooks),
         }
     }
@@ -115,7 +119,54 @@ pub fn refresh_blocking(
         process_batch(store, root, files, &prior, counters, options, &mut report)?;
     }
     finish(store, &walked, &plan.deleted, counters, &mut report)?;
+    cochange_phase(store, root, counters, options, &mut report)?;
     Ok(report)
+}
+
+/// Re-derives co-change edges when, and only when, `HEAD` has moved since they were computed.
+///
+/// Uncommitted work has no history, so it cannot change the answer: an ordinary edit-and-refresh
+/// never reruns `git log`. `HEAD` is read with a cheap `rev-parse`; the head the edges were
+/// computed at is stored in the same transaction as the edges, so a crash cannot leave them
+/// claiming a head they were not computed for. Not a repository, no `git`, or a timeout all mean
+/// "no co-change edges", never an error.
+fn cochange_phase(
+    store: &Store,
+    root: &Path,
+    counters: &Counters,
+    options: &IndexOptions,
+    report: &mut RefreshReport,
+) -> Result<(), MemError> {
+    let Some(head) = cochange::head(root) else {
+        return Ok(());
+    };
+    let (stored, current) = store.writer().call_blocking(|s| {
+        let stored = schema::get_meta(&s.memory, "meta", "cochange_head")?;
+        let mut statement = s
+            .memory
+            .prepare("SELECT key FROM node WHERE kind = 'file' AND source = 'index'")?;
+        let current: HashSet<String> = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok::<_, MemError>((stored, current))
+    })??;
+    if stored.as_deref() == Some(head.as_str()) {
+        return Ok(());
+    }
+    counters.add_git_log_runs(1);
+    let Some(commits) = cochange::log(root, &options.cochange, cochange::GIT_TIMEOUT) else {
+        return Ok(());
+    };
+    let pairs = cochange::compute(&commits, &current, &options.cochange);
+    let stamp = now_ns();
+    let applied = store
+        .writer()
+        .call_blocking(move |s| graph::replace_cochange(&mut s.memory, &pairs, &head, stamp))??;
+    if applied.changed {
+        counters.add_batches(1);
+    }
+    report.generation = applied.generation;
+    Ok(())
 }
 
 fn process_batch(

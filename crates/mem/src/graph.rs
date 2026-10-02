@@ -558,6 +558,94 @@ pub fn resolve_edges(memory: &mut Connection, now_ns: i64) -> Result<EdgeResolut
     })
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CoChangeApplied {
+    pub changed: bool,
+    pub edges: usize,
+    pub generation: i64,
+}
+
+/// Replaces the `co_edited_with` edges between indexed files with `pairs`, writing only the
+/// difference, and records the commit they were computed at.
+///
+/// The head is written in the same transaction as the edges, so "edges are current for this head"
+/// is a single fact: a crash leaves either both or neither. Pairs naming a path that has no file
+/// node are dropped. Storage order is by node id (`src < dst`), which the schema enforces.
+///
+/// # Errors
+/// SQLite errors; the transaction is rolled back.
+pub fn replace_cochange(
+    memory: &mut Connection,
+    pairs: &[crate::cochange::Pair],
+    head: &str,
+    now_ns: i64,
+) -> Result<CoChangeApplied, MemError> {
+    let tx = memory.transaction()?;
+    let files: HashMap<String, i64> = {
+        let mut statement =
+            tx.prepare("SELECT key, id FROM node WHERE kind = 'file' AND source = ?1")?;
+        statement
+            .query_map([SOURCE_INDEX], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let desired: HashMap<(i64, i64), f64> = pairs
+        .iter()
+        .filter_map(|p| {
+            let (a, b) = (*files.get(&p.a)?, *files.get(&p.b)?);
+            Some(((a.min(b), a.max(b)), f64::from(p.weight)))
+        })
+        .collect();
+    let existing: HashMap<(i64, i64), f64> = {
+        let mut statement = tx.prepare(
+            "SELECT e.src, e.dst, e.weight FROM edge e
+             JOIN node s ON s.id = e.src JOIN node d ON d.id = e.dst
+             WHERE e.rel = 'co_edited_with'
+               AND s.kind = 'file' AND s.source = ?1 AND d.kind = 'file' AND d.source = ?1",
+        )?;
+        statement
+            .query_map([SOURCE_INDEX], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut changed = false;
+    for (key, weight) in &existing {
+        if desired.get(key) != Some(weight) {
+            tx.execute(
+                "DELETE FROM edge WHERE src = ?1 AND dst = ?2 AND rel = 'co_edited_with'",
+                [key.0, key.1],
+            )?;
+            changed = true;
+        }
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO edge(src, dst, rel, weight, created_at_ns)
+             VALUES (?1, ?2, 'co_edited_with', ?3, ?4)",
+        )?;
+        for (key, weight) in &desired {
+            if existing.get(key) != Some(weight) {
+                insert.execute(params![key.0, key.1, weight, now_ns])?;
+                changed = true;
+            }
+        }
+    }
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('cochange_head', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [head],
+    )?;
+    let generation = if changed {
+        bump_generation(&tx, now_ns)?
+    } else {
+        generation(&tx)?
+    };
+    tx.commit()?;
+    Ok(CoChangeApplied {
+        changed,
+        edges: desired.len(),
+        generation,
+    })
+}
+
 /// A comparison-friendly view of the whole graph with ids and timestamps removed, so two graphs
 /// built by different routes can be asserted identical.
 #[derive(Debug, PartialEq, Eq)]

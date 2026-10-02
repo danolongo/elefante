@@ -55,6 +55,20 @@ fn index_a_real_repository_and_print_it() {
     for edge in snapshot.edges.iter().filter(|e| e.2 == "depends_on") {
         println!("EDGE {} -> {}", edge.0, edge.1);
     }
+    let mut co: Vec<_> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.2 == "co_edited_with")
+        .collect();
+    co.sort_by(|a, b| {
+        b.3.parse::<f64>()
+            .unwrap()
+            .total_cmp(&a.3.parse::<f64>().unwrap())
+    });
+    println!("co_edited_with edges: {}", co.len());
+    for edge in co.iter().take(25) {
+        println!("CO   {:>5}  {}  <->  {}", edge.3, edge.0, edge.1);
+    }
     for node in snapshot.nodes.iter().filter(|n| n.0 == "symbol").take(40) {
         println!("SYM  {}  |  {}", node.1, node.3.replace('\n', "  //  "));
     }

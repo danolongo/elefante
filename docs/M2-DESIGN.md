@@ -1052,10 +1052,10 @@ Throwaway-cost work that settles what this design *asserts* but has not tested.
 
 ## Open questions
 
-1. **`MIN_SUPPORT` = 2 yields no co-change edges in a young repository.** This repository has 30
-   commits. Acceptable (the signal is honest about being absent) or should it fall back
-   to 1 below some commit count? Recommendation: leave at 2 and report the edge count in the soft
-   performance report, so the answer is empirical.
+1. **`MIN_SUPPORT` = 2 and a young repository.** *Resolved empirically during implementation:* on a
+   clone of this repository at 38 commits, the default produced 306 `co_edited_with` edges — the
+   documents that change together, `Cargo.toml` with `Cargo.lock`, `main.rs` with the crates it
+   drives. The default stands; the support floor remains configurable.
 2. **`.js`/`.jsx`** get file nodes only. The TS grammar would parse most of them; deferred only to
    keep D2 honest about what is claimed.
 3. **Session-touched files as `Query.files`.** Core knows which files the model read and edited this

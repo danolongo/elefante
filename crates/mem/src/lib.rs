@@ -1,6 +1,7 @@
 //! Graph memory for repositories. Design: `docs/M2-DESIGN.md`.
 
 pub mod actor;
+pub mod cochange;
 pub mod diff;
 pub mod error;
 pub mod extract;

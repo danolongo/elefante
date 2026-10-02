@@ -17,6 +17,8 @@ pub struct IndexStats {
     pub parsed: u64,
     /// `memory.db` batch commits.
     pub batches: u64,
+    /// `git log` invocations. A refresh whose `HEAD` is unchanged runs none.
+    pub git_log_runs: u64,
 }
 
 #[derive(Debug, Default)]
@@ -27,6 +29,7 @@ pub struct Counters {
     extraction_hits: AtomicU64,
     parsed: AtomicU64,
     batches: AtomicU64,
+    git_log_runs: AtomicU64,
 }
 
 macro_rules! bump {
@@ -44,6 +47,7 @@ impl Counters {
     bump!(add_extraction_hits, extraction_hits);
     bump!(add_parsed, parsed);
     bump!(add_batches, batches);
+    bump!(add_git_log_runs, git_log_runs);
 
     #[must_use]
     pub fn snapshot(&self) -> IndexStats {
@@ -54,6 +58,7 @@ impl Counters {
             extraction_hits: self.extraction_hits.load(Ordering::Relaxed),
             parsed: self.parsed.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
+            git_log_runs: self.git_log_runs.load(Ordering::Relaxed),
         }
     }
 }

@@ -272,6 +272,7 @@ name = "elefante-core"
 version = "0.1.0"
 dependencies = [
  "elefante-guard",
+ "elefante-mem",
  "elefante-provider",
  "elefante-tools",
  "futures-util",
@@ -342,10 +343,12 @@ dependencies = [
  "anyhow",
  "async-stream",
  "elefante-core",
+ "elefante-mem",
  "elefante-provider",
  "elefante-rpc",
  "elefante-tools",
  "futures-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -358,6 +361,7 @@ name = "elefante-tools"
 version = "0.1.0"
 dependencies = [
  "elefante-guard",
+ "futures-util",
  "globset",
  "ignore",
  "regex",

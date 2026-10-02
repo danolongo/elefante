@@ -679,20 +679,35 @@ const CODE: &[(&str, &str)] = &[
 fn blocks_are_marked_partial_until_a_full_index_has_finished() {
     let live = live(CODE);
     let retriever = Retriever::new(Arc::clone(&live.store));
-    refresh(&live);
-    live.store.index_state().set_running(true);
-    let during = run(retriever.retrieve(Query::new("frobnicate")))
+    // Content is present, but no refresh has completed.
+    apply(&live.store, vec![file("x.rs", "frobnicate", vec![])]);
+    let before = run(retriever.retrieve(Query::new("frobnicate")))
         .unwrap()
         .unwrap();
-    assert!(during.partial);
-    assert!(during.rendered.contains("partial=\"true\""));
+    assert!(before.partial);
+    assert!(before.rendered.contains("partial=\"true\""));
 
-    live.store.index_state().set_running(false);
+    refresh(&live);
     let after = run(retriever.retrieve(Query::new("frobnicate")))
         .unwrap()
         .unwrap();
     assert!(!after.partial);
     assert!(after.rendered.contains("partial=\"false\""));
+}
+
+#[test]
+fn a_refresh_in_flight_on_a_complete_index_is_not_partial() {
+    let live = live(CODE);
+    refresh(&live);
+    let retriever = Retriever::new(Arc::clone(&live.store));
+    live.store.index_state().set_running(true);
+    let block = run(retriever.retrieve(Query::new("frobnicate")))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !block.partial,
+        "refreshes run at every turn; a complete index being kept current is not incomplete"
+    );
 }
 
 #[test]

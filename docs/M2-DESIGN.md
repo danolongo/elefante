@@ -672,10 +672,15 @@ against reality. The gate asserts the estimate stays within 1 500; it does not a
 
 ### 10.7 `partial`
 
-`partial` is true when the indexer is running **or** `meta.index_complete` is false. Both are mirrored
-into an in-process `IndexState` (loaded from `meta` when the store opens, kept current by the
-indexer), so retrieval reads them without a database round trip and a cached block can be keyed by
-them. The same applies to `repo_generation`: `Store::generation()` is an atomic advanced by this
+`partial` is true when `meta.index_complete` is false: the first full index has not finished.
+*Amended during implementation:* the draft also said "or the indexer is running", which is wrong.
+Refreshes start at every session create, turn start and turn end, so on a complete index one is
+nearly always in flight, and every block would be marked partial — teaching the model to distrust an
+index that is complete and merely being kept current. The flag means "absence from this index is not
+evidence of absence from the repository", and an incremental refresh does not weaken that. Both facts
+are mirrored into an in-process `IndexState` (loaded from `meta` when the store opens, kept current by
+the indexer), so retrieval reads them without a database round trip and a cached block can be keyed
+by them. The same applies to `repo_generation`: `Store::generation()` is an atomic advanced by this
 process's own commits, which is what lets a cache hit skip the reader thread entirely. A second
 process writing the same repository would not advance it, so cached blocks also expire after 30
 seconds. Retrieval

@@ -87,6 +87,7 @@ impl Daemon {
             api_key: None,
             base_url: Some("http://127.0.0.1:9".into()),
             stub_provider: stub,
+            memory: true,
             idle_timeout: idle,
         };
         let task = tokio::spawn(run(config.clone()));
@@ -375,6 +376,7 @@ async fn stale_socket_recovers_and_concurrent_start_converges() {
         api_key: None,
         base_url: None,
         stub_provider: None,
+        memory: true,
         idle_timeout: Duration::from_secs(1),
     };
     let mut first = tokio::spawn(run(config.clone()));
@@ -412,6 +414,7 @@ async fn directory_ownership_serializes_stale_reclamation_and_shutdown() {
         api_key: None,
         base_url: None,
         stub_provider: None,
+        memory: true,
         idle_timeout: Duration::from_secs(20),
     };
     let first = tokio::spawn(run(config.clone()));
@@ -477,6 +480,7 @@ async fn invalid_cold_start_finishes_validation_before_socket_publication() {
             api_key: Some("test-key".into()),
             base_url: Some("not-a-url".into()),
             stub_provider: None,
+            memory: true,
             idle_timeout: Duration::from_secs(20),
         };
         let error = tokio::time::timeout(Duration::from_secs(1), run(config))
@@ -775,6 +779,7 @@ async fn key_set_rebuilds_provider_and_environment_key_wins() {
             api_key: environment_key.map(str::to_owned),
             base_url: Some(format!("http://{address}")),
             stub_provider: None,
+            memory: true,
             idle_timeout: Duration::from_secs(20),
         };
         let task = tokio::spawn(run(config.clone()));

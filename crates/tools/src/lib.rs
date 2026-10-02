@@ -1,6 +1,7 @@
 //! The permanent M0 tool surface.
 
 use elefante_guard::{PathPolicy, Scrubber};
+use futures_util::future::BoxFuture;
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -68,12 +70,42 @@ pub enum ToolError {
     Setup(String),
 }
 
+/// Which nodes an explicit repository search returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKind {
+    File,
+    Symbol,
+}
+
+/// One `memory_search` call, validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemorySearchRequest {
+    pub query: String,
+    /// Between 1 and [`MEMORY_SEARCH_MAX_LIMIT`].
+    pub limit: usize,
+    pub kind: Option<SearchKind>,
+}
+
+pub const MEMORY_SEARCH_DEFAULT_LIMIT: usize = 8;
+pub const MEMORY_SEARCH_MAX_LIMIT: usize = 20;
+
+/// The repository index, as the `memory_search` tool sees it.
+///
+/// Defined here and implemented elsewhere so that this crate does not depend on the crate that
+/// owns the index: `tools` depends on `guard` and nothing above it. An executor with no
+/// implementation attached answers `memory_search` with a fixed refusal.
+pub trait MemorySearch: Send + Sync + std::fmt::Debug {
+    /// Returns the result text, or a message explaining why there is none.
+    fn search(&self, request: MemorySearchRequest) -> BoxFuture<'_, Result<String, String>>;
+}
+
 /// Cloneable, stateless-per-call executor suitable for parallel task dispatch.
 #[derive(Debug, Clone)]
 pub struct ToolExecutor {
     root: PathBuf,
     policy: PathPolicy,
     scrubber: Scrubber,
+    memory: Option<Arc<dyn MemorySearch>>,
 }
 
 impl ToolExecutor {
@@ -89,7 +121,15 @@ impl ToolExecutor {
             root: policy.root().to_path_buf(),
             policy,
             scrubber: Scrubber::new(),
+            memory: None,
         })
+    }
+
+    /// Attaches the repository index that backs `memory_search`.
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn MemorySearch>) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     #[must_use]
@@ -107,12 +147,54 @@ impl ToolExecutor {
             "glob" => self.glob(input).await,
             "grep" => self.grep(input).await,
             "bash" => self.bash(input).await,
-            "memory_search" => memory_search(input),
+            "memory_search" => self.memory_search(input).await,
             _ => ToolResult::error(format!("unknown tool: {name}")),
         };
         ToolResult {
             content: self.scrubber.scrub(&result.content),
             is_error: result.is_error,
+        }
+    }
+
+    async fn memory_search(&self, input: Value) -> ToolResult {
+        let input: MemoryInput = match decode(input) {
+            Ok(input) => input,
+            Err(result) => return result,
+        };
+        let query = input.query.trim();
+        if query.is_empty() {
+            return ToolResult::error("query must not be empty");
+        }
+        let limit = match input.limit {
+            None => MEMORY_SEARCH_DEFAULT_LIMIT,
+            Some(n) => match usize::try_from(n) {
+                Ok(n) if (1..=MEMORY_SEARCH_MAX_LIMIT).contains(&n) => n,
+                _ => {
+                    return ToolResult::error(format!(
+                        "limit must be between 1 and {MEMORY_SEARCH_MAX_LIMIT}"
+                    ));
+                }
+            },
+        };
+        let kind = match input.kind.as_deref() {
+            None => None,
+            Some("file") => Some(SearchKind::File),
+            Some("symbol") => Some(SearchKind::Symbol),
+            Some(_) => return ToolResult::error("kind must be \"file\" or \"symbol\""),
+        };
+        let Some(memory) = &self.memory else {
+            return ToolResult::error(
+                "memory_search is unavailable: this session has no repository index",
+            );
+        };
+        let request = MemorySearchRequest {
+            query: query.to_owned(),
+            limit,
+            kind,
+        };
+        match memory.search(request).await {
+            Ok(text) => ToolResult::success(text),
+            Err(message) => ToolResult::error(message),
         }
     }
 
@@ -326,10 +408,13 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             "memory_search",
-            "Search project memory (available in milestone M2).",
+            "Find files and symbols in this repository by what they do. Returns ranked path:line matches. Use it when you do not know where something lives.",
             json!({
-                "type": "object", "properties": { "query": { "type": "string" } },
-                "required": ["query"], "additionalProperties": false
+                "type": "object", "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MEMORY_SEARCH_MAX_LIMIT },
+                    "kind": { "type": "string", "enum": ["file", "symbol"] }
+                }, "required": ["query"], "additionalProperties": false
             }),
         ),
         definition(
@@ -365,14 +450,6 @@ fn definition(name: &str, description: &str, input_schema: Value) -> ToolDefinit
 fn decode<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ToolResult> {
     serde_json::from_value(input)
         .map_err(|error| ToolResult::error(format!("invalid tool input: {error}")))
-}
-
-fn memory_search(input: Value) -> ToolResult {
-    let _: MemoryInput = match decode(input) {
-        Ok(input) => input,
-        Err(result) => return result,
-    };
-    ToolResult::error("memory_search is unavailable until milestone M2")
 }
 
 fn contains_glob_meta(pattern: &str) -> bool {
@@ -503,6 +580,9 @@ struct BashInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryInput {
-    #[allow(dead_code)]
     query: String,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    kind: Option<String>,
 }

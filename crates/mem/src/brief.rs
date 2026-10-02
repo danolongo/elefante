@@ -191,11 +191,40 @@ pub fn render(memory: &Connection) -> Result<String, MemError> {
     Ok(text)
 }
 
+fn render_cached(s: &mut crate::store::WriterState) -> Result<String, MemError> {
+    let head = get_meta(&s.memory, "meta", "cochange_head")?.unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&tree_root(&s.cache)?);
+    hasher.update(head.as_bytes());
+    hasher.update(TEMPLATE_VERSION);
+    let key = *hasher.finalize().as_bytes();
+
+    let cached: Option<String> = s
+        .cache
+        .query_row(
+            "SELECT text FROM brief WHERE tree_root = ?1",
+            [key.as_slice()],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(text) = cached {
+        return Ok(text);
+    }
+    let text = render(&s.memory)?;
+    s.cache.execute(
+        "INSERT OR REPLACE INTO brief(tree_root, text, created_ns) VALUES (?1, ?2, ?3)",
+        rusqlite::params![key.as_slice(), text, now_ns()],
+    )?;
+    Ok(text)
+}
+
 /// The brief for the current graph, from cache when nothing relevant changed.
 ///
 /// `None` until a first full index has finished: a brief of a half-built graph would be wrong in
 /// ways nobody could tell. The cache key covers the tree fingerprint **and** the commit the
 /// co-change edges were computed at, because "central files" depend on edges as well as content.
+///
+/// Blocks the calling thread; inside an async context use [`get_or_render_async`].
 ///
 /// # Errors
 /// SQLite errors, or a writer thread that is gone.
@@ -203,32 +232,18 @@ pub fn get_or_render(store: &Store) -> Result<Option<String>, MemError> {
     if !store.index_state().is_complete() {
         return Ok(None);
     }
-    store.writer().call_blocking(|s| {
-        let head = get_meta(&s.memory, "meta", "cochange_head")?.unwrap_or_default();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&tree_root(&s.cache)?);
-        hasher.update(head.as_bytes());
-        hasher.update(TEMPLATE_VERSION);
-        let key = *hasher.finalize().as_bytes();
+    store.writer().call_blocking(render_cached)?.map(Some)
+}
 
-        let cached: Option<String> = s
-            .cache
-            .query_row(
-                "SELECT text FROM brief WHERE tree_root = ?1",
-                [key.as_slice()],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(text) = cached {
-            return Ok(Some(text));
-        }
-        let text = render(&s.memory)?;
-        s.cache.execute(
-            "INSERT OR REPLACE INTO brief(tree_root, text, created_ns) VALUES (?1, ?2, ?3)",
-            rusqlite::params![key.as_slice(), text, now_ns()],
-        )?;
-        Ok(Some(text))
-    })?
+/// As [`get_or_render`], for use from async code.
+///
+/// # Errors
+/// SQLite errors, or a writer thread that is gone.
+pub async fn get_or_render_async(store: &Store) -> Result<Option<String>, MemError> {
+    if !store.index_state().is_complete() {
+        return Ok(None);
+    }
+    store.writer().call(render_cached).await?.map(Some)
 }
 
 /// Keeps the newest [`KEEP_BRIEFS`] cached briefs.

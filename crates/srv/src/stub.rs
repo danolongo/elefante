@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
     fs,
-    path::Path,
+    io::Write as _,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -51,12 +52,16 @@ pub(crate) struct StubProvider {
     rounds: Vec<Vec<Step>>,
     next_round: AtomicUsize,
     delay: Duration,
+    /// When set, every request is appended to this file as one JSON line, so a test can see
+    /// exactly what the model would have been sent.
+    record: Option<PathBuf>,
 }
 
 impl StubProvider {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let value: Value = serde_json::from_slice(&fs::read(path)?)?;
         let delay = Duration::from_millis(value["delay_ms"].as_u64().unwrap_or(0));
+        let record = value["record_requests"].as_str().map(PathBuf::from);
         let rounds = if let Some(rounds) = value.get("rounds").and_then(Value::as_array) {
             rounds.clone()
         } else {
@@ -85,6 +90,7 @@ impl StubProvider {
             rounds,
             next_round: AtomicUsize::new(0),
             delay,
+            record,
         })
     }
 }
@@ -126,6 +132,12 @@ impl Provider for StubProvider {
     }
 
     fn stream(&self, request: Request) -> BoxStream<'static, Result<Event, ProviderError>> {
+        if let Some(path) = &self.record
+            && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
+            && let Ok(line) = serde_json::to_string(&request)
+        {
+            let _ = writeln!(file, "{line}");
+        }
         let validation = validate_pairing(&request);
         let index = self.next_round.fetch_add(1, Ordering::Relaxed);
         let steps = self.rounds[index.min(self.rounds.len() - 1)].clone();

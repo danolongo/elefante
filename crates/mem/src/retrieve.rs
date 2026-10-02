@@ -708,6 +708,97 @@ pub fn run(
     Ok(pack(&hits, query.budget_tokens, generation, partial))
 }
 
+// ----- explicit search, for the `memory_search` tool -----
+
+/// Which nodes an explicit search returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKind {
+    File,
+    Symbol,
+}
+
+pub const DEFAULT_SEARCH_LIMIT: usize = 8;
+pub const MAX_SEARCH_LIMIT: usize = 20;
+
+/// Collapses whitespace and control characters to single spaces and caps the length.
+///
+/// Unlike [`escape_capped`] this does no entity escaping: a tool result is not wrapped in an
+/// envelope, so there is nothing for repository text to close.
+fn flatten_capped(raw: &str, max_chars: usize) -> String {
+    let text = raw
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&text, max_chars)
+}
+
+fn search_line(hit: &Hit) -> String {
+    let raw = match hit.kind {
+        HitKind::File => {
+            let mut raw = format!("{}  file", hit.path);
+            if !hit.body.is_empty() {
+                raw.push_str(" — ");
+                raw.push_str(&hit.body);
+            }
+            raw
+        }
+        HitKind::Symbol => {
+            let kind = hit.symbol_kind.as_deref().unwrap_or("item");
+            let qname = hit.qname.as_deref().unwrap_or(&hit.name);
+            let location = hit
+                .line
+                .map_or_else(|| hit.path.clone(), |line| format!("{}:{line}", hit.path));
+            let detail = if hit.doc().is_empty() {
+                hit.signature()
+            } else {
+                hit.doc()
+            };
+            format!("{location}  {kind} {qname} — {detail}")
+        }
+    };
+    flatten_capped(&raw, MAX_LINE_CHARS)
+}
+
+/// An explicit, ranked search rendered as plain lines: `path:line  kind qname — description`.
+///
+/// # Errors
+/// SQLite errors.
+pub fn search(
+    conn: &Connection,
+    query: &Query,
+    kind: Option<SearchKind>,
+    limit: usize,
+    partial: bool,
+) -> Result<String, MemError> {
+    let tx = conn.unchecked_transaction()?;
+    let hits = rank(&tx, query)?;
+    tx.commit()?;
+    let wanted = |hit: &Hit| {
+        matches!(
+            (kind, hit.kind),
+            (None, _)
+                | (Some(SearchKind::File), HitKind::File)
+                | (Some(SearchKind::Symbol), HitKind::Symbol)
+        )
+    };
+    let lines: Vec<String> = hits
+        .iter()
+        .filter(|hit| wanted(hit))
+        .take(limit.clamp(1, MAX_SEARCH_LIMIT))
+        .map(search_line)
+        .collect();
+    let note = if partial {
+        "\n(the index is still being built; results may be incomplete)"
+    } else {
+        ""
+    };
+    if lines.is_empty() {
+        return Ok(format!("no matches{note}"));
+    }
+    Ok(format!("{}{note}", lines.join("\n")))
+}
+
 // ----- the cached entry point -----
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -740,6 +831,14 @@ pub struct Retriever {
     cache: moka::sync::Cache<CacheKey, Option<Arc<MemoryBlock>>>,
 }
 
+impl std::fmt::Debug for Retriever {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Retriever")
+            .field("cached", &self.cache.entry_count())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Retriever {
     #[must_use]
     pub fn new(store: Arc<Store>) -> Self {
@@ -750,6 +849,24 @@ impl Retriever {
                 .time_to_live(CACHE_TTL)
                 .build(),
         }
+    }
+
+    /// An explicit search, rendered as plain lines. Not cached: the model asking for something
+    /// specific is a different intent from ambient context, and repeats are rare.
+    ///
+    /// # Errors
+    /// SQLite errors, or a reader thread that is gone.
+    pub async fn search(
+        &self,
+        query: Query,
+        kind: Option<SearchKind>,
+        limit: usize,
+    ) -> Result<String, MemError> {
+        let partial = self.store.index_state().is_partial();
+        self.store
+            .reader()
+            .call(move |s| search(&s.memory, &query, kind, limit, partial))
+            .await?
     }
 
     /// The best block for `query`, or `None` when nothing in the index matches.

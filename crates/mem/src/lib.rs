@@ -28,6 +28,3 @@ pub use repo::RepoId;
 pub use schema::Pairing;
 pub use stats::{Counters, IndexStats};
 pub use store::Store;
-
-/// Marker describing why the `memory_search` tool has no backing store yet.
-pub const NOT_AVAILABLE: &str = "memory search is not available until milestone M2";

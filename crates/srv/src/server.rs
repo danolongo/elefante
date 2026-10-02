@@ -11,7 +11,11 @@ use std::{
 };
 
 use anyhow::Context as _;
-use elefante_core::{ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate};
+use elefante_core::{
+    ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate,
+    memory::{MemContext, MemSearchTool},
+};
+use elefante_mem::{Indexer, RepoId, Store, indexer::IndexOptions, retrieve::Retriever};
 use elefante_provider::{OpenRouterProvider, Provider};
 use elefante_rpc::{Notification, NotificationEvent, truncate_preview};
 use elefante_tools::ToolExecutor;
@@ -36,6 +40,9 @@ pub struct DaemonConfig {
     pub base_url: Option<String>,
     pub stub_provider: Option<PathBuf>,
     pub idle_timeout: Duration,
+    /// Index repositories and give sessions context from them. `ELEFANTE_MEMORY=0` turns it all
+    /// off: no store is opened, nothing is written under `.elefante/`, no context is added.
+    pub memory: bool,
 }
 
 /// Resolve the test override, runtime directory, then the home-directory fallback.
@@ -82,6 +89,7 @@ impl DaemonConfig {
                     .map_or(Ok(900), |value| value.parse())
                     .context("invalid ELEFANTE_IDLE_SECS")?,
             ),
+            memory: env::var("ELEFANTE_MEMORY").map_or(true, |value| value.trim() != "0"),
         })
     }
 }
@@ -174,10 +182,34 @@ async fn bind(path: &Path) -> anyhow::Result<Option<(UnixListener, SocketGuard)>
     }
 }
 
+/// One repository's index: opened lazily the first time a session starts beneath it, and shared by
+/// every session after that, so they all attach to one warm store and one indexer.
+struct RepoMemory {
+    store: Arc<Store>,
+    indexer: Arc<Indexer>,
+    retriever: Arc<Retriever>,
+}
+
+impl RepoMemory {
+    fn open(repo: &RepoId) -> Result<Self, elefante_mem::MemError> {
+        let store = Arc::new(Store::open(repo)?);
+        Ok(Self {
+            indexer: Indexer::new(
+                Arc::clone(&store),
+                repo.root().to_path_buf(),
+                IndexOptions::default(),
+            ),
+            retriever: Arc::new(Retriever::new(Arc::clone(&store))),
+            store,
+        })
+    }
+}
+
 struct Shared {
     config: DaemonConfig,
     provider: Mutex<Option<Arc<dyn Provider>>>,
     sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+    memories: Mutex<HashMap<PathBuf, Arc<RepoMemory>>>,
     next_id: AtomicU64,
     instance_id: String,
     clients: AtomicUsize,
@@ -236,6 +268,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         config,
         provider: Mutex::new(provider),
         sessions: Mutex::new(HashMap::new()),
+        memories: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         instance_id,
         clients: AtomicUsize::new(0),
@@ -267,6 +300,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
 struct SessionEntry {
     session: tokio::sync::Mutex<Session>,
+    memory: Option<Arc<RepoMemory>>,
     tools: ToolExecutor,
     view: Mutex<View>,
     approvals: Arc<Approvals>,
@@ -597,13 +631,15 @@ fn create_session(
             .ok_or_else(|| invalid("max_rounds must be positive"))?;
     }
     let tools = ToolExecutor::new(&cwd).map_err(invalid)?;
+    let (session, tools, memory) = attach_memory(state, &cwd, Session::new(config), tools);
     let session_id = format!(
         "s{}-{}",
         state.instance_id,
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
     let entry = Arc::new(SessionEntry {
-        session: tokio::sync::Mutex::new(Session::new(config)),
+        session: tokio::sync::Mutex::new(session),
+        memory,
         tools,
         approvals: Arc::new(Approvals::default()),
         view: Mutex::new(View {
@@ -628,6 +664,62 @@ fn create_session(
         json!({"session_id":session_id,"seq":0}),
     ));
     Ok(())
+}
+
+/// Gives a new session the repository index beneath its working directory, if there is one.
+///
+/// Memory is an aid and never a requirement: any failure to open the index is reported and the
+/// session simply runs without it. The refresh requested here returns immediately.
+fn attach_memory(
+    state: &Arc<Shared>,
+    cwd: &Path,
+    session: Session,
+    tools: ToolExecutor,
+) -> (Session, ToolExecutor, Option<Arc<RepoMemory>>) {
+    if !state.config.memory {
+        return (session, tools, None);
+    }
+    let repo = match RepoId::resolve(cwd) {
+        Ok(repo) => repo,
+        Err(error) => {
+            eprintln!("elefante: {error}");
+            return (session, tools, None);
+        }
+    };
+    let memory = {
+        let mut memories = state.memories.lock().expect("memory registry poisoned");
+        if let Some(existing) = memories.get(repo.root()) {
+            Arc::clone(existing)
+        } else {
+            match RepoMemory::open(&repo) {
+                Ok(opened) => {
+                    let opened = Arc::new(opened);
+                    memories.insert(repo.root().to_path_buf(), Arc::clone(&opened));
+                    opened
+                }
+                Err(error) => {
+                    eprintln!(
+                        "elefante: memory unavailable for {}: {error}",
+                        repo.root().display()
+                    );
+                    return (session, tools, None);
+                }
+            }
+        }
+    };
+    memory.indexer.refresh();
+    let scope = repo.scope_of(cwd);
+    let context = MemContext::new(
+        Arc::clone(&memory.store),
+        Arc::clone(&memory.retriever),
+        scope.clone(),
+    );
+    let search = MemSearchTool::new(Arc::clone(&memory.retriever), scope);
+    (
+        session.with_context(Arc::new(context)),
+        tools.with_memory(Arc::new(search)),
+        Some(memory),
+    )
 }
 
 fn handle_method(
@@ -800,6 +892,10 @@ fn prompt_session(
     tokio::spawn(async move {
         let gate = ToolGate::new(entry.approvals.clone());
         let mut session = entry.session.lock().await;
+        // The user may have edited files since the last turn. Never waited on.
+        if let Some(memory) = &entry.memory {
+            memory.indexer.refresh();
+        }
         let _ = session
             .prompt(
                 provider.as_ref(),
@@ -823,6 +919,10 @@ fn prompt_session(
                 },
             )
             .await;
+        // The agent may have edited files during the turn.
+        if let Some(memory) = &entry.memory {
+            memory.indexer.refresh();
+        }
         state.turns.fetch_sub(1, Ordering::SeqCst);
     });
     Ok(())
@@ -881,9 +981,11 @@ mod tests {
                 base_url: None,
                 stub_provider: None,
                 idle_timeout: Duration::from_secs(20),
+                memory: false,
             },
             provider: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            memories: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             instance_id: instance_id().unwrap(),
             clients: AtomicUsize::new(0),

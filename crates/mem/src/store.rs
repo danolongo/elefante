@@ -13,7 +13,7 @@ use crate::{
     schema::{self, Pairing},
 };
 
-/// Whether the index can be trusted to be complete, readable without a database round trip.
+/// What retrieval needs to know about the index, readable without a database round trip.
 ///
 /// Retrieval reports `partial` from this, and a cached result is keyed by it, so a cache hit never
 /// has to ask the database anything.
@@ -43,10 +43,16 @@ impl IndexState {
         self.complete.load(Ordering::SeqCst)
     }
 
-    /// Retrieval from an index that is being built, or was never finished, is flagged.
+    /// Whether a first full index has not yet finished.
+    ///
+    /// This deliberately ignores whether a refresh is *running*. Refreshes start at every session
+    /// create, turn start and turn end, so on a complete index one is nearly always in flight, and
+    /// calling that "partial" would mark almost every block and teach the model to distrust an
+    /// index that is complete and merely being kept current. Partial means: absence from this
+    /// index is not evidence of absence from the repository.
     #[must_use]
     pub fn is_partial(&self) -> bool {
-        self.is_running() || !self.is_complete()
+        !self.is_complete()
     }
 }
 

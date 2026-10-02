@@ -1,6 +1,10 @@
-use elefante_tools::{ToolExecutor, definitions};
+use elefante_tools::{
+    MEMORY_SEARCH_DEFAULT_LIMIT, MemorySearch, MemorySearchRequest, SearchKind, ToolExecutor,
+    definitions,
+};
+use futures_util::future::BoxFuture;
 use serde_json::json;
-use std::fs;
+use std::{fs, sync::Arc};
 
 fn executor() -> (tempfile::TempDir, ToolExecutor) {
     let temp = tempfile::tempdir().unwrap();
@@ -287,7 +291,7 @@ async fn glob_and_grep_are_deterministic() {
 }
 
 #[tokio::test]
-async fn memory_search_is_a_deterministic_m2_stub() {
+async fn memory_search_without_an_index_is_a_deterministic_refusal() {
     let (_temp, executor) = executor();
     let first = executor
         .execute("memory_search", json!({"query": "anything"}))
@@ -299,8 +303,155 @@ async fn memory_search_is_a_deterministic_m2_stub() {
     assert!(first.is_error);
     assert_eq!(
         first.content,
-        "memory_search is unavailable until milestone M2"
+        "memory_search is unavailable: this session has no repository index"
     );
+}
+
+#[derive(Debug, Default)]
+struct FakeIndex {
+    seen: std::sync::Mutex<Vec<MemorySearchRequest>>,
+    reply: std::sync::Mutex<Option<Result<String, String>>>,
+}
+
+impl FakeIndex {
+    fn replying(reply: Result<String, String>) -> Arc<Self> {
+        Arc::new(Self {
+            reply: std::sync::Mutex::new(Some(reply)),
+            ..Self::default()
+        })
+    }
+
+    fn requests(&self) -> Vec<MemorySearchRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl MemorySearch for FakeIndex {
+    fn search(&self, request: MemorySearchRequest) -> BoxFuture<'_, Result<String, String>> {
+        self.seen.lock().unwrap().push(request);
+        let reply = self
+            .reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok("no matches".to_owned()));
+        Box::pin(async move { reply })
+    }
+}
+
+fn indexed(index: &Arc<FakeIndex>) -> (tempfile::TempDir, ToolExecutor) {
+    let (temp, executor) = executor();
+    (temp, executor.with_memory(index.clone()))
+}
+
+#[tokio::test]
+async fn memory_search_passes_a_validated_request_to_the_index() {
+    let index = FakeIndex::replying(Ok("src/lib.rs:3  fn run".to_owned()));
+    let (_temp, executor) = indexed(&index);
+
+    let result = executor
+        .execute("memory_search", json!({"query": "  where is run  "}))
+        .await;
+    assert_eq!(result.content, "src/lib.rs:3  fn run");
+    assert!(!result.is_error);
+
+    executor
+        .execute(
+            "memory_search",
+            json!({"query": "x", "limit": 20, "kind": "symbol"}),
+        )
+        .await;
+    executor
+        .execute("memory_search", json!({"query": "y", "kind": "file"}))
+        .await;
+    assert_eq!(
+        index.requests(),
+        [
+            MemorySearchRequest {
+                query: "where is run".to_owned(),
+                limit: MEMORY_SEARCH_DEFAULT_LIMIT,
+                kind: None,
+            },
+            MemorySearchRequest {
+                query: "x".to_owned(),
+                limit: 20,
+                kind: Some(SearchKind::Symbol),
+            },
+            MemorySearchRequest {
+                query: "y".to_owned(),
+                limit: MEMORY_SEARCH_DEFAULT_LIMIT,
+                kind: Some(SearchKind::File),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn memory_search_rejects_bad_input_without_asking_the_index() {
+    let index = FakeIndex::replying(Ok("never".to_owned()));
+    let (_temp, executor) = indexed(&index);
+    let cases = [
+        json!({}),
+        json!({"query": ""}),
+        json!({"query": "   "}),
+        json!({"query": "x", "limit": 0}),
+        json!({"query": "x", "limit": 21}),
+        json!({"query": "x", "limit": -1}),
+        json!({"query": "x", "limit": "5"}),
+        json!({"query": "x", "limit": 1.5}),
+        json!({"query": "x", "kind": "folder"}),
+        json!({"query": "x", "kind": 3}),
+        json!({"query": "x", "extra": true}),
+        json!({"query": 7}),
+    ];
+    for input in cases {
+        let result = executor.execute("memory_search", input.clone()).await;
+        assert!(result.is_error, "{input} must be rejected, got {result:?}");
+    }
+    assert!(index.requests().is_empty());
+}
+
+#[tokio::test]
+async fn memory_search_results_are_scrubbed_and_errors_stay_errors() {
+    let leaky = FakeIndex::replying(Ok(
+        "a.rs:1  const KEY sk-ant-api03-ABCDEFGH12345678".to_owned()
+    ));
+    let (_temp, executor) = indexed(&leaky);
+    let result = executor
+        .execute("memory_search", json!({"query": "key"}))
+        .await;
+    assert!(!result.content.contains("sk-ant"), "{}", result.content);
+
+    let failing = FakeIndex::replying(Err("the index is busy".to_owned()));
+    let (_temp, executor) = indexed(&failing);
+    let result = executor
+        .execute("memory_search", json!({"query": "key"}))
+        .await;
+    assert!(result.is_error);
+    assert_eq!(result.content, "the index is busy");
+}
+
+#[test]
+fn an_executor_with_an_index_attached_is_still_clone_and_debug() {
+    let index = FakeIndex::replying(Ok(String::new()));
+    let (_temp, executor) = indexed(&index);
+    let cloned = executor.clone();
+    assert!(format!("{cloned:?}").contains("memory"));
+}
+
+#[test]
+fn the_memory_search_definition_describes_the_real_tool() {
+    let definition = definitions()
+        .into_iter()
+        .find(|d| d.name == "memory_search")
+        .unwrap();
+    assert!(!definition.description.contains("milestone"));
+    let props = &definition.input_schema["properties"];
+    assert_eq!(props["limit"]["minimum"], 1);
+    assert_eq!(props["limit"]["maximum"], 20);
+    assert_eq!(props["kind"]["enum"], json!(["file", "symbol"]));
+    assert_eq!(definition.input_schema["required"], json!(["query"]));
+    assert_eq!(definition.input_schema["additionalProperties"], false);
 }
 
 #[tokio::test]

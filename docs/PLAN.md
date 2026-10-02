@@ -699,6 +699,31 @@ secrets and path-policy questions in § Session picker. Then `session.list`, `se
 per-conversation lock; bounded snapshots; and a TUI picker shown on launch (new session first)
 with `--session ID` and `--new` to bypass it.
 
+**Audit trail.** The stored record doubles as the means to audit agent behaviour, so it keeps
+what the live view discards. Today `View.turns` omits reasoning and truncates tool input and
+output to 2 KiB previews; the durable record instead holds, per turn: the prompt, the visible
+reasoning text, the answer, every tool call with its **full** input, output, duration, and
+approval decision, `stop_reason`, and `usage`. Encrypted reasoning blocks are replay state, not
+readable text, and are stored only as the history needs them for resume — an audit cannot read
+what the provider does not disclose. Everything passes `Scrubber` on write, as above.
+
+**Observability.** The daemon has two choke points that see everything: the connection reader
+sees every client → daemon request, and `View::emit` sees every daemon → client event, tool
+calls included. Both feed one structured-log stream, shipped to **Datadog** through a sink, so
+the backend can change without touching the tap. Constraints, since this sends a user's work to
+a third party:
+- **Off by default**, enabled by explicit configuration, with the API key supplied the way the
+  OpenRouter key is — never from the working tree.
+- **Scrubbed before it leaves the process**, by the same `Scrubber`; tool inputs and outputs can
+  hold file contents, so log bodies are redacted or truncated by a stated rule rather than sent
+  whole.
+- Each line carries `session_id`, `conversation_id`, `turn_id`, and `seq`, so a wire event, a
+  tool call, and a stored turn can be joined.
+- A slow or unreachable Datadog never blocks or fails a turn: the sink is bounded and drops
+  rather than back-pressuring the daemon.
+- The log is not the audit record. Datadog is for operating the system; the on-disk record is
+  the source of truth for what the agent did.
+
 **Gate.**
 - `SIGKILL` the daemon between turns and restart it: the conversation is listed with every
   completed turn, and resuming it then prompting does not 400 — against the pairing-validating
@@ -713,6 +738,14 @@ with `--session ID` and `--new` to bypass it.
 - A prompt containing an `sk-ant-` fixture string leaves it absent from every file under
   `.elefante/` after the session.
 - `git status` is clean after a full session.
+- The stored record of a scripted turn contains its reasoning text, answer, and every tool call
+  with its complete input and output — a tool result longer than the 2 KiB preview limit is
+  stored in full, not truncated.
+- With the Datadog sink pointed at a local fake endpoint: a session produces one log line per
+  request, event, and tool call, each carrying the join ids; none contains the `sk-ant-` fixture;
+  and with the endpoint down or slow the turn still completes and the sink drops rather than
+  blocks.
+- With no sink configured, nothing is sent anywhere.
 - A second resume of a live conversation is refused with a named error; `session.close` ends the
   live session and leaves the stored conversation listed; `session.delete` removes it.
 - The TUI picker shows live and stored conversations in one list, bypasses on `--session` and

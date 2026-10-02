@@ -1,6 +1,7 @@
 //! Graph memory for repositories. Design: `docs/M2-DESIGN.md`.
 
 pub mod actor;
+pub mod brief;
 pub mod cochange;
 pub mod diff;
 pub mod error;
@@ -21,6 +22,7 @@ mod util;
 pub mod walk;
 
 pub use error::MemError;
+pub use indexer::Indexer;
 pub use layout::StoreDir;
 pub use repo::RepoId;
 pub use schema::Pairing;

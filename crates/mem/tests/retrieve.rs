@@ -1,12 +1,13 @@
 mod common;
 
+use common::live::{live, refresh};
+
 use std::{fs, future::Future, sync::Arc};
 
 use elefante_mem::{
-    Counters, RepoId, Store,
+    RepoId, Store,
     extract::Symbol,
     graph::{self, Batch, FileUpdate},
-    indexer::{IndexOptions, refresh_blocking},
     retrieve::{
         self, CO_CHANGE, DEPENDS_REVERSE, HOP_DECAY, HUB_DAMPING, MAX_LINE_CHARS, MAX_QUERY_TERMS,
         MAX_SYMBOLS_PER_FILE, PATH_BOOST, Query, Retriever, estimate_tokens, fts_expression,
@@ -664,44 +665,6 @@ fn run<F: Future>(future: F) -> F::Output {
         .build()
         .unwrap()
         .block_on(future)
-}
-
-struct Live {
-    _tmp: tempfile::TempDir,
-    root: std::path::PathBuf,
-    store: Arc<Store>,
-}
-
-fn live(files: &[(&str, &str)]) -> Live {
-    let tmp = tempfile::tempdir().unwrap();
-    fs::create_dir(tmp.path().join(".git")).unwrap();
-    for (path, contents) in files {
-        let target = tmp.path().join(path);
-        fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::write(&target, contents).unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
-            .unwrap();
-    }
-    let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
-    Live {
-        root: repo.root().to_path_buf(),
-        store: Arc::new(Store::open(&repo).unwrap()),
-        _tmp: tmp,
-    }
-}
-
-fn refresh(live: &Live) {
-    refresh_blocking(
-        &live.store,
-        &live.root,
-        &Counters::default(),
-        &IndexOptions::default(),
-    )
-    .unwrap();
 }
 
 const CODE: &[(&str, &str)] = &[

@@ -7,8 +7,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -20,7 +25,7 @@ use crate::{
     hash::hash_files,
     schema,
     state::{self, StateRow},
-    stats::Counters,
+    stats::{Counters, IndexStats},
     store::Store,
     util::{now_ns, par_map},
     walk::{Walk, WalkedFile, walk},
@@ -64,7 +69,7 @@ impl Default for IndexOptions {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshReport {
     /// Files whose content changed and were written to the graph.
     pub updated: Vec<String>,
@@ -372,6 +377,7 @@ fn finish(
         )?;
         if complete {
             cache::gc(&s.cache, stamp, cache::GC_MAX_AGE_NS)?;
+            crate::brief::prune(&s.cache)?;
         }
         let mut changed = applied.as_ref().is_some_and(|a| a.changed);
         let mut generation = match applied {
@@ -394,4 +400,148 @@ fn finish(
     store.index_state().set_complete(complete);
     report.generation = generation;
     Ok(())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // The guarded values are plain flags and results; a panic elsewhere cannot leave them
+    // inconsistent, so a poisoned lock is still safe to use.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs refreshes in the background, one at a time.
+///
+/// `refresh()` never waits: if a run is in progress it marks the indexer dirty and returns, and the
+/// running thread goes round once more when it finishes. However many triggers arrive — session
+/// create, turn start, turn end, from any number of sessions — they collapse into at most two
+/// runs, and none of them blocks a prompt.
+pub struct Indexer {
+    store: Arc<Store>,
+    root: PathBuf,
+    options: IndexOptions,
+    counters: Arc<Counters>,
+    control: Mutex<Control>,
+    idle: Condvar,
+    runs: AtomicU64,
+    last: Mutex<Option<Result<RefreshReport, String>>>,
+}
+
+#[derive(Default)]
+struct Control {
+    running: bool,
+    dirty: bool,
+}
+
+impl Indexer {
+    #[must_use]
+    pub fn new(store: Arc<Store>, root: PathBuf, options: IndexOptions) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            root,
+            options,
+            counters: Arc::new(Counters::default()),
+            control: Mutex::new(Control::default()),
+            idle: Condvar::new(),
+            runs: AtomicU64::new(0),
+            last: Mutex::new(None),
+        })
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// Requests a refresh. Returns immediately.
+    pub fn refresh(self: &Arc<Self>) {
+        {
+            let mut control = lock(&self.control);
+            if control.running {
+                control.dirty = true;
+                return;
+            }
+            control.running = true;
+            control.dirty = false;
+        }
+        self.store.index_state().set_running(true);
+        let worker = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("elefante-indexer".to_owned())
+            .spawn(move || worker.run_until_clean());
+        if spawned.is_err() {
+            self.finish_running();
+        }
+    }
+
+    fn run_until_clean(&self) {
+        loop {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            // A panic must not leave `running` set forever, or the index would never refresh again.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                refresh_blocking(&self.store, &self.root, &self.counters, &self.options)
+            }));
+            let result = match outcome {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("indexer panicked".to_owned()),
+            };
+            *lock(&self.last) = Some(result);
+            let mut control = lock(&self.control);
+            if control.dirty {
+                control.dirty = false;
+                continue;
+            }
+            control.running = false;
+            drop(control);
+            self.finish_running();
+            return;
+        }
+    }
+
+    fn finish_running(&self) {
+        lock(&self.control).running = false;
+        self.store.index_state().set_running(false);
+        self.idle.notify_all();
+    }
+
+    /// Blocks until no run is in progress, or `timeout` passes. Returns whether it went idle.
+    #[must_use]
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut control = lock(&self.control);
+        while control.running {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            control = self
+                .idle
+                .wait_timeout(control, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        lock(&self.control).running
+    }
+
+    /// Completed or abandoned runs so far. Gates assert on this to prove coalescing.
+    #[must_use]
+    pub fn runs(&self) -> u64 {
+        self.runs.load(Ordering::SeqCst)
+    }
+
+    /// Cumulative counters across every run.
+    #[must_use]
+    pub fn stats(&self) -> IndexStats {
+        self.counters.snapshot()
+    }
+
+    /// The outcome of the most recent run.
+    #[must_use]
+    pub fn last_result(&self) -> Option<Result<RefreshReport, String>> {
+        lock(&self.last).clone()
+    }
 }

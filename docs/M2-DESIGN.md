@@ -711,8 +711,12 @@ This is stricter than § 10.5 because the brief is present on every request for 
 ### 11.2 Merkle root and freezing
 
 `tree_root = blake3` over `file_state` rows sorted by path, each contributing `(path, blake3)`. It
-is the cheap "did anything change" fingerprint and the key of `cache.db.brief`, so the brief is
-re-rendered only when a file changed.
+is the cheap "did anything change" fingerprint. *Amended during implementation:* the key of
+`cache.db.brief` is `blake3(tree_root ‖ cochange_head ‖ template version)`, not the fingerprint alone,
+because "central files" is computed from edges as well as content, and the co-change edges move when
+`HEAD` does while no file's content has. The newest 8 cached briefs are kept; the rest are pruned at
+the end of every complete refresh. The brief lists a language once, so TS and TSX files both count
+as `typescript`.
 
 **Per session the brief is frozen** the first time it is available: the same bytes on every request
 thereafter, whatever the index does underneath. A changing prefix would invalidate the prompt cache
@@ -789,10 +793,12 @@ per round**, it asks for a block, then builds each round's `Request.messages` as
 - `create_session` resolves the root (§ 6.2), gets or opens the store, constructs
   `Session::with_context(…)` and the `ToolExecutor` with `with_memory`, and calls
   `store.refresh()`.
-- **Refresh triggers (D4):** session create, turn start, turn end. `refresh()` is
-  **single-flight**: a call while one is running marks the store dirty and returns immediately;
+- **Refresh triggers (D4):** session create, turn start, turn end. `Indexer::refresh()` is
+  **single-flight**: a call while one is running marks the indexer dirty and returns immediately;
   when the running one finishes it runs once more. N concurrent triggers collapse to at most two
-  runs. No trigger ever awaits the result.
+  runs. No trigger ever awaits the result. The run executes on a dedicated thread, so the API needs
+  no async runtime, a panic inside a run is caught and recorded rather than leaving the indexer
+  permanently "running", and `wait_idle` exists for tests and orderly shutdown.
 - `ELEFANTE_MEMORY=0` disables everything: no store opened, no `.elefante/` created, no block, no
   preamble, and `memory_search` returns its refusal. A kill switch is table stakes for a feature that
   reads the whole repository.

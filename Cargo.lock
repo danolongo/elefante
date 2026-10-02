@@ -304,6 +304,8 @@ dependencies = [
  "moka",
  "rusqlite",
  "tempfile",
+ "thiserror",
+ "tokio",
  "tree-sitter",
  "tree-sitter-rust",
  "tree-sitter-typescript",

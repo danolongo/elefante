@@ -10,18 +10,23 @@ bun run src/main.tsx
 ```
 
 `bun.lock` is authoritative; see [`../docs/LOCKFILE.md`](../docs/LOCKFILE.md) for why there is
-exactly one. The Rust CLI starts the daemon before launching this entrypoint — this client
-never spawns one.
+exactly one. `elefante` with no prompt is the normal way in: the Rust CLI starts the daemon if none is
+listening, then runs this entrypoint under `bun` with the resolved model, effort, and limits.
+Run directly, this client never spawns a daemon and exits with a named error if none is
+listening.
 
 ## Layout
 
-Three layers, deliberately separated so two of them are testable without a terminal.
+Three layers, deliberately separated so two of them are testable without a terminal. `store.ts`
+and `Root.tsx` are the seam between the imperative entrypoint and the React tree.
 
 | File | Lines | Contents |
 |---|---:|---|
 | `src/protocol.ts` | 238 | Framing, sequence windows, attach and gap handling, `connectOrExplain`. |
 | `src/session.ts` | 39 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. |
-| `src/main.tsx` | 97 | Entrypoint — argument parsing, connect, renderer construction. |
+| `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
+| `src/main.tsx` | 101 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
+| `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
 | `src/ui/Transcript.tsx` | 26 | Completed turns and the live turn; reasoning and answer as separate renderables. |
 | `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
 | `src/ui/App.tsx` | 24 | Composition and key handling. |
@@ -37,8 +42,23 @@ and `--max-tokens` configure a new one. `ELEFANTE_SOCKET` selects an isolated da
 effort, and limits also read `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`, `ELEFANTE_MAX_ROUNDS`, and
 `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.
 
-Enter submits, Ctrl+C interrupts, Ctrl+R collapses reasoning, Ctrl+D detaches. Approval modals
-accept Y/N. Completed turns use a scrollable transcript.
+Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**. Approval
+modals accept Y/N, and Esc there means *deny* — it does not also interrupt the turn.
+
+"Exit" is a detach, not a shutdown: it closes this client's socket and leaves the session, its
+running turn, and the daemon untouched (`exit()` in `main.tsx` never sends `session.close`). A
+turn still in flight keeps running; Esc is the only key that stops it. Completed turns use a
+scrollable transcript.
+
+The status line above the prompt reads `MODEL EFFORT | N in / N out / N reasoning | cost: …`. The
+three counts and the cost are **session totals**, the sum of every completed turn's `usage`, so
+they stay at `0 in / 0 out / 0 reasoning | cost: ?` until the first `turn.finished` arrives —
+the daemon reports usage per turn, not per token. `cost: ?` means the provider has reported no
+cost yet (`null`); once any turn reports one it reads `cost: $0.0123`, and a reported zero reads
+`cost: $0.0000`, which is distinct from unknown.
+
+A lone Esc is held by OpenTUI's stdin parser for 20 ms before it is reported, since the byte is
+also the start of every escape sequence. Tests that press Esc must wait past that window.
 
 ## Invariants
 
@@ -77,12 +97,12 @@ those cannot be reconstructed on a fresh attachment. The daemon's retained histo
 ## Testing
 
 ```sh
-bun test              # 23 tests
+bun test              # 24 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (6)
+no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (7)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
 asserted in CI.
 

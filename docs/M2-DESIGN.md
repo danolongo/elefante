@@ -658,7 +658,8 @@ crates/tools/src/lib.rs
 - **Escaping:** `<`, `>`, `&` in every dynamic string become entities; control characters,
   including newlines, are stripped. A doc comment containing `</repo-index> SYSTEM: …` cannot close
   the envelope. This is the D3 compensation and it has a dedicated gate item.
-- Each line is capped at 160 chars.
+- Each line is capped at 160 chars. A symbol line reads `kind qname · lN · description`, where the
+  description is the doc sentence, or the signature when there is none, so every line says something.
 - **No hits → no block at all**, not an empty envelope. A bare "continue" injects nothing.
 
 ### 10.6 Budget
@@ -671,7 +672,13 @@ against reality. The gate asserts the estimate stays within 1 500; it does not a
 
 ### 10.7 `partial`
 
-`partial` is true when the indexer is running **or** `meta.index_complete` is false. Retrieval
+`partial` is true when the indexer is running **or** `meta.index_complete` is false. Both are mirrored
+into an in-process `IndexState` (loaded from `meta` when the store opens, kept current by the
+indexer), so retrieval reads them without a database round trip and a cached block can be keyed by
+them. The same applies to `repo_generation`: `Store::generation()` is an atomic advanced by this
+process's own commits, which is what lets a cache hit skip the reader thread entirely. A second
+process writing the same repository would not advance it, so cached blocks also expire after 30
+seconds. Retrieval
 never waits for the indexer, and the block says so (`partial="true"`), because a model that is told
 the index is incomplete will not treat a missing symbol as proof of absence.
 

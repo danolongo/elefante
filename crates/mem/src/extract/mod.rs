@@ -207,7 +207,8 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
+#[must_use]
+pub fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }

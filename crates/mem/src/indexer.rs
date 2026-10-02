@@ -165,6 +165,7 @@ fn cochange_phase(
     if applied.changed {
         counters.add_batches(1);
     }
+    store.note_generation(applied.generation);
     report.generation = applied.generation;
     Ok(())
 }
@@ -319,6 +320,7 @@ fn commit_batch(
         tx.commit()?;
         Ok::<_, MemError>(applied)
     })??;
+    store.note_generation(applied.generation);
     if applied.changed {
         counters.add_batches(1);
     }
@@ -388,6 +390,8 @@ fn finish(
     if changed {
         counters.add_batches(1);
     }
+    store.note_generation(generation);
+    store.index_state().set_complete(complete);
     report.generation = generation;
     Ok(())
 }

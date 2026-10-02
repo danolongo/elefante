@@ -27,6 +27,7 @@ if (connectFailure !== null) {
 
 const renderer = await createCliRenderer({ exitOnCtrlC: false });
 const root = createRoot(renderer);
+const resumed = Boolean(option("--session"));   // a re-attached session skips the elephant's new-session intro
 let state = initialSession("", option("--cwd") ?? process.cwd(), setting("model"), setting("effort"));
 let connected = false;
 let message: string | null = null;
@@ -71,7 +72,7 @@ function draw() {
   } };
   // Publish, never re-render: `root.render()` remounts the tree on every call, so calling it
   // per update leaked one keypress listener each time — four a second, unbounded.
-  publish({ state, now: Date.now(), connected, submitting, message: message ?? state.error, modal, onSubmit: text => void prompt(text), onInterrupt: () => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }, onExit: exit });
+  publish({ state, now: Date.now(), connected, submitting, resumed, message: message ?? state.error, modal, onSubmit: text => void prompt(text), onInterrupt: () => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }, onExit: exit });
 }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function recover() {

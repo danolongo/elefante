@@ -392,8 +392,15 @@ pub trait Language: Send + Sync {
 }
 ```
 
-A language is a grammar crate, one `.scm` query file embedded with `include_str!`, and a resolver
+A language is a grammar crate, an extractor (a walk over the syntax tree), and a resolver
 (§ 8). Adding Python or Go later touches those three things and one registry line.
+
+*Amended during implementation:* this section originally specified `.scm` query files. A hand-written
+walk replaced them because the two things extraction needs most — the qualified name, which nests
+through `impl`, `trait`, `mod`, class and namespace bodies, and the signature, which is a slice of
+source ending at a field that differs per node kind — are parent-context questions a query does not
+express cleanly. The extractors are still data-shaped (a table of node kinds to symbol kinds and the
+field that ends each signature); only the mechanism changed.
 
 | Path | Extractor |
 |---|---|
@@ -414,7 +421,7 @@ A language is a grammar crate, one `.scm` query file embedded with `include_str!
     { "kind": "fn", "name": "prompt", "qname": "Session::prompt",
       "signature": "pub async fn prompt<F>(&mut self, provider: &dyn Provider, …)",
       "doc": "Appends one user turn and retains its paired history.",
-      "line": 232, "end_line": 262 }
+      "line": 232, "end_line": 262, "via_trait": null }
   ],
   "imports": [ { "kind": "mod", "spec": "openrouter" },
                { "kind": "use", "spec": "crate::sse::SseDecoder" } ],
@@ -426,8 +433,9 @@ Symbol kinds. **Rust:** `fn`, `method` (a `fn` inside an `impl` or `trait`), `st
 `trait`, `type`, `const`, `static`, `mod`, `macro`. `impl` blocks are not symbols; they supply the
 `qname` prefix to their methods (`impl Session { fn prompt }` → `Session::prompt`; for
 `impl Trait for Type`, `Type::method` with the trait recorded in `attrs`). **TypeScript:**
-`function`, `class`, `method`, `interface`, `type`, `enum`, and top-level `const` whose value is
-a function or arrow function (React components land here).
+`function`, `class`, `method`, `interface`, `type`, `enum`, `namespace`, and top-level `const` whose
+value is a function or arrow function (React components land here). Overload signatures and
+`declare function` are `function` symbols with no body.
 
 Extraction is **error-tolerant**: tree-sitter returns a tree for malformed source, and whatever
 symbols parse are kept. A per-file parse budget (progress callback, default 1 s) abandons a
@@ -440,9 +448,13 @@ Memory is durable. A credential written into a row outlives the transient contex
 the output scrubber was designed for, so extraction is conservative by construction, with the
 scrubber as a second layer rather than the only one.
 
-1. **A signature never includes an initializer or a body.** It ends at the item's opening `{`, `=`
-   or `;`. `const KEY: &str = "sk-ant-…"` indexes as `const KEY: &str`. This is the rule that
-   actually keeps a literal out of the graph.
+1. **A signature never includes an initializer or a body.** It ends at the field that starts one
+   (`body`, `value`, or a type alias's target). `const KEY: &str = "sk-ant-…"` indexes as
+   `const KEY: &str`. In TypeScript only constants whose value is a function are indexed at all, so
+   `const KEY = "…"` leaves no trace. This is the rule that actually keeps a literal out of the graph.
+   **String literals inside a signature are elided** (`(key = "…")`), because a default argument is
+   part of a function's signature and can carry a credential; Rust's `'` is not treated as a quote,
+   as it also begins lifetimes.
 2. **Doc comments and headings are reduced to one sentence**, whitespace-collapsed, ≤ 160 chars.
 3. Every string bound for `node.body` or `node_fts` passes `Scrubber::scrub` — the single
    implementation `PLAN.md` mandates for memory writes. `mem → guard` is the declared edge.

@@ -303,6 +303,8 @@ dependencies = [
  "ignore",
  "moka",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

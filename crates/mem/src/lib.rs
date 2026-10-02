@@ -3,6 +3,7 @@
 pub mod actor;
 pub mod diff;
 pub mod error;
+pub mod extract;
 pub mod hash;
 pub mod layout;
 pub mod repo;

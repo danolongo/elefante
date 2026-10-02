@@ -15,6 +15,8 @@ use std::{
 
 use tempfile::TempDir;
 
+pub mod tree;
+
 pub struct GitRepo {
     dir: TempDir,
     home: TempDir,

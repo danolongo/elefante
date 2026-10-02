@@ -9,6 +9,7 @@ pub mod hash;
 pub mod indexer;
 pub mod layout;
 pub mod repo;
+pub mod resolve;
 pub mod schema;
 pub mod state;
 pub mod stats;

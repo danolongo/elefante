@@ -155,6 +155,7 @@ pub fn apply_batch(
     for update in &batch.updates {
         upsert_file(&tx, update, now_ns, &mut applied)?;
     }
+    mark_edges_dirty_if_needed(&tx, &applied)?;
     applied.generation = if applied.changed {
         bump_generation(&tx, now_ns)?
     } else {
@@ -204,6 +205,7 @@ pub fn apply_removals<S: BuildHasher>(
             }
         }
     }
+    mark_edges_dirty_if_needed(&tx, &applied)?;
     applied.generation = if applied.changed {
         bump_generation(&tx, now_ns)?
     } else {
@@ -211,6 +213,36 @@ pub fn apply_removals<S: BuildHasher>(
     };
     tx.commit()?;
     Ok(applied)
+}
+
+/// Import edges depend on the set of paths and on every file's raw imports, so a change to either
+/// makes them stale. The flag is written in the *same transaction* as the change: if the process
+/// dies before edges are re-derived, the next run still knows, even though it will see every file
+/// as already up to date.
+fn mark_edges_dirty_if_needed(tx: &Transaction<'_>, applied: &Applied) -> Result<(), MemError> {
+    if applied.path_set_changed || !applied.import_changed_files.is_empty() {
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('edges_dirty', '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether import edges need re-deriving.
+///
+/// # Errors
+/// SQLite errors.
+pub fn edges_dirty(conn: &Connection) -> Result<bool, MemError> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'edges_dirty'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref() == Some("1"))
 }
 
 fn delete_file(tx: &Transaction<'_>, path: &str) -> Result<bool, MemError> {
@@ -422,6 +454,108 @@ fn sync_imports(
     applied.changed = true;
     applied.import_changed_files.push(update.path.clone());
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EdgeResolution {
+    /// Edges were added or removed.
+    pub changed: bool,
+    pub edges: usize,
+    /// Raw imports that resolved to no file in the repository.
+    pub unresolved: usize,
+    pub generation: i64,
+}
+
+/// Re-derives every `depends_on` edge between indexed files from the stored raw imports and the
+/// current set of file nodes, writing only the difference.
+///
+/// Only edges whose two ends are both index-owned file nodes are considered. A `depends_on` edge
+/// that involves any other node is somebody else's and is neither read nor changed.
+///
+/// # Errors
+/// SQLite errors; the transaction is rolled back.
+pub fn resolve_edges(memory: &mut Connection, now_ns: i64) -> Result<EdgeResolution, MemError> {
+    let tx = memory.transaction()?;
+    let files: HashMap<String, i64> = {
+        let mut statement =
+            tx.prepare("SELECT key, id FROM node WHERE kind = 'file' AND source = ?1")?;
+        statement
+            .query_map([SOURCE_INDEX], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let paths: HashSet<String> = files.keys().cloned().collect();
+
+    let mut desired: HashSet<(i64, i64)> = HashSet::new();
+    let mut unresolved = 0;
+    {
+        let mut statement = tx.prepare(
+            "SELECT n.key, i.kind, i.spec FROM import_ref i
+             JOIN node n ON n.id = i.file_id WHERE n.source = ?1",
+        )?;
+        let rows = statement.query_map([SOURCE_INDEX], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (from, kind, spec) = row?;
+            match crate::resolve::resolve(&from, &kind, &spec, &paths) {
+                Some(target) if target != from => {
+                    if let (Some(&src), Some(&dst)) = (files.get(&from), files.get(&target)) {
+                        desired.insert((src, dst));
+                    }
+                }
+                Some(_) => {}
+                None => unresolved += 1,
+            }
+        }
+    }
+
+    let existing: HashSet<(i64, i64)> = {
+        let mut statement = tx.prepare(
+            "SELECT e.src, e.dst FROM edge e
+             JOIN node s ON s.id = e.src JOIN node d ON d.id = e.dst
+             WHERE e.rel = 'depends_on'
+               AND s.kind = 'file' AND s.source = ?1 AND d.kind = 'file' AND d.source = ?1",
+        )?;
+        statement
+            .query_map([SOURCE_INDEX], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+
+    let mut changed = false;
+    for (src, dst) in existing.difference(&desired) {
+        tx.execute(
+            "DELETE FROM edge WHERE src = ?1 AND dst = ?2 AND rel = 'depends_on'",
+            [src, dst],
+        )?;
+        changed = true;
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO edge(src, dst, rel, weight, created_at_ns)
+             VALUES (?1, ?2, 'depends_on', 1.0, ?3)",
+        )?;
+        for (src, dst) in desired.difference(&existing) {
+            insert.execute(params![src, dst, now_ns])?;
+            changed = true;
+        }
+    }
+    tx.execute("DELETE FROM meta WHERE key = 'edges_dirty'", [])?;
+    let generation = if changed {
+        bump_generation(&tx, now_ns)?
+    } else {
+        generation(&tx)?
+    };
+    tx.commit()?;
+    Ok(EdgeResolution {
+        changed,
+        edges: desired.len(),
+        unresolved,
+        generation,
+    })
 }
 
 /// A comparison-friendly view of the whole graph with ids and timestamps removed, so two graphs

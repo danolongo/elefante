@@ -479,15 +479,27 @@ owned by the parse. They are owned by a **resolution pass**:
   `import_ref`. This is pure in-memory string probing against a `HashSet`, so it is cheap
   relative to parsing.
 - Otherwise re-resolve only files whose `import_ref` rows changed.
-- Diff the desired edge set against existing `depends_on` edges for the affected sources;
-  apply deletions and insertions. Unresolved specs stay in `import_ref` and produce no edge.
+- Diff the desired edge set against existing `depends_on` edges; apply deletions and insertions.
+  Unresolved specs stay in `import_ref` and produce no edge.
+
+*Amended during implementation:* the trigger is a **persistent flag**, `meta.edges_dirty`, set in the
+same transaction as the content change that makes edges stale (a file added or removed, or a file's
+raw imports changed). Resolution runs whenever the flag is set and clears it in its own transaction.
+The first draft tracked "what changed this run" in memory, which loses the information exactly when
+it matters: a crash after a content batch commits leaves a graph whose files all look up to date on
+the next run, so nothing would ever re-derive their edges. Resolution is always a full pass — it is
+in-memory string probing, and was measured at a few milliseconds for this repository — and it only
+*writes* the difference. Consequently a refresh that changes the import structure bumps the
+generation twice, once for the content and once for the edges; one that changes only bodies bumps once.
+Only edges whose both ends are index-owned file nodes are considered, so a learned node's
+`depends_on` edge is never touched.
 
 **Tier 1 — in M2:**
 
 | Language | Resolved | Not resolved |
 |---|---|---|
-| Rust | `mod name;` → `name.rs` or `name/mod.rs` beside the declaring file (exact); `use crate::a::b`, `use self::…`, `use super::…` → longest path prefix that names a file under the crate's `src/` | `use other_crate::…` |
-| TS/TSX | relative specs (`./`, `../`), probing `.ts`, `.tsx`, `.d.ts`, `/index.ts`, `/index.tsx` | bare specifiers, `tsconfig` `paths`, aliases |
+| Rust | `mod name;` → `name.rs` or `name/mod.rs` by module path (exact); `use crate::a::b`, `use self::…`, `use super::…` → longest path prefix that names a file under the crate, falling back to the file that holds an inline module. `tests/`, `examples/`, `benches/` and `bin/` files are each their own crate. | `use other_crate::…`, bare names in scope |
+| TS/TSX | relative specs (`./`, `../`), probing `.ts`, `.tsx`, `.d.ts`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, then `/index.*`; a NodeNext-style `./x.js` maps back to `x.ts` | bare specifiers, `tsconfig` `paths`, aliases |
 
 **Tier 2 — deferred:** workspace-crate resolution (`use elefante_core::…` → `crates/core/src/lib.rs`,
 readable from `Cargo.toml`), `tsconfig` paths, bare package imports. They are deferred because

@@ -320,11 +320,18 @@ fn finish(
         if complete {
             cache::gc(&s.cache, stamp, cache::GC_MAX_AGE_NS)?;
         }
-        let changed = applied.as_ref().is_some_and(|a| a.changed);
-        let generation = match applied {
+        let mut changed = applied.as_ref().is_some_and(|a| a.changed);
+        let mut generation = match applied {
             Some(a) => a.generation,
             None => graph::generation(&s.memory)?,
         };
+        // Edges are derived last, from the final set of paths. The dirty flag is persistent, so
+        // this also repairs a refresh that was interrupted after its content batches committed.
+        if graph::edges_dirty(&s.memory)? {
+            let edges = graph::resolve_edges(&mut s.memory, stamp)?;
+            changed |= edges.changed;
+            generation = edges.generation;
+        }
         Ok::<_, MemError>((generation, changed))
     })??;
     if changed {

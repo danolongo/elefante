@@ -168,7 +168,8 @@ CREATE TABLE file_state (
   size          INTEGER NOT NULL,
   mtime_ns      INTEGER NOT NULL,
   blake3        BLOB    NOT NULL,    -- 32 bytes
-  indexed_at_ns INTEGER NOT NULL     -- wall clock when hashed; drives the racy-mtime rule
+  indexed_at_ns INTEGER NOT NULL,    -- wall clock when hashed; drives the racy-mtime rule
+  skip          INTEGER NOT NULL DEFAULT 0   -- 1 = binary: hashed once, never indexed
 ) WITHOUT ROWID;
 
 CREATE TABLE extraction (
@@ -345,7 +346,7 @@ cannot disagree with reality.
 | Skip anything `PathPolicy::is_secret_path` flags | a denied file is never read, never hashed, never named in the graph. Needs a small public lexical wrapper over `guard`'s existing `built_in_secret_rule` (no filesystem access, so it is cheap per entry). |
 | Skip non-UTF-8 paths | § 5.1 |
 | Skip files over `MAX_FILE_BYTES` = 1 MiB | generated bundles and lockfiles; they would dominate the graph and tell the model nothing |
-| Skip files with a NUL in the first 8 KiB | binary |
+| Skip files with a NUL in the first 8 KiB | binary. Detecting this needs a read, so it happens when a file is hashed, and the verdict is recorded as `file_state.skip = 1`: without that row a warm start would re-read every image in the repository, which is exactly the cost the stat shortcut exists to avoid. A skipped file gets no node and no extraction. |
 | Stop at `MAX_FILES` = 200 000 and set `meta.truncated` | bounds the adversarial case; sorted order makes truncation deterministic |
 
 Note that `.env.example` is skipped by the secret rule (it matches `.env.*`). That is the

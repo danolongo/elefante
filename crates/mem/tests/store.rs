@@ -228,7 +228,7 @@ fn a_deleted_graph_clears_file_state_but_keeps_extractions() {
             .call_blocking(|s| {
                 s.cache
                     .execute_batch(
-                        "INSERT INTO file_state VALUES ('a.rs', 1, 1, x'00', 1);
+                        "INSERT INTO file_state(path, size, mtime_ns, blake3, indexed_at_ns) VALUES ('a.rs', 1, 1, x'00', 1);
                          INSERT INTO extraction VALUES (x'aa', 'rust@1', '{}', 1);",
                     )
                     .unwrap();
@@ -259,7 +259,7 @@ fn a_matched_reopen_keeps_file_state() {
             .writer()
             .call_blocking(|s| {
                 s.cache
-                    .execute("INSERT INTO file_state VALUES ('a.rs', 1, 1, x'00', 1)", [])
+                    .execute("INSERT INTO file_state(path, size, mtime_ns, blake3, indexed_at_ns) VALUES ('a.rs', 1, 1, x'00', 1)", [])
                     .unwrap();
             })
             .unwrap();

@@ -73,7 +73,8 @@ CREATE TABLE file_state (
   size          INTEGER NOT NULL,
   mtime_ns      INTEGER NOT NULL,
   blake3        BLOB    NOT NULL,
-  indexed_at_ns INTEGER NOT NULL
+  indexed_at_ns INTEGER NOT NULL,
+  skip          INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 CREATE TABLE extraction (

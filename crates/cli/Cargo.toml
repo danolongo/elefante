@@ -15,6 +15,7 @@ elefante-rpc = { path = "../rpc" }
 serde_json.workspace = true
 
 [dev-dependencies]
+elefante-mem = { path = "../mem" }
 tempfile.workspace = true
 
 [lints]

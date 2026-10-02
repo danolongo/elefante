@@ -137,6 +137,81 @@ fn live_edit_lands_in_a_scratch_repository() {
     );
 }
 
+/// The repository index reaches a real model, in the shape a real provider accepts.
+///
+/// The scratch repository is indexed *before* the daemon starts, so the first prompt cannot race
+/// the background indexer. `--max-rounds 1` then makes the answer depend on context alone: a model
+/// that reaches for a tool exhausts its single round and fails the run, so the only way to name a
+/// function it has never seen is to have read the block and brief it was sent. A hermetic test
+/// proves the request is built correctly; only a live one proves a provider accepts it.
+#[test]
+#[ignore = "requires OpenRouter credentials, network, and billable requests"]
+fn live_memory_context_reaches_the_model() {
+    let api_key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+    let workspace = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    std::fs::create_dir(workspace.path().join("src")).expect("src");
+    std::fs::write(
+        workspace.path().join("src/quartz.rs"),
+        "//! Quartz polishing.\n\n/// Polishes quartz crystals until they gleam.\npub fn gleam_quartz_crystals() {}\n",
+    )
+    .expect("seed file");
+    std::fs::write(
+        workspace.path().join("src/other.rs"),
+        "//! Unrelated helpers.\n\n/// Adds two numbers.\npub fn add_numbers() {}\n",
+    )
+    .expect("decoy file");
+
+    let repo = elefante_mem::RepoId::resolve_with_home(workspace.path(), None).expect("repo");
+    let store = elefante_mem::Store::open(&repo).expect("store");
+    elefante_mem::indexer::refresh_blocking(
+        &store,
+        repo.root(),
+        &elefante_mem::Counters::default(),
+        &elefante_mem::indexer::IndexOptions::default(),
+    )
+    .expect("pre-index");
+    drop(store);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_elefante"));
+    command
+        .current_dir(workspace.path())
+        .env(
+            "ELEFANTE_SOCKET",
+            workspace.path().join("run/elefante.sock"),
+        )
+        .env("ELEFANTE_IDLE_SECS", "1")
+        .env_remove("ELEFANTE_STUB_PROVIDER")
+        .env("OPENROUTER_API_KEY", api_key)
+        .args([
+            "--max-tokens",
+            "2048",
+            "--effort",
+            "low",
+            "--max-rounds",
+            "1",
+        ])
+        .arg(
+            "Do not use any tools. Using only the repository index you were given, which function \
+             polishes quartz crystals? Reply with just the function name.",
+        );
+    if let Ok(model) = std::env::var("OPENROUTER_MODEL") {
+        command.env("OPENROUTER_MODEL", model);
+    }
+    let output = command.output().expect("binary runs");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the turn did not complete: {stderr}"
+    );
+    let answer = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        answer.contains("gleam_quartz_crystals"),
+        "the model did not use the index it was sent.\nanswer: {answer:?}\nstderr: {stderr}"
+    );
+}
+
 #[test]
 fn headless_stream_keeps_reasoning_out_of_redirected_stdout() {
     let isolated = tempfile::tempdir().expect("isolated daemon");

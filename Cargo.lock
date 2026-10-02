@@ -262,6 +262,7 @@ name = "elefante-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "elefante-mem",
  "elefante-rpc",
  "serde_json",
  "tempfile",

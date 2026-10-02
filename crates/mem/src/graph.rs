@@ -1,4 +1,4 @@
-//! Writing the graph. Design: `docs/M2-DESIGN.md` § 3–5.
+//! Writing the graph. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! Everything here runs inside one `memory.db` transaction per call and bumps
 //! `meta.repo_generation` at most once, and only if a row actually changed. Identity is stable:

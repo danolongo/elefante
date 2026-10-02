@@ -1,4 +1,4 @@
-//! Turning one file's content into symbols and imports. Design: `docs/M2-DESIGN.md` § 7.
+//! Turning one file's content into symbols and imports. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! Extraction is a pure function of `(content, extractor)`: no path, no database. That is what
 //! lets its result be cached by content hash and reused across renames, branch switches, and a

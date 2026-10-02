@@ -1,4 +1,4 @@
-//! Files that change together. Design: `docs/M2-DESIGN.md` § 9.
+//! Files that change together. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! Coupling that imports miss — a handler and its schema, a test and its fixture — is visible in
 //! history for the price of one `git log`. Everything here is a pure function of that log except

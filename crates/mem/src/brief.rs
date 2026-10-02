@@ -1,4 +1,4 @@
-//! The repository brief. Design: `docs/M2-DESIGN.md` § 11.
+//! The repository brief. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! A deterministic template over the graph — no model call — small enough to ride on every
 //! request for a whole session. Because it is present that long and sits in front of the model,

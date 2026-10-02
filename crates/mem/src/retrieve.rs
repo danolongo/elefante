@@ -1,4 +1,4 @@
-//! Finding what to tell the model. Design: `docs/M2-DESIGN.md` § 10.
+//! Finding what to tell the model. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! A prompt becomes a bounded set of seeds by full-text search, the seeds are expanded a hop or
 //! two along import and co-change edges, and the result is packed into a token budget as a block

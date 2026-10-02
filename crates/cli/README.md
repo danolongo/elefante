@@ -67,7 +67,7 @@ command the classifier escalated — it has no way to ask you. Use the TUI when 
 approvals.
 
 **The environment that counts is the daemon's, not yours.** `OPENROUTER_API_KEY`,
-`OPENROUTER_BASE_URL`, and `ELEFANTE_IDLE_SECS` are read once, when `elefante-srv` starts, and a
+`OPENROUTER_BASE_URL`, `ELEFANTE_IDLE_SECS`, and `ELEFANTE_MEMORY` are read once, when `elefante-srv` starts, and a
 running daemon is reused as-is (`srv::run` returns immediately if the socket answers). So a new
 key exported after a daemon is already up is ignored until it idles out (15 minutes by default)
 or is killed. `--model`, `--effort`, `--max-rounds`, and `--max-tokens` are unaffected — they
@@ -77,19 +77,27 @@ travel in `session.create`.
 
 ```sh
 cargo test -p elefante-cli                          # 13 hermetic
-cargo test -p elefante-cli -- --ignored --nocapture   # 1 credentialed, billable
+cargo test -p elefante-cli -- --ignored --nocapture   # 2 credentialed, billable
 ```
 
 `tests/renderer.rs` (6) covers channel transitions and newline discipline against an in-memory
-writer. `tests/client.rs` (3) covers the socket client. `tests/cli.rs` (5, one of them `#[ignore]`d) drives
+writer. `tests/client.rs` (3) covers the socket client. `tests/cli.rs` (6, two of them `#[ignore]`d) drives
 the real binary under `ELEFANTE_SOCKET` isolation.
 
-One test is `#[ignore]`d — `live_edit_lands_in_a_scratch_repository` needs credentials and makes
-billable requests. It runs in a `tempfile` directory rather than this repository, so a model
-that misreads its instruction cannot touch tracked files, and it bounds itself to
-`--max-tokens 2048 --effort low --max-rounds 8`. **It requires `elefante-srv` to have been
-built** — `cargo test -p elefante-cli` alone does not build it, which is why CI runs
-`cargo build --workspace` first.
+Two tests are `#[ignore]`d; both need credentials and make billable requests. They run in a
+`tempfile` directory rather than this repository, so a model that misreads its instruction cannot
+touch tracked files, and they bound themselves with `--max-tokens 2048 --effort low`.
+
+- `live_edit_lands_in_a_scratch_repository` — a real edit lands (`--max-rounds 8`).
+- `live_memory_context_reaches_the_model` — the repository index reaches a real model. The scratch
+  repository is indexed *before* the daemon starts so the first prompt cannot race the background
+  indexer, and `--max-rounds 1` makes the answer depend on context alone: a model that reaches for a
+  tool exhausts its single round and fails. It is the only test of whether a provider *accepts* the
+  injected message shape; the hermetic tests prove the request is built correctly, not accepted.
+
+**Both require `elefante-srv` to have been built** — `cargo test -p elefante-cli` alone does not
+build it, which is why CI runs `cargo build --workspace` first. This crate's tests gained a
+dev-dependency on `elefante-mem` only to pre-index that repository.
 
 ## Boundaries
 

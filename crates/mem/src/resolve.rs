@@ -1,4 +1,4 @@
-//! Turning raw import specs into file paths. Design: `docs/M2-DESIGN.md` § 8, tier 1.
+//! Turning raw import specs into file paths. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! A spec resolves against the *set of paths in the repository*, never the filesystem, so the
 //! functions here are pure and a path appearing or disappearing anywhere can change what any

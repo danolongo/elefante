@@ -1,4 +1,4 @@
-//! DDL, versioning, and the pairing between the two databases. Design: `docs/M2-DESIGN.md` § 3–4.
+//! DDL, versioning, and the pairing between the two databases. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 
 use std::{
     collections::hash_map::RandomState,

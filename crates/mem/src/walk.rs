@@ -1,4 +1,4 @@
-//! The repository walk. Design: `docs/M2-DESIGN.md` § 6.
+//! The repository walk. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 
 use std::{fs, path::Path, time::UNIX_EPOCH};
 

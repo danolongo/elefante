@@ -4,17 +4,20 @@ Elefante is a small, modifiable coding-agent harness. Its current implementation
 Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
 seven guarded tools, and policy enforced in code rather than in a long system prompt.
 
-The daemon and OpenTUI client have shipped. The long-term design adds graph-backed project
-memory, adversarial critics, and token analysis. Those features are deliberately milestone-gated;
-`elefante-mem` is the one remaining compile-safe scaffold.
+The daemon, the OpenTUI client, and a per-repository index have shipped. The index gives each
+turn relevant files and symbols and gives the model a `memory_search` tool. The long-term design
+adds learned memory, adversarial critics, and token analysis, which are deliberately
+milestone-gated.
 
 ## Project status
 
-M0 and M1 are complete, with both gates green — 118 hermetic Rust tests, 23 TypeScript tests,
-and the two credentialed checks described in [`docs/MILESTONES.md`](docs/MILESTONES.md): a real
-prompt-cache hit through OpenRouter and a live edit in a scratch repository. CI runs the
-hermetic gates on every push and the credentialed pair on dispatch. M2 — repo cache and
-mechanical graph — has not begun.
+M0 and M1 are complete, with their gates green — including a real prompt-cache hit through
+OpenRouter and a live edit in a scratch repository, both described in
+[`docs/MILESTONES.md`](docs/MILESTONES.md). M2 — the repository index — is implemented and its
+hermetic gate is green: 350 Rust tests and 24 TypeScript tests. Its one credentialed check, that a
+real model uses the index it is sent, has been written but not yet run, so the milestone is not yet
+recorded as complete. CI runs the hermetic gates on every push and the credentialed tests on
+dispatch.
 
 ## Quick start
 
@@ -47,7 +50,9 @@ Useful options:
 ```
 
 Environment defaults are `OPENROUTER_MODEL` (default `anthropic/claude-sonnet-5`),
-`ELEFANTE_EFFORT`, and `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`).
+`ELEFANTE_EFFORT`, `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), and
+`ELEFANTE_MEMORY` (set to `0` to switch the repository index off entirely: nothing is indexed,
+nothing is written under `.elefante/`, and no context is added to a turn).
 Command-line values take precedence where both forms exist. Models are named by OpenRouter
 slug, so reaching a different vendor is a different slug rather than a different transport.
 

@@ -1,4 +1,4 @@
-//! Deciding which walked files need reading. Design: `docs/M2-DESIGN.md` § 6.1.
+//! Deciding which walked files need reading. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 
 use std::{
     collections::{HashMap, HashSet},

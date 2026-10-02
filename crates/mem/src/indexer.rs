@@ -1,4 +1,4 @@
-//! One synchronous refresh: walk, diff, hash, extract, materialise. Design: `docs/M2-DESIGN.md` § 2.
+//! One synchronous refresh: walk, diff, hash, extract, materialise. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 //!
 //! The expensive work — hashing and parsing — runs on worker threads without touching a
 //! database; the database is reached in short calls to the writer actor. Each batch commits to

@@ -1,4 +1,4 @@
-//! Graph memory for repositories. Design: `docs/M2-DESIGN.md`.
+//! Graph memory for repositories. See `docs/PLAN.md` § Memory subsystem, and this crate's README for the contract.
 
 pub mod actor;
 pub mod brief;

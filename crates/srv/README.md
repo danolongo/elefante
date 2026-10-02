@@ -10,9 +10,9 @@ around it.
 |---|---:|---|
 | `src/main.rs` | 4 | The binary. Calls `run_from_env()` and nothing else. |
 | `src/lib.rs` | 12 | Module declarations, four re-exports, three capacity constants. |
-| `src/server.rs` | 1010 | **The largest file in the workspace.** Listener, session registry, ring buffer, method dispatch, turn driving. |
+| `src/server.rs` | 1112 | **The largest file in the workspace.** Listener, session registry, ring buffer, method dispatch, turn driving. |
 | `src/queue.rs` | 300 | `ClientQueue` — per-client delivery with coalescing and eviction. |
-| `src/stub.rs` | 186 | `StubProvider`, the scripted fake used by daemon tests. |
+| `src/stub.rs` | 198 | `StubProvider`, the scripted fake used by daemon tests. |
 | `src/credentials.rs` | 95 | `0700` directories and `0600` files for the socket and stored key. |
 
 `server.rs` is a fair first target if you are looking for something to split — the listener,
@@ -46,10 +46,25 @@ reason.
 client whose queue is overflowing is by definition one that cannot receive an error; the close
 *is* the signal. The session is unaffected and the client reconnects and attaches.
 
-**`StubProvider` validates `tool_use`/`tool_result` pairing and rejects a mismatch.** This is
+**`StubProvider` validates `tool_use`/`tool_result` pairing and rejects a mismatch, and can record
+every request it receives.** This is
 what makes the pairing assertions in `tests/daemon.rs` meaningful — against a stub that ignored
 its input, "the next request does not 400" would pass vacuously on an implementation that drops
 history. If you extend the stub, keep `validate_pairing` in the path.
+
+**Memory is an aid, never a requirement, and one switch turns it all off.** A session's working
+directory resolves to a repository root (`RepoId`); the first session beneath a root opens that
+repository's `Store` and starts its `Indexer`, and every later session shares them. If the store
+cannot be opened, or the directory is `/` or `$HOME`, the session is created anyway and runs exactly
+as it did before — the reason goes to stderr. `DaemonConfig::memory` (`ELEFANTE_MEMORY=0`) is
+checked before anything else: nothing is opened, nothing is written under `.elefante/`, no context
+is added and `memory_search` returns its fixed refusal. It is a config field, not a process-wide
+env read, so tests can run daemons with and without memory in one process.
+
+**Refreshes are requested at three moments and never awaited.** Session create, turn start and
+turn end each call `Indexer::refresh()`, which returns immediately and coalesces. Turn start picks
+up edits made in an editor between turns; turn end picks up the agent's own. A prompt is never held
+behind an index.
 
 **A turn continues with zero clients attached.** The daemon exits after an idle period only when
 there are no clients *and* no active turns; checking client count alone would make it kill its
@@ -65,11 +80,15 @@ own work.
 ## Testing
 
 ```sh
-cargo test -p elefante-srv     # 22 tests
+cargo test -p elefante-srv     # 30 tests
 ```
 
 `tests/daemon.rs` (15) drives the real daemon over a real socket with `ELEFANTE_SOCKET` pointed
-at a `tempfile` path — resume, fanout, interrupt, approval, and lifecycle. Inline tests cover
+at a `tempfile` path — resume, fanout, interrupt, approval, and lifecycle. `tests/memory.rs` (8)
+does the same for the repository index: what a model is sent, what `memory_search` returns, a
+subdirectory session's scope, edits between turns, and that switching memory off writes nothing.
+It reads the requests the model would have received from a file the stub records them to
+(`record_requests` in the script). Inline tests cover
 `queue.rs` (4), plus one each in `credentials.rs`, `server.rs`, and `stub.rs`.
 
 Nothing here needs credentials: `ELEFANTE_STUB_PROVIDER` swaps in `StubProvider`, which is why

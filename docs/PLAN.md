@@ -116,8 +116,8 @@ unknown model must never silently receive fields it cannot handle.
 
 Degradation stays at the *mapping* boundary inside the impl, so `elefante-core` never learns
 provider shape. `Capabilities` gains core-side callers later, where the branch is genuinely
-core's: `mid_conversation_system` for memory placement (M2/M3) and `structured_output` for
-critic findings (M4).
+core's: `mid_conversation_system` and `structured_output`, both for critic findings (M4). (Repository
+context does *not* use `mid_conversation_system`: it is a `user` message on purpose — see step 3.)
 
 ### Wire facts that constrain the design
 
@@ -236,7 +236,7 @@ metadata the primary source:
 | `effort` | `supported_parameters` contains `reasoning_effort` |
 | `structured_output` | `supported_parameters` contains `structured_outputs` |
 | `prompt_caching`, `cache_metrics` | `pricing.input_cache_read` is present — no `supported_parameters` entry exists for caching, so pricing is the only signal |
-| `mid_conversation_system` | transport property; always true |
+| `mid_conversation_system` | transport property; always true. No core caller until M4 |
 
 This removes the maintenance treadmill of tracking new slugs by hand, and it is accurate per
 model rather than per family. The prefix table stays for the cold-start and offline cases,
@@ -385,22 +385,40 @@ This is the central interaction, and the place where every crate meets. One numb
 
 **1. Prompt received** — `srv` routes `session.prompt` to `core::Session`, which takes a turn lock. A second prompt on the same session while a turn is live is rejected, not queued: silent queueing makes an interrupted session behave unpredictably.
 
-**2. Context assembly** (`core` → `mem`)
+**2. Context assembly** (`core` → `mem`) — **shipped in M2**
 
 ```
-core::assemble_context(user_msg, open_files, budget) →
-    mem::retrieve(Query { text, files, budget_tokens: 1500 })
-        → moka lookup on (query_hash, repo_generation)
-        → miss: FTS5 seed → graph expand (1–2 hops, weighted) → pack to budget
-    → MemoryBlock { nodes, tokens, partial: bool }
+core::Session::prompt → ContextSource::turn_block(prompt)           once per turn
+    mem::Retriever::retrieve(Query { text, files, scope, budget_tokens: 1500 })
+        → in-process cache keyed (query, scope, budget, repo_generation, partial)
+        → miss: FTS5 seeds → graph expand (2 hops, damped, ≤ 8 per node) → pack to budget
+    → Option<MemoryBlock { nodes, tokens, partial, generation, rendered }>
 ```
 
-`partial: true` when the indexer hasn't finished its first pass — retrieval never blocks on indexing.
+`partial: true` until the **first full index** has finished — retrieval never blocks on indexing.
+A refresh running on an already-complete index is *not* partial: refreshes run at every turn, and
+flagging all of them would teach the model to distrust an index that is merely being kept current.
+No match yields `None`, never an empty envelope.
 
-**3. Placement decision** (`core`) — capability-dependent, and the reason `Capabilities` exists:
+**3. Placement** (`core`) — **ephemeral, `user` role, immediately after the turn's user message.**
+This replaces an earlier capability-dependent design (`system` role when
+`mid_conversation_system`, else prepended to the user turn), for two reasons:
 
-- `mid_conversation_system: true` → memory appended as `{"role": "system"}` in `messages[]`. **The cached prefix survives.**
-- `false` → memory prepended to the user turn's content. Correct, just less cache-efficient.
+- *Authority.* The block is repository-derived text — doc comments, file names — which in a cloned
+  repository is attacker-controllable. `system` would give it the highest authority a message can
+  have; the `read` tool returns the same text at tool-result authority. A `user` message with
+  escaped, framed, truncated content is the compromise. (A synthetic `memory_search` call and result
+  would be lower still, but a fabricated assistant `tool_use` turn carries no `reasoning_details` and
+  is rejected by providers that require them on a tool-use turn.) The brief, which sits in front of
+  every request, is further limited to plain paths, counts and identifiers.
+- *Cache.* The block is built into each request and **never stored in history**, so it does not
+  accumulate. Placed *after* the user message, the request prefix is byte-identical across
+  consecutive turns through that message and only the block and what follows differ; placed before,
+  the user message and everything after it would shift. It is fetched once per turn and re-sent at the
+  same index every round, so the cache holds across tool rounds.
+
+A preamble (the repository brief) leads the request. It is adopted at most once per session and then
+frozen, so a changing index cannot invalidate the prefix mid-session.
 
 **4. Request construction** (`core` → `provider`) — `core` builds a provider-agnostic `Request { system, tools, messages, role }`. The provider maps it to wire format, applying only capabilities it declares, and places cache breakpoints itself (end of the system block, when the resolved model declares `prompt_caching`). `core` never writes provider-specific fields.
 
@@ -464,29 +482,75 @@ Three details that are easy to get wrong and expensive to fix later:
   user.db                    # cross-project: preferences, corrections, workflows
 
 <repo>/.elefante/
-  memory.db                  # project graph
-  cache.db                   # derived: file hashes, symbols, briefs
-  .gitignore                 # generated, contains `*` — self-ignoring
+  memory.db                  # the graph: node, edge, import_ref, node_fts, meta
+  cache.db                   # derived: file_state, content-addressed extractions, briefs
+  .gitignore                 # generated, contains `*` — self-ignoring, written before either db
 ```
 
-The generated `.gitignore` containing a single `*` means the directory ignores itself and the host repo's own ignore rules are never touched. Repo identity is the project path, so no identity keying is needed.
+The generated `.gitignore` containing a single `*` means the directory ignores itself and the host
+repo's own ignore rules are never touched. Written first, so `git status` is clean at every instant,
+not merely after a clean exit. Directory `0700`, databases and their `-wal`/`-shm` `0600`.
+
+**Repo identity** is the nearest ancestor of a session's working directory containing a `.git` entry
+(a directory, or the file a worktree has), else the working directory itself. `/` and `$HOME` are
+refused. `repo_root` is for grouping and for where `.elefante/` lives, **never** for tool policy: a
+session started in `repo/subdir` is still confined to `subdir`, and retrieval is *scoped* to match so
+it never names a file the session's tools cannot open. M6 reuses this resolver.
+
+**`cache.db` is content-addressed.** An extraction is keyed by the `blake3` of a file's content plus
+an extractor id (`rust@1`, `typescript@1`, `tsx@1`, `markdown@1` — TS and TSX are separate because
+identical bytes can parse differently), and is path-independent. A rename, a branch switch back, two
+byte-identical vendored files, and a rebuilt `memory.db` all cost no parse. It is disposable: any
+schema-version mismatch drops and recreates it. `memory.db` is not — from M3 it holds learned memory,
+and migrates.
+
+**Keeping two databases honest.** They cannot share an atomic commit. A random *pairing epoch* in
+`memory.db.meta` is recorded in `cache.db`; a mismatch clears `file_state` and keeps the extractions.
+Each batch commits to the graph first and the cache second, so a crash leaves the cache *behind* the
+graph and the files are re-examined and re-upserted identically. An orphan sweep after a *complete*
+walk reconciles deletions. Deleting either database, or both, converges on the same graph.
 
 ### Concurrency: the memory actor
 
-`rusqlite::Connection` is not `Sync` and SQLite calls block. Rather than scattering `spawn_blocking` across the codebase, `mem` runs **one actor thread owning both connections**, receiving `MemRequest` over an `mpsc` channel and replying via `oneshot`. This serializes writes naturally, keeps `Connection` off the async runtime, and gives one place to instrument query timing. The `moka` cache sits in front of the actor, so hits never cross the channel.
+`rusqlite::Connection` is not `Sync` and SQLite calls block. Rather than scattering `spawn_blocking`
+across the codebase, `mem` runs **two actor threads**: a *writer* owning both write connections
+(`memory.db` and `cache.db`) and a *reader* owning a read-only `memory.db` connection. WAL lets the
+reader answer retrieval while the writer commits, so retrieval never waits on an index write. Heavy
+work — walking, hashing, parsing — runs on worker threads without touching a database, so a write
+transaction is as long as the rows it changes. Actors serialise access, keep `Connection` off the
+async runtime, and give one place to count calls. A result cache sits in front of the reader, keyed
+by an in-process mirror of `repo_generation`, so a hit never crosses a channel.
 
 ### Schema
 
-Deliberately small. **Full schema and relation semantics get a dedicated design pass before M2 ships** — this is the starting point, not the final word:
-
 ```sql
-node(id, kind, key, body, confidence, source, created_at, updated_at)
-edge(src, dst, rel, weight, created_at)
-node_fts(key, body)                            -- FTS5 virtual table
-meta(repo_generation, last_indexed_at, ...)
+node(id, kind, key, name, body, file_id, attrs, confidence, source, created_at_ns, updated_at_ns,
+     UNIQUE(kind, key))
+edge(src, dst, rel, weight, created_at_ns, PRIMARY KEY(src, dst, rel),
+     CHECK(rel <> 'co_edited_with' OR src < dst))
+import_ref(file_id, kind, spec)                 -- raw imports; edges are derived from these
+node_fts(name_terms, path_terms, body_terms)    -- FTS5, rowid = node.id, pre-split identifiers
+meta(key, value)   -- graph_epoch, repo_generation, index_complete, cochange_head, edges_dirty, ...
 ```
 
-Kinds: `fact`, `preference`, `decision`, `convention`, `file`, `symbol`. Relations: `about`, `depends_on`, `co_edited_with`, `contradicts`, `supersedes`, `derived_from`.
+Kinds: `fact`, `preference`, `decision`, `convention`, `file`, `symbol` — **not enforced by a
+`CHECK`**, because SQLite cannot alter one and adding a kind in M3 would force a table rebuild; a Rust
+enum validates at the boundary. Relations: `about`, `depends_on`, `co_edited_with`, `contradicts`,
+`supersedes`, `derived_from` — M2 uses `depends_on` (file → file) and `co_edited_with` (file ↔ file).
+
+- **`(kind, key)` is a stable natural key**: a file's repository-relative path; a symbol's
+  `path::qualified_name`, `#2`, `#3` for duplicates.
+- **`source` is the ownership discriminator.** The indexer reads, updates and deletes only
+  `source = 'index'` rows. It never touches a learned row, and the orphan sweep ignores them.
+- **Ids are stable across edits.** The indexer upserts; a file node is updated in place and a symbol
+  keeps its id while its key does, so a learned edge into either survives re-indexing. A rename is a
+  delete plus an add, so a learned link into the old path is lost; re-linking is M3's decision.
+- **`symbol → file` is a column (`file_id`), not an edge.** `ON DELETE CASCADE` removes a deleted
+  file's symbols, raw imports and incident edges in one statement.
+- **Edges are derived, not parsed.** An import edge depends on a file's raw imports *and the set of
+  paths*, so creating `foo.ts` can resolve an import in a file that did not change. `meta.edges_dirty`
+  is written in the same transaction as the change that makes edges stale, so a crash cannot leave
+  them stale with nothing to say so.
 
 ### Two ingestion layers
 
@@ -495,21 +559,38 @@ The split is what keeps this cheap:
 **Mechanical** — no LLM, fully cacheable, runs in the indexer:
 
 ```
-ignore::WalkBuilder (respects .gitignore)
-  → blake3 per file → diff against cache.db → changed set only
-  → tree-sitter parse → symbol nodes, import edges
-  → git log --name-only -n 500 → files co-occurring in a commit
-                                → co_edited_with edge weight++
-  → single transaction → bump repo_generation (invalidates moka)
+ignore::WalkBuilder (honours ignore files beneath the root; skips symlinks, binaries, > 1 MiB,
+                     anything PathPolicy::is_secret_path flags — unread)
+  → stat comparison, with a racy-timestamp rule → blake3 of what changed
+  → extraction by content hash: tree-sitter (Rust, TypeScript/TSX), heading scan (Markdown)
+      signatures end before any body or initializer, string literals elided, one doc sentence,
+      every string through the Scrubber; never source
+  → batched graph writes (graph first, cache second); one generation bump per batch
+  → import edges derived from stored raw imports + the set of paths
+  → git log --name-status -M -z -n 500 --no-merges, only when HEAD has moved
+        skip commits touching > 50 files · follow renames · min support 2 · top 20 per file
+        weight = raw commit count (stored); normalised at retrieval
 ```
 
-Git co-change is the highest-value-per-cost signal here: it captures "these files change together" — real coupling that imports alone miss — for the price of parsing one `git log`.
+Git co-change is the highest-value-per-cost signal here: it captures "these files change together" —
+real coupling that imports alone miss — for the price of one `git log`. Git runs without a shell,
+under a timeout and a size cap, with the repository's own config unable to run a program.
 
 **Learned** — LLM-extracted decisions, conventions, corrections, written at session end and on explicit signal.
 
 ### Indexer scheduling
 
-`session.create` spawns `mem::Indexer::refresh` as a background task. It **never blocks the first prompt**. Retrieval against a partially-built index is valid and flagged. The repo brief (~300 tokens, injected each session) is keyed by the merkle root of tracked file hashes, so it regenerates only on material change.
+`Indexer::refresh()` runs on a dedicated thread, is **single-flight**, and never blocks: a call while
+a run is in progress marks it dirty and returns, and the run goes round once more — N triggers become
+at most two runs. It is requested at session create, turn start and turn end (the user's editor edits
+land at the next turn start, the agent's own at turn end). Retrieval against a partially-built index
+is valid and flagged.
+
+The repo brief (~300 estimated tokens, deterministic, no model call) is injected once per session and
+**frozen**. It contains only paths, counts and identifiers, and a path is admitted only if it matches
+`[A-Za-z0-9._/@+-]+` — with no whitespace a hostile file name cannot form a sentence. It is cached by
+`blake3(tree fingerprint ‖ co-change head ‖ template version)`, because "central files" depends on
+edges as well as content; the newest 8 are kept.
 
 ### Anti-bloat
 
@@ -646,7 +727,7 @@ The headless client splits streams: **`stdout` is the answer, `stderr` is reason
 
 ### M2 — Repo cache + mechanical graph
 
-**Baseline.** Schema design pass first. Walk + blake3 cache, tree-sitter symbols, import edges, git co-change edges, repo brief, FTS5 + graph-hop retrieval injected per capability.
+**Baseline.** Schema design pass first. Walk + blake3 cache, tree-sitter symbols, import edges, git co-change edges, repo brief, FTS5 + graph-hop retrieval injected per turn, and a working `memory_search`.
 
 **Gate.**
 - Warm start: second launch on an unchanged repo performs **zero** tree-sitter invocations (asserted by counter, not by timing).
@@ -654,7 +735,16 @@ The headless client splits streams: **`stdout` is the answer, `stderr` is reason
 - `co_edited_with` weights match a hand-computed expectation on a fixture repo with known commit history.
 - A prompt issued before indexing completes returns a `partial: true` memory block and does not block.
 - Retrieval respects the 1500-token budget under an adversarially large graph.
-- **M0–M1 gates still green.**
+- Editing a file leaves its node id, and the ids of its unchanged symbols, intact.
+- Deleting `cache.db` or `memory.db` converges on an identical graph — the latter with zero parses — and a crash between the graph commit and the cache write converges too, edges included.
+- No secret fixture string survives in any row or in the raw bytes of any file under `.elefante/`; `git status` is clean after a session and at a mid-index kill; files are `0600`, the directory `0700`.
+- Hostile repository text cannot close or forge the injected envelope; no request carries a `system` message other than the configured prompt; the block is absent from history and from the next turn's request.
+- FTS-hostile prompts never error; a session in a subdirectory sees only its subtree; history before a rename counts for the renamed file; a non-repository indexes fully with no co-change.
+- N concurrent refresh requests collapse to at most two runs and none blocks.
+- `ELEFANTE_MEMORY=0` creates no `.elefante/` and adds no context.
+- Golden retrievals: a fixture repository's queries find the expected file in the top three.
+- **M0–M1 gates still green**, and the MSRV check passes with the new dependencies.
+- *Credentialed:* a real model, given `--max-rounds 1`, names a function it can only know from the index it was sent.
 
 ### M3 — Learned memory
 
@@ -767,7 +857,7 @@ Noted now so the architecture accommodates them, not built yet:
   Decide first whether collapse is global or per turn, whether it survives reattach (snapshots do
   not carry completed reasoning), and whether it should default to collapsed once a turn ends.
 - **Hooks and plugins.**
-- **Full graph schema and relation semantics** — dedicated design pass before M2 ships.
+- **Resolution beyond tier 1** — workspace-crate imports (`use elefante_core::…`), `tsconfig` paths and bare package imports; deferred from M2 because each is a second parser for a signal tier-1 edges and co-change already approximate. Also a call/reference graph, `.js`/`.jsx` extraction, and further languages (a grammar crate, an extractor and a resolver apiece).
 - **Server-side compaction** (`compact-2026-01-12`) and **context editing** (`clear_tool_uses_20250919`) as alternatives to client-side compaction.
 - **Task budgets** (`task-budgets-2026-03-13`) for agentic-loop spend ceilings, feeding M5.
 - **Embedding-based retrieval** — the vector slot is left pluggable; FTS + graph hops ship first.

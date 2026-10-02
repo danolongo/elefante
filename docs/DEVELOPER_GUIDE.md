@@ -6,8 +6,9 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M1: a provider-backed coding loop behind a daemon, driven by either a
-headless client or an OpenTUI terminal client. The implemented vertical slice can:
+The repository is at M2: a provider-backed coding loop behind a daemon, driven by either a
+headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
+relevant context and gives the model a search tool. The implemented vertical slice can:
 
 - send a prompt and stable tool catalog to OpenRouter;
 - stream reasoning and text, separated end to end;
@@ -16,18 +17,18 @@ headless client or an OpenTUI terminal client. The implemented vertical slice ca
 - enforce path, shell, and output-scrubbing policy, suspending for approval when the shell
   classifier escalates;
 - serve many clients per session and many sessions per client, with resume after disconnect;
-  and
+- index the repository in the background — files, symbols, imports, and files that change
+  together — and keep that index current as turns edit it;
+- add an ephemeral block of relevant files to each turn, and a short repository brief to each
+  session, neither of which enters history; and
 - continue the conversation until the provider ends the turn, refuses, is interrupted, or
   reaches a configured round limit.
 
-Crates that remain compile-safe scaffolds, because their dependency boundaries are expensive
-to retrofit. These do not imply that later milestones have shipped:
-
-- `elefante-mem` contains only an M2 availability marker; there is no database or graph.
-
-Both milestone gates are green, including the credentialed OpenRouter cache-hit test and the
-live repository edit. CI runs the hermetic gates on every push and the credentialed pair
-behind `workflow_dispatch`; see `.github/workflows/`.
+M0 and M1 gates are green, including the credentialed OpenRouter cache-hit test and the live
+repository edit. M2's hermetic gate is green; its one credentialed check —
+`live_memory_context_reaches_the_model` — has been written and compiled but **not yet run**, and the
+milestone record says so rather than claiming it. CI runs the hermetic gates on every push and the
+credentialed tests behind `workflow_dispatch`; see `.github/workflows/`.
 
 ## 2. Design principles
 
@@ -67,7 +68,7 @@ elefante/
     ├── tools/                     schemas and syscall-facing tool executor
     ├── rpc/                       wire envelopes and framing
     ├── srv/                       daemon, session registry, ring
-    └── mem/                       M2 memory scaffold
+    └── mem/                       repository index: graph, indexer, retrieval
 ```
 
 All crates inherit Rust 2024 edition, the minimum Rust version, dependency versions, and
@@ -121,11 +122,14 @@ this; here it is as structure — which crate lives where, and what crosses each
                                  ▼
                             HTTPS + SSE ──► OpenRouter
 
-  ── linked by nothing ────────────────────────────────────────────────────────
+  ── the index ───────────────────────────────────────────────────────────────
 
-   elefante-mem        4-line scaffold. Its edge to guard is declared but unused,
-                       reserved for the Scrubber on the M2 write path.
-```
+   elefante-mem        <repo>/.elefante/{memory.db, cache.db}
+   ├─ indexer          walk · hash · extract · graph · imports · co-change
+   ├─ retrieve         FTS5 seeds · graph hops · token-budget packing
+   └─ brief            ~300-token repository summary
+        used by core (memory.rs: context + memory_search) and opened by srv
+        (one Store and one Indexer per repository, shared by every session)
 
 Three things are visible here that a dependency list cannot show.
 
@@ -150,10 +154,10 @@ elefante-guard      ──► (nothing)      pure policy; the graph's floor
 elefante-provider   ──► (nothing)
 
 elefante-tools      ──► guard
-elefante-mem        ──► guard                        (declared, not yet used)
+elefante-mem        ──► guard                        (Scrubber on every stored string)
 elefante-rpc        ──► provider                     (re-exports StopReason, Usage)
-elefante-core       ──► guard, provider, tools
-elefante-srv        ──► core, rpc, provider, tools   the daemon; top of the graph
+elefante-core       ──► guard, mem, provider, tools
+elefante-srv        ──► core, mem, rpc, provider, tools   the daemon; top of the graph
 elefante-cli        ──► rpc                          a client: it does not link core
 ```
 
@@ -187,7 +191,9 @@ Core owns conversation semantics:
 - validating tool-use lifecycle and IDs;
 - executing a batch of tools concurrently while retaining deterministic result order;
 - returning every tool result together as one batch; and
-- enforcing refusal and round-limit behavior.
+- enforcing refusal and round-limit behavior; and
+- placing per-turn repository context in a request — as an ephemeral `user` message after the
+  turn's user message, never `system`, never stored in history (`ContextSource`, `memory.rs`).
 
 Core does not know OpenRouter field names, does not know how a result batch is shaped on the
 wire, and does not perform filesystem operations.
@@ -224,6 +230,9 @@ Tools is the syscall boundary. It owns the seven permanent tool schemas and a cl
 `ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
 classifier; every success and error result passes through `Scrubber`.
 
+`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core`, so this crate
+still depends only on `guard`. Without an implementation attached it returns one fixed refusal.
+
 Do not add an alternate read, write, process, glob, or search path that bypasses this crate's
 policy calls.
 
@@ -231,13 +240,60 @@ policy calls.
 
 Both shipped in M1 and are covered by its gate. `rpc` holds the wire types shared by daemon and
 client; `srv` is the daemon itself — socket, session registry, ring, and bounded delivery.
-Section 5 is the contract they implement.
+Section 5 is the contract they implement. M2 added no method, notification, or error code: the
+wire contract is untouched. `srv` additionally owns the lifetime of each repository's index (below).
 
-### Scaffold crates
+### `elefante-mem`
 
-`elefante-mem` alone remains a scaffold: four lines, one const, and no dependents anywhere in
-the workspace. It preserves the topology so the M2 edges do not have to be retrofitted. Its API
-can change freely until that milestone's design pass is complete.
+The repository index. The crate README is the detail; this is the contract other crates rely on.
+
+**Storage.** `<repo_root>/.elefante/` holds `memory.db` (the graph: `node`, `edge`, `import_ref`,
+`node_fts`, `meta`) and `cache.db` (`file_state`, a content-addressed `extraction` cache, `brief`),
+both WAL, directory `0700`, files `0600`, and a self-ignoring `.gitignore` written *before* either
+database so `git status` is clean at every instant. `repo_root` is the nearest ancestor of a
+session's working directory containing `.git` (a directory or a worktree file), else the directory
+itself; `/` and `$HOME` are refused.
+
+**Identity.** `node` is keyed by `(kind, key)`: a file by its repository-relative path, a symbol
+by `path::qualified_name` (`#2`, `#3` for duplicates). The indexer upserts, so ids are stable
+across edits, and it touches only rows whose `source = 'index'` — learned rows arriving in M3 are
+never read, changed, or swept by it.
+
+**Consistency between the two files.** They cannot share a commit. A random *pairing epoch* ties
+`cache.db` to the `memory.db` it was written against (a mismatch clears `file_state` but keeps the
+content-addressed extractions); each batch commits to the graph first and the cache second; and an
+orphan sweep after a complete walk reconciles deletions. Deleting either database converges on the
+same graph.
+
+**The pipeline.** Walk (honours ignore files beneath the root, skips symlinks, binaries, files
+over 1 MiB, and anything `PathPolicy::is_secret_path` flags — unread) → stat comparison with a
+racy-timestamp rule → `blake3` of what changed → extraction by content hash (tree-sitter for Rust
+and TypeScript/TSX, a heading scan for Markdown) → batched graph writes → import edges derived from
+stored raw imports and the set of paths → co-change edges from `git log`, only when `HEAD` has
+moved. Edge derivation is flagged by a persistent `meta.edges_dirty`, written in the same
+transaction as the change that makes edges stale.
+
+**What is stored.** Names, signatures cut off before any body or initializer with string literals
+elided, one doc sentence, line numbers. Never source. Everything passes `Scrubber`.
+
+**Retrieval.** Prompt words → FTS5 seeds (rank-based) → two hops over `depends_on` and
+`co_edited_with`, damped near hubs → packed by file into 1,500 estimated tokens → rendered as an
+escaped, framed block that says it is reference data. `None`, not an empty envelope, when nothing
+matches. `partial` means the first full index has not finished; a refresh on a complete index is not
+partial. Results are cached by generation, from an in-process mirror of it, so a hit never reaches
+the reader thread.
+
+**Integration.**
+
+- *Per turn:* `core` asks a `ContextSource` for a block once per turn and inserts it immediately
+  after the turn's user message in every round's request. It is not stored. A leading brief message
+  is adopted once and frozen. Both are `user`-role: repository text never has system authority.
+- *`memory_search`:* `{query, limit?, kind?}` → ranked `path:line  kind name — description` lines.
+- *Lifecycle:* `srv` opens one `Store` and `Indexer` per repository root when the first session
+  starts beneath it, and calls `Indexer::refresh()` at session create, turn start and turn end.
+  `refresh()` returns immediately and coalesces; N triggers become at most two runs.
+- *Switch:* `ELEFANTE_MEMORY=0` (`DaemonConfig::memory`) — nothing opened, nothing written, no
+  context added, `memory_search` refuses.
 
 ## 5. Runtime interaction
 
@@ -546,7 +602,7 @@ Six independent flags describe what may be sent or observed:
 | `adaptive_thinking` | The model reasons before answering. |
 | `effort` | The model accepts `reasoning: { effort }`. |
 | `prompt_caching` | Stable system/tool cache breakpoints may be sent. |
-| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. Gains its consumer in M2/M3, when memory blocks and critic findings are placed mid-conversation. |
+| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. No core caller yet. Repository context is deliberately an ephemeral `user` message rather than a `system` one, so its first consumer is M4, where critic findings are harness-authored and `system` is correct. |
 | `structured_output` | Strict schemas may be requested. |
 | `cache_metrics` | Cache creation/read usage is observable. |
 
@@ -713,7 +769,7 @@ The seven tools are intentionally permanent prompt cost, so additions require a 
 | `glob` | `pattern`, optional `path` | Lists matching allowed files deterministically. |
 | `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. |
 | `bash` | `command` | Executes only commands classified `Allow`. |
-| `memory_search` | `query` | Deterministic M2-not-available error. |
+| `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk
@@ -931,7 +987,10 @@ When behavior changes, update:
 
 ## 14. Known limitations and next boundaries
 
-- `memory_search` has no backing graph until M2.
+- The index understands Rust, TypeScript/TSX and Markdown headings. Import edges resolve Rust
+  `mod`/`crate::`/`self::`/`super::` and TypeScript relative specifiers; cross-crate paths, `tsconfig`
+  aliases and bare packages are not resolved. There is no call graph, and `.js`/`.jsx` files are
+  indexed by path only. Learned memory is M3.
 - Usage is parsed but not accumulated into cost/staleness reporting until M5.
 - There is no model-backed critic.
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and
@@ -974,9 +1033,17 @@ broaden the shell allowlist just to make a task convenient.
 The requested lexical or resolved path is outside the workspace or matches a protected rule.
 Move non-secret fixture data to an allowed path; never rename real credentials to evade policy.
 
-### `memory_search is unavailable until milestone M2`
+### `memory_search is unavailable: this session has no repository index`
 
-This is expected. Repository inspection currently uses `read`, `glob`, and `grep`.
+Memory is off or could not start for this session: `ELEFANTE_MEMORY=0` was set, the working
+directory is `/` or `$HOME` (never indexed), or the store could not be opened — the daemon's stderr
+says which. `read`, `glob` and `grep` work regardless.
+
+### A block says `partial="true"`
+
+The first full index of this repository has not finished, so a symbol's absence from it is not
+evidence it does not exist. It resolves itself; a refresh on an already-complete index is never
+partial.
 
 ### Provider stream ends with a protocol error
 

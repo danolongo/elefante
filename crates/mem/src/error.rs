@@ -22,6 +22,8 @@ pub enum MemError {
     Corrupt { path: PathBuf, reason: String },
     #[error("memory is disabled for {path}: {reason}")]
     Refused { path: PathBuf, reason: &'static str },
+    #[error("indexing aborted: {0}")]
+    Aborted(String),
     #[error("memory store worker is gone")]
     ActorGone,
     #[error("memory store worker panicked while handling a request")]

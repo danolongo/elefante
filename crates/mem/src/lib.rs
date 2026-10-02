@@ -4,7 +4,9 @@ pub mod actor;
 pub mod diff;
 pub mod error;
 pub mod extract;
+pub mod graph;
 pub mod hash;
+pub mod indexer;
 pub mod layout;
 pub mod repo;
 pub mod schema;
@@ -12,6 +14,7 @@ pub mod state;
 pub mod stats;
 pub mod store;
 pub mod terms;
+mod util;
 pub mod walk;
 
 pub use error::MemError;

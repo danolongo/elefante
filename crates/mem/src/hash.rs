@@ -1,15 +1,8 @@
 //! Reading and hashing file content.
 
-use std::{
-    fs, io,
-    path::Path,
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{fs, io, path::Path};
 
-use crate::{stats::Counters, walk::WalkedFile};
+use crate::{stats::Counters, util::par_map, walk::WalkedFile};
 
 /// How much of a file is inspected for a NUL byte to call it binary.
 pub const BINARY_SNIFF_BYTES: usize = 8192;
@@ -44,37 +37,16 @@ pub fn read_and_hash(path: &Path) -> io::Result<Hashed> {
 
 /// Hashes `files` (paths relative to `root`) on a bounded number of threads. Results are in
 /// input order, and a file that cannot be read yields its error rather than aborting the batch.
-///
-/// # Panics
-/// Only if a worker thread panics, which would leave a result slot unfilled.
 pub fn hash_files(
     root: &Path,
     files: &[WalkedFile],
     counters: &Counters,
 ) -> Vec<io::Result<Hashed>> {
-    let slots: Vec<OnceLock<io::Result<Hashed>>> = files.iter().map(|_| OnceLock::new()).collect();
-    let next = AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZero::get)
-        .min(8)
-        .min(files.len().max(1));
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(file) = files.get(index) else { break };
-                    let result = read_and_hash(&root.join(&file.path));
-                    if result.is_ok() {
-                        counters.add_hashed(1);
-                    }
-                    let _ = slots[index].set(result);
-                }
-            });
+    par_map(files, |file| {
+        let result = read_and_hash(&root.join(&file.path));
+        if result.is_ok() {
+            counters.add_hashed(1);
         }
-    });
-    slots
-        .into_iter()
-        .map(|slot| slot.into_inner().expect("every slot is filled"))
-        .collect()
+        result
+    })
 }

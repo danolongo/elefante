@@ -277,6 +277,96 @@ Socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to `~/.elefante/run/ele
 
 **Why the daemon exists even for single-user CLI use:** it is what later lets N tmux panes attach to one warm memory store and one set of provider connections. Retrofitting that onto an in-process design is the expensive path, so the split is paid for up front and is cheap now.
 
+### Session picker
+
+**Planned, not built.** Launching the TUI always creates a fresh session. The intended behaviour
+is a menu, scoped to the current repository, listing the conversations that have happened there
+with "new session" first, so a user can resume earlier work instead of starting cold.
+
+**What the current structure does and does not allow** (verified against `srv/src/server.rs`):
+
+- **One daemon per socket, by construction.** `bind()` takes an exclusive lock on the socket's
+  parent directory, probes the socket, and a second `elefante-srv` that finds a live daemon
+  returns without serving. A second daemon needs a different `ELEFANTE_SOCKET`, which is a test
+  isolation device — it would share nothing with the first but the credentials file. The picker
+  must not depend on running several daemons.
+- **Many sessions per daemon already works.** The registry is a `HashMap` of sessions; any
+  number can be live, each with its own turn lock, and one client may attach to several. This is
+  the capability the picker needs and it exists.
+- **There is no way to enumerate them.** No `session.list` method exists, so a client can attach
+  only to an id it already holds (`--session ID`).
+- **Sessions do not outlive the daemon.** The registry and every history live in memory. The
+  daemon exits after `ELEFANTE_IDLE_SECS` (15 min) with no clients and no turns, taking every
+  session with it; the TUI's exit is a detach and never sends `session.close`, so an abandoned
+  session lingers only until then. "Every conversation that has happened in this repo" is
+  therefore not answerable today, only "every session the running daemon still holds".
+
+**This is milestone M6 — Conversation history** (below). It is sequenced after M5 because it
+reuses what M2 and M3 build: the repo identity and self-ignoring `.elefante/` directory, and the
+`Scrubber` on a durable write path. Nothing in M0–M5 should have to change to make room for it;
+the architecture notes that follow record why, so that stays true.
+
+#### Architecture it builds on
+
+The daemon already separates the three things a durable history needs to keep apart:
+
+| Concern | Today | Where | Survives daemon exit |
+|---|---|---|---|
+| What the **model** sees | `core::Session.messages` — provider-neutral `Message`s, `reasoning_details` verbatim | private field of `core::Session` | no |
+| What the **user** sees | `View.turns` — one record per completed turn: prompt, answer, tool previews, `stop_reason`, `usage` | `srv::View` | no |
+| What a client **missed** | `View.ring` — 4,096 notification envelopes | `srv::View` | no, and not meant to |
+
+The ring is a delivery buffer and should stay one; it is not the history. The history is the first
+two, and they cannot be derived from each other: `View.turns` carries truncated previews and usage
+that the messages do not, and the messages carry replay blocks that `View.turns` deliberately
+omits. **A durable record therefore stores both, written together at `turn.finished`.** A turn
+boundary is the natural commit point — an interrupt still returns a result for every `tool_use`
+(DEVELOPER_GUIDE §5) — so a crash mid-turn loses at most the turn in flight rather than leaving
+half of one on disk.
+
+Constraints that follow from the existing design, to be honoured when the design pass happens:
+
+- **Live session and stored conversation are different objects.** A `session_id` today is
+  `s{instance_id}-{n}`, where `instance_id` is random per daemon run — unique, but a handle to a
+  process's memory, not a name for a conversation. A stored conversation needs its own stable
+  `conversation_id`, and *resume* creates a new live session loaded from it. That leaves
+  `session.attach`, `seq`, the ring, and the snapshot contract (DEVELOPER_GUIDE §5) exactly as
+  they are: a resumed session starts at `seq: 0` with its completed turns delivered by the first
+  attach, which is already a snapshot.
+- **`close` must stop meaning "gone".** `session.close` currently drops the session and its
+  history. With durable history it ends the *live* session only; deleting a conversation is a
+  separate, explicit method.
+- **The daemon stays the sole writer.** Clients never touch the files, which keeps one process
+  ordering writes. Two daemons on different sockets are possible only as a test device, but both
+  could resume the same conversation, so resume takes a per-conversation lock and a second
+  resumer gets a named error rather than interleaved appends.
+- **Group by repo root, sandbox by `cwd`.** `View.cwd` is the canonicalised `session.create`
+  path and is also the tool policy root, so a session started in `repo/subdir` is deliberately
+  confined to `subdir`. Listing "this repo's conversations" needs a second field, `repo_root`,
+  resolved once at creation, used only for grouping and never for policy.
+- **List headers, not transcripts.** A listing row is `{ conversation_id, repo_root, cwd, model,
+  created_at, updated_at, turn_count, first_prompt_preview, state }` where `state` is
+  `live_active | live_idle | stored`. It lives apart from the transcript so listing a hundred
+  conversations reads a hundred small records, never a hundred histories. Live sessions and
+  stored ones share the row shape so a client renders one list.
+- **Resume needs a constructor core does not have.** `Session::new(config)` starts empty and
+  `messages` is private. M6 adds `Session::from_history`, and resume may change model or effort,
+  since both live in `RunConfig` rather than the history. Resumed prefixes will usually miss the
+  prompt cache once its TTL has lapsed; that is a cost, not a defect.
+- **Transcripts are secrets-adjacent.** User prompts are not scrubbed today and can contain a
+  pasted key. Every durable write goes through `Scrubber`, the same call site M3 uses for memory
+  rows. The path policy also denies only `.elefante/credentials.toml`; once transcripts live in
+  `<repo>/.elefante/`, whether the agent may read its own history is a decision, not a default.
+- **Snapshot growth gets decided here.** Developer guide §14 open question 1 — snapshots grow
+  without bound per session — becomes real once conversations live for weeks. Paging completed
+  turns, or capping the snapshot to the last N with the rest fetched on demand, is part of M6.
+
+Open for the design pass, deliberately not decided now: the on-disk form (an append-only JSONL
+file per conversation plus a small header record is the leading option — crash-tolerant,
+greppable, no actor thread — against a `sessions.db` beside `memory.db`); and whether transcripts
+live under the repo or under `~/.elefante/`. The repo is preferred, because the picker is
+per-repo and the directory already ignores itself.
+
 ---
 
 ## The RPC protocol (`elefante-rpc`)
@@ -600,6 +690,35 @@ The headless client splits streams: **`stdout` is the answer, `stderr` is reason
 - Staleness signals fire on a synthetic session built to trigger each one.
 - **M0–M4 gates still green.**
 
+### M6 — Conversation history
+
+**Baseline.** Design pass first: on-disk form, `conversation_id`, resume semantics, and the
+secrets and path-policy questions in § Session picker. Then `session.list`, `session.resume`, and
+`session.delete`; durable per-conversation records written at each `turn.finished` under
+`<repo_root>/.elefante/`, scrubbed on write; `repo_root` resolution; `Session::from_history`; a
+per-conversation lock; bounded snapshots; and a TUI picker shown on launch (new session first)
+with `--session ID` and `--new` to bypass it.
+
+**Gate.**
+- `SIGKILL` the daemon between turns and restart it: the conversation is listed with every
+  completed turn, and resuming it then prompting does not 400 — against the pairing-validating
+  stub, so the assertion cannot pass vacuously.
+- A conversation interrupted mid-turn resumes from its last completed turn, with no half-written
+  turn in the list or the history.
+- `reasoning_details` in the first request after resume are byte-identical to those recorded
+  before the restart.
+- Listing from repo A never returns repo B's conversations; listing from a subdirectory of A
+  returns A's, while the session started there keeps its narrower tool root.
+- Listing reads headers only, asserted by a counter on transcript opens rather than by timing.
+- A prompt containing an `sk-ant-` fixture string leaves it absent from every file under
+  `.elefante/` after the session.
+- `git status` is clean after a full session.
+- A second resume of a live conversation is refused with a named error; `session.close` ends the
+  live session and leaves the stored conversation listed; `session.delete` removes it.
+- The TUI picker shows live and stored conversations in one list, bypasses on `--session` and
+  `--new`, and a headless one-shot is unchanged.
+- **M0–M5 gates still green.**
+
 ---
 
 ## Deferred
@@ -609,6 +728,11 @@ Noted now so the architecture accommodates them, not built yet:
 - **tmux subagent execution and nested sessions** — the daemon is already the shared backend; subagents become additional registry sessions, each rendered in its own pane.
 - **Multi-model routing policy** — automatic selection by specialization / intelligence / cost, building on the interactive model picker (see § Model selection), which is where a user's reachable catalogue and its real prices first become available to the harness. One provider reaching hundreds of models means the reach exists from M0; the deferred part is the policy that picks per task rather than per configured role. `usage.cost` on every response makes the cost input real rather than estimated.
 - **Self-authored skills** (user- and project-level) and self-improving workflow — builds on the M3 learned-memory write path.
+- **Collapsible reasoning in the TUI.** A key that folds the reasoning block of each turn to its
+  heading, so long chains of thought do not push the answer off-screen. An earlier version bound
+  this to Ctrl+R with an `App`-level flag; it was removed rather than shipped half-designed.
+  Decide first whether collapse is global or per turn, whether it survives reattach (snapshots do
+  not carry completed reasoning), and whether it should default to collapsed once a turn ends.
 - **Hooks and plugins.**
 - **Full graph schema and relation semantics** — dedicated design pass before M2 ships.
 - **Server-side compaction** (`compact-2026-01-12`) and **context editing** (`clear_tool_uses_20250919`) as alternatives to client-side compaction.

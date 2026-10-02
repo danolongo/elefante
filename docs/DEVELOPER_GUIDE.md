@@ -168,15 +168,14 @@ it alone. The subsections below are the overview; the READMEs are the detail.
 
 ### `elefante-cli`
 
-The binary is composition code. It parses arguments, reads environment configuration,
-constructs `OpenRouterProvider` and `ToolExecutor`, builds `RunConfig`, and calls
-the daemon. It is a client: it spawns `elefante-srv` if none is listening, then streams a
-session over the socket. The answer goes to stdout and reasoning plus tool activity to
-stderr, which is what resolves issue #4 — the two can no longer render as one undelimited
-run, by construction rather than by formatting.
+The binary is a client. It parses arguments and environment defaults, spawns `elefante-srv` if
+none is listening, and then either streams one headless turn over the socket (a prompt was
+given) or launches the Bun TUI (none was). It links only `elefante-rpc` — it constructs no
+provider, no `ToolExecutor`, and no `RunConfig`; those live in the daemon. The answer goes to
+stdout and reasoning plus tool activity to stderr, which is what resolves issue #4 — the two can
+no longer render as one undelimited run, by construction rather than by formatting.
 
-Keep provider protocol parsing, policy, and orchestration out of this crate. Prefer
-this direct composition path with daemon/client startup behavior.
+Keep provider protocol parsing, policy, and orchestration out of this crate.
 
 ### `elefante-core`
 
@@ -935,8 +934,9 @@ When behavior changes, update:
 - `memory_search` has no backing graph until M2.
 - Usage is parsed but not accumulated into cost/staleness reporting until M5.
 - There is no model-backed critic.
-- `session.list` waits for the tmux fanout work, so a client cannot enumerate sessions it did
-  not create.
+- There is no `session.list`, so a client cannot enumerate sessions it did not create, and
+  sessions live only in daemon memory — they end with `session.close` or the daemon's idle exit.
+  `PLAN.md` § Session picker and milestone M6 cover the list and durable history.
 - The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
   time-of-check/time-of-use filesystem races.
 

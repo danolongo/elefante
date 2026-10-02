@@ -170,3 +170,39 @@ fn supports_custom_denied_globs() {
         })
     ));
 }
+
+#[test]
+fn lexical_secret_check_agrees_with_resolve_on_names() {
+    use std::path::Path;
+    for path in [
+        ".env",
+        ".env.local",
+        "app/.env.production",
+        "server.pem",
+        "deep/dir/private.KEY",
+        ".ssh/config",
+        "home/.aws/credentials",
+        ".elefante/credentials.toml",
+        "id_rsa",
+        "id_rsa.pub",
+        ".netrc",
+        ".npmrc",
+        ".git-credentials",
+    ] {
+        assert!(PathPolicy::is_secret_path(Path::new(path)), "{path}");
+    }
+    for path in [
+        "src/lib.rs",
+        "environment.rs",
+        ".envrc.md.bak/readme.txt",
+        "docs/keys.md",
+        "monkey.rs",
+        ".github/workflows/ci.yml",
+        ".elefante/memory.db",
+        ".aws/config",
+    ] {
+        // `.envrc.md.bak` is a directory name that merely begins with `.env`; it does not match
+        // `.env` exactly nor `.env.` prefix, so it must stay indexable.
+        assert!(!PathPolicy::is_secret_path(Path::new(path)), "{path}");
+    }
+}

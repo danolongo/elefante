@@ -25,11 +25,17 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/protocol.ts` | 238 | Framing, sequence windows, attach and gap handling, `connectOrExplain`. |
 | `src/session.ts` | 39 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. |
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
-| `src/main.tsx` | 101 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
+| `src/main.tsx` | 102 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
 | `src/ui/Transcript.tsx` | 26 | Completed turns and the live turn; reasoning and answer as separate renderables. |
 | `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
-| `src/ui/App.tsx` | 24 | Composition and key handling. |
+| `src/ui/App.tsx` | 28 | Composition and key handling. |
+| `src/ui/Mascot.tsx` | 41 | Places the elephant over the transcript area and decides which stage it is on. |
+| `src/ui/elephant/Elephant.tsx` | 119 | `TopElephant` and `PerchElephant`: a frame-buffer renderable played by an OpenTUI timeline. |
+| `src/ui/elephant/scenes.ts` | 66 | Pure frame clips (intro, exit, perch entrance, idle flap) and the 30–90 s flap pause. |
+| `src/ui/elephant/sprites.ts` | 48 | The pixel art and its palette, ported from the design project. |
+| `src/ui/elephant/paint.ts` | 49 | Composes a frame into pixels and paints it as half-block cells. |
+| `src/ui/elephant/phase.ts` | 25 | The `intro → exit → perch` transitions, as pure functions. |
 | `src/ui/Status.tsx` | 9 | Thinking indicator, elapsed time, usage. |
 | `src/ui/Input.tsx` | 5 | Prompt entry. |
 
@@ -56,6 +62,25 @@ they stay at `0 in / 0 out / 0 reasoning | cost: ?` until the first `turn.finish
 the daemon reports usage per turn, not per token. `cost: ?` means the provider has reported no
 cost yet (`null`); once any turn reports one it reads `cost: $0.0123`, and a reported zero reads
 `cost: $0.0000`, which is distinct from unknown.
+
+## The elephant
+
+A pixel-art elephant (from the "8-bit Elephant TUI Animations" design) keeps the transcript company.
+A new session opens with it walking in from the left edge of the terminal at the top, raising its trunk, flapping its ears and standing;
+the first prompt sends it walking off to the right, and it comes back in at the bottom-right just above
+the status row and input bar, where it stands facing the chat. It flaps its ears once after each random
+30–90 second pause and is otherwise still. `--session ID` skips the intro and starts it on the perch, and
+terminals under 60 columns or 18 rows show no elephant at all.
+
+It is drawn with half-block cells (`▀`/`▄`, foreground = top pixel, background = bottom pixel), so one
+sprite pixel is one column by half a row, into a `FrameBufferRenderable` with alpha blending so the
+transcript shows through around it. Clips are plain arrays of `{ x, pose }` frames played by an OpenTUI
+`Timeline` that tweens a tick counter at 80 ms a frame and paints straight into the buffer — no React
+render per frame. The engine holds the renderer in live mode only while a clip is playing, so a standing
+elephant costs nothing. Colours are the design's greys against a dark terminal; on a light one the body is
+low contrast.
+
+While it walks off the top stage it can pass over the first turn's text, which is drawn beneath it.
 
 A lone Esc is held by OpenTUI's stdin parser for 20 ms before it is reported, since the byte is
 also the start of every escape sequence. Tests that press Esc must wait past that window.
@@ -97,14 +122,17 @@ those cannot be reconstructed on a fresh attachment. The daemon's retained histo
 ## Testing
 
 ```sh
-bun test              # 24 tests
+bun test              # 44 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
 no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (7)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
-asserted in CI.
+asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, clips, flap pause and phase transitions
+as pure functions; `tests/elephant.ui.test.tsx` (9) renders the app and steps the animation by calling
+`engine.update(ms)`, so no test waits on a real clock. `App`'s `animateMascot={false}` makes the elephant
+paint its resting pose and finish its exit at once.
 
 ## Boundaries
 

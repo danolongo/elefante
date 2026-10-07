@@ -4,7 +4,9 @@ import { Transcript } from "./Transcript";
 import { Status } from "./Status";
 import { Input } from "./Input";
 import { Modal, type ModalProps } from "./Modal";
-export type AppProps = { state: SessionState; now: number; connected: boolean; submitting?: boolean; message: string | null; modal: ModalProps | null; onSubmit: (text: string) => void; onInterrupt: () => void; onExit: () => void };
+import { Mascot } from "./Mascot";
+// `resumed` skips the new-session intro; `animateMascot` is false only under test.
+export type AppProps = { state: SessionState; now: number; connected: boolean; submitting?: boolean; resumed?: boolean; animateMascot?: boolean; message: string | null; modal: ModalProps | null; onSubmit: (text: string) => void; onInterrupt: () => void; onExit: () => void };
 export function App(props: AppProps) {
   useKeyboard(key => {
     if (key.ctrl && key.name === "c") { key.preventDefault(); props.onExit(); }
@@ -13,7 +15,10 @@ export function App(props: AppProps) {
     if (key.name === "escape" && !props.modal) { key.preventDefault(); props.onInterrupt(); }
   });
   return <box flexDirection="column" height="100%" padding={1}>
-    <Transcript state={props.state} />
+    <box position="relative" flexGrow={1} flexDirection="column">
+      <Transcript state={props.state} />
+      <Mascot state={props.state} resumed={props.resumed} animate={props.animateMascot} />
+    </box>
     <Status state={props.state} now={props.now} />
     {props.message && <text fg="#ffaaaa">{props.message}</text>}
     {!props.connected && <text>Reconnecting… the turn continues in the daemon.</text>}

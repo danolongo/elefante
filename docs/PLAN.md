@@ -857,7 +857,30 @@ Noted now so the architecture accommodates them, not built yet:
   Decide first whether collapse is global or per turn, whether it survives reattach (snapshots do
   not carry completed reasoning), and whether it should default to collapsed once a turn ends.
 - **Hooks and plugins.**
-- **Resolution beyond tier 1** — workspace-crate imports (`use elefante_core::…`), `tsconfig` paths and bare package imports; deferred from M2 because each is a second parser for a signal tier-1 edges and co-change already approximate. Also a call/reference graph, `.js`/`.jsx` extraction, and further languages (a grammar crate, an extractor and a resolver apiece).
+- **Resolution beyond tier 1** — workspace-crate imports (`use elefante_core::…`), `tsconfig` paths and bare package imports; deferred from M2 because each is a second parser for a signal tier-1 edges and co-change already approximate. Also a call/reference graph and `.js`/`.jsx` extraction.
+- **Python and C/C++ extraction** — planned, after M3. A language is a grammar crate, an extractor and a
+  resolver apiece (plus one registry line in `extract::language_for` and one arm in `resolve::resolve`),
+  so these add no schema, no relation and no RPC change. Proposed ids: `python@1`, `c@1`, `cpp@1`; the
+  file-state, extraction cache and graph are already language-agnostic. Open points to settle in that
+  milestone's design pass, not decided here:
+  - **Gates that carry over unchanged:** signatures end before a body or initializer and elide string
+    literals (Python: default arguments, `single_quotes = true`; C/C++: never index a `#define` body or
+    an initializer); one-sentence docs (Python docstrings, `///` and `/** */`); the `Scrubber` on every
+    string; the parse budget; the secret-fixture gate re-run for each language.
+  - **Python:** relative imports (`from . import x`, `from ..pkg import y`) and `__init__.py` packages
+    resolve against the path set like Rust `mod`; absolute imports need a source-root guess (repo root,
+    `src/`) — likely tier 2 with `pyproject.toml`. Index `def`, `class`, methods and top-level
+    functions only; module-level assignments are skipped for the same reason TS skips non-function
+    `const`.
+  - **C/C++:** `#include "x.h"` resolves relative to the including file, then the repo path set;
+    `<system>` includes are ignored; include directories need `compile_commands.json` or build files,
+    so tier 2. `.h` is ambiguous between C and C++ (decide: parse as C++, which is a superset for
+    declarations). Header/source pairing (`foo.h` ↔ `foo.cc`) is a strong coupling signal worth a
+    dedicated edge or a resolver rule. Templates, namespaces and macros stress `qname` nesting.
+  - **Cost:** every grammar crate must clear the MSRV job (`tree-sitter-rust` and
+    `tree-sitter-typescript` did via the S0 spike, which should be repeated for these), and each adds
+    binary size and a per-file parse cost against the 1 s budget.
+  - Per-language golden-retrieval fixtures, as for Rust and TS.
 - **Server-side compaction** (`compact-2026-01-12`) and **context editing** (`clear_tool_uses_20250919`) as alternatives to client-side compaction.
 - **Task budgets** (`task-budgets-2026-03-13`) for agentic-loop spend ceilings, feeding M5.
 - **Embedding-based retrieval** — the vector slot is left pluggable; FTS + graph hops ship first.

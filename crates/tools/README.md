@@ -45,18 +45,23 @@ executor would have nowhere to wait. This crate spawns the process — `bash -lc
 policy root, `kill_on_drop`, its own process group on Unix so an interrupt takes the children
 with it. Do not reintroduce a classifier here.
 
-**`memory_search` returns a hardcoded refusal string** (`src/lib.rs:375`) rather than
-`elefante_mem::NOT_AVAILABLE`. The two have drifted; see `crates/mem/README.md`. This crate does
-not depend on `elefante-mem` at all.
+**`memory_search` is a trait, not a dependency.** The tool is validated here (a non-empty query,
+`limit` 1–20, `kind` of `file` or `symbol`, no other fields) and then handed to a `MemorySearch`
+implementation attached with `ToolExecutor::with_memory`. The implementation lives in
+`elefante-core`, over `elefante-mem`; this crate depends on neither, so the dependency direction
+`tools → guard` stays intact. With nothing attached the tool returns one fixed refusal, so a
+session with memory switched off still gets a deterministic answer. The result passes through the
+same scrubber as every other tool.
 
 ## Testing
 
 ```sh
-cargo test -p elefante-tools    # 13 tests
+cargo test -p elefante-tools    # 18 tests
 ```
 
 `tests/tools.rs` covers all seven tools against `tempfile` workspaces — real files, real
-`bash`, no network. Nothing is `#[ignore]`d.
+`bash`, no network. `memory_search` is tested against a fake index that records what it was asked.
+Nothing is `#[ignore]`d.
 
 ## Boundaries
 

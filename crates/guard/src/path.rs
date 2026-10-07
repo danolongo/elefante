@@ -88,6 +88,17 @@ impl PathPolicy {
         &self.root
     }
 
+    /// Whether `path` names a built-in secret location, judged by its components alone.
+    ///
+    /// Purely lexical: no filesystem access, no symlink resolution, and no root. That makes it
+    /// cheap enough to run on every entry of a repository walk, which [`PathPolicy::resolve`]
+    /// is not. It is not a substitute for `resolve` at a syscall boundary, which also defeats
+    /// symlinks and traversal.
+    #[must_use]
+    pub fn is_secret_path(path: &Path) -> bool {
+        built_in_secret_rule(path).is_some()
+    }
+
     /// Resolves `path` beneath the workspace and rejects known secret locations.
     ///
     /// # Errors

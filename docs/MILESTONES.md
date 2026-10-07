@@ -165,4 +165,85 @@ was corrected in the same pass.*
 
 ---
 
-_Next: M2 — repo cache and mechanical graph._
+## M2 — Repo cache + mechanical graph            (implemented 2026-10-02; one credentialed check not yet run)
+
+**Status, stated plainly.** Every hermetic item of the gate is green from a clean checkout. The
+gate's last item — `live_memory_context_reaches_the_model`, which proves a real provider accepts the
+injected message shape and that a real model uses the index it is sent — has been written, compiled
+and wired into `credentialed.yml`, but **has not been run**. By this project's own rule the
+milestone is not complete until it has. Run it, then change this heading's parenthetical to a
+completion date and `README.md`'s status paragraph with it.
+
+**Shipped.** A per-repository index in `elefante-mem`: a walk that honours ignore files and prunes
+secret paths unread; stat-based change detection with a racy-timestamp rule; a content-addressed
+extraction cache; symbols and imports for Rust, TypeScript/TSX and Markdown headings; a graph in
+`memory.db` with stable node ids; import edges derived from the set of paths; `co_edited_with`
+edges from `git log` with rename aliasing; FTS5 retrieval with graph expansion, packed into a token
+budget and rendered as an escaped, framed block; a deterministic repository brief; a background
+`Indexer` whose triggers coalesce and never block. Integration: `memory_search` is a real tool
+(`MemorySearch` is a trait in `tools`, implemented in `core`, so `tools` still depends only on
+`guard`); `core` places an ephemeral block after each turn's user message and a frozen brief at the
+head of the request, both `user`-role and neither stored; `srv` opens one store and indexer per
+repository and refreshes at session create and around every turn; `ELEFANTE_MEMORY=0` turns it all
+off. No RPC method, notification or error code was added.
+
+**Gate.** 350 hermetic Rust tests (210 in `mem`), 24 TypeScript tests, clippy under `-D warnings`,
+`cargo fmt --check`, `tsc --noEmit`, and `cargo +1.90.0 check` — all after `cargo clean`. The M0 and
+M1 suites for `guard`, `tools`, `core` and `srv` re-ran after every stage that touched them. Every
+assertion in the plan's gate is a counter, never a clock: `parsed == 0` on a warm start,
+`parsed == 1` after one edit, `git_log_runs == 0` when `HEAD` has not moved, reader-actor call
+counts for the cache, and the raw bytes of every file under `.elefante/` for the secret fixture.
+
+**Where the tests earned their keep.** Defects found *by the tests, not by inspection*, each fixed
+and each now pinned:
+
+- The identifier splitter classified characters from its own lowercased output, so every upper-case
+  run split into single letters (`HTTPServer`, `TURN_LOCK`); caught by the first table.
+- A `///` comment separated from its item by a blank line was attached as its doc, because a node
+  that ends with a newline ends at column 0 of the *next* row.
+- A `touch` refresh counted a graph commit it had not made.
+- **A crash after a content batch committed would have left import edges un-derived forever**, since
+  every file looked up to date on the next run. The trigger was in-memory; it is now a persistent
+  `meta.edges_dirty` written in the same transaction as the change. The mutation that removes it
+  fails five tests.
+- **`partial` as designed ("the indexer is running") would have marked nearly every block**, because
+  refreshes run at every turn start, concurrently with retrieval. It now means "the first full index
+  has not finished". Found by an integration test whose tool result carried an "index still being
+  built" note it had no business carrying.
+- The first draft of the brief's cache key was the tree fingerprint alone; "central files" depends
+  on edges, which move with `HEAD` while no file does.
+
+Each guard was also checked the other way: the racy-timestamp window, the orphan sweep, the dirty
+flag, `HEAD` gating, rename aliasing, the secret rules, block placement, coalescing, the kill
+switch and the ranking order were each disabled in turn and the corresponding tests confirmed to
+fail. A test that cannot fail is documentation.
+
+**Observed, not gated.** On this repository (124 files, 1,048 symbols, 38 commits): a cold index
+took about 320 ms with 92 parses, a warm refresh 5 ms when files had settled (33 ms immediately after
+a fresh clone, when every file is inside the racy window and is rehashed once), and the two databases
+total about 1.2 MB. 130 `depends_on` edges and 306 `co_edited_with` edges. Timing was never asserted.
+
+**Deferred.** Learned memory (M3). Workspace-crate, `tsconfig` and bare-package import resolution;
+a call or reference graph; `.js`/`.jsx` extraction; further languages; embeddings; a file watcher; a
+model-written brief. Session-touched files as a retrieval signal (`Query.files` carries only prompt
+mentions; the field exists so adding them changes no signature). Whether the agent's own tools may
+open `.elefante/*.db` — decide with the transcript question in M6.
+
+**Amended.** `PLAN.md`: placement of retrieved context is ephemeral and `user`-role, not
+capability-dependent `system` — `Capabilities::mid_conversation_system` therefore has no core caller
+until M4; storage, the memory actor (two threads, not one), the schema (no `CHECK` on `kind`/`rel`;
+`source` as the ownership discriminator; `import_ref`; stable ids), ingestion and scheduling were
+rewritten from what shipped; the M2 gate gained its additions. `DEVELOPER_GUIDE.md` and every
+affected crate README were rewritten, `mem`'s from "a four-line scaffold" to the real contract.
+`memory_search`'s refusal text no longer says "milestone M2", so the one M0 test that asserted the
+old wording was updated. `docs/M2-DESIGN.md`, the design pass the plan required, is retired into
+these as the M1 contracts were; it remains in history at `f5485f7:docs/M2-DESIGN.md`.
+
+**Deviations from the design pass, recorded where they happened.** Extraction uses hand-written tree
+walks rather than `.scm` query files; `file_state` gained a `skip` column so a binary is read once;
+the brief's cache key covers the co-change head; `partial` ignores a running refresh. Each is
+explained in `PLAN.md` or the crate README.
+
+---
+
+_Next: M3 — learned memory. First, run `live_memory_context_reaches_the_model` and close M2._

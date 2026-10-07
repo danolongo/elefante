@@ -1,4 +1,6 @@
-//! Provider-neutral agent loop for the first usable Elefante milestone.
+//! Provider-neutral agent loop.
+
+pub mod memory;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -198,10 +200,35 @@ impl ToolGate {
     }
 }
 
+/// Where per-turn context comes from. Implemented over the repository index in [`memory`]; tests
+/// supply their own.
+///
+/// What it returns is **repository-derived data**. It is placed in a request as an ephemeral
+/// `user` message and never in `system`, and never stored in history: see [`Session::prompt`].
+pub trait ContextSource: Send + Sync {
+    /// A block relevant to `prompt`, or `None` when nothing is. Called once per turn.
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>>;
+
+    /// A standing summary, or `None` while there is not yet one to give. Once a session has
+    /// adopted one it keeps it.
+    fn preamble(&self) -> BoxFuture<'_, Option<String>>;
+}
+
 pub struct Session {
     messages: Vec<Message>,
     config: RunConfig,
     usage: Usage,
+    context: Option<Arc<dyn ContextSource>>,
+    /// Adopted at most once; the same bytes on every later request so the cached prefix holds.
+    preamble: Option<String>,
+}
+
+/// What one turn adds to its requests without adding it to history.
+#[derive(Default)]
+struct TurnContext {
+    /// Index in `Session::messages` of this turn's user message.
+    user_index: usize,
+    block: Option<String>,
 }
 
 impl Session {
@@ -211,7 +238,16 @@ impl Session {
             messages: Vec::new(),
             config,
             usage: Usage::default(),
+            context: None,
+            preamble: None,
         }
+    }
+
+    /// Attaches a source of per-turn context.
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<dyn ContextSource>) -> Self {
+        self.context = Some(context);
+        self
     }
 
     #[must_use]
@@ -241,11 +277,17 @@ impl Session {
     where
         F: FnMut(OutputEvent),
     {
-        self.messages.push(Message::text(Role::User, prompt));
+        let prompt = prompt.into();
+        self.messages
+            .push(Message::text(Role::User, prompt.clone()));
+        let turn = TurnContext {
+            user_index: self.messages.len() - 1,
+            block: self.gather_context(&prompt).await,
+        };
         emit(OutputEvent::TurnStarted);
         let mut usage = Usage::default();
         let result = self
-            .run_turn(provider, tools, gate, &cancel, &mut usage, &mut emit)
+            .run_turn(provider, tools, gate, &cancel, &turn, &mut usage, &mut emit)
             .await;
         self.usage.accumulate(usage);
         let stop_reason = match &result {
@@ -261,12 +303,45 @@ impl Session {
         result
     }
 
+    /// Fetches this turn's context and, once, the standing preamble.
+    ///
+    /// Done once per turn rather than per round: every round re-sends the same block at the same
+    /// position, so the cache holds across tool rounds.
+    async fn gather_context(&mut self, prompt: &str) -> Option<String> {
+        let context = self.context.clone()?;
+        if self.preamble.is_none() {
+            self.preamble = context.preamble().await;
+        }
+        context.turn_block(prompt).await
+    }
+
+    /// History as the provider sees it: the preamble first, the turn's block immediately after
+    /// the user message that started it. Neither is in `self.messages`.
+    ///
+    /// The block goes *after* the user message, not before, so that across consecutive turns the
+    /// request prefix is byte-identical through that user message and only what follows differs.
+    fn request_messages(&self, turn: &TurnContext) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(self.messages.len() + 2);
+        if let Some(preamble) = &self.preamble {
+            messages.push(Message::text(Role::User, preamble.clone()));
+        }
+        let split = (turn.user_index + 1).min(self.messages.len());
+        messages.extend_from_slice(&self.messages[..split]);
+        if let Some(block) = &turn.block {
+            messages.push(Message::text(Role::User, block.clone()));
+        }
+        messages.extend_from_slice(&self.messages[split..]);
+        messages
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn<F>(
         &mut self,
         provider: &dyn Provider,
         tools: &ToolExecutor,
         gate: &ToolGate,
         cancel: &CancellationToken,
+        turn: &TurnContext,
         usage: &mut Usage,
         emit: &mut F,
     ) -> Result<TurnOutcome, LoopError>
@@ -281,7 +356,7 @@ impl Session {
                 max_tokens: self.config.max_tokens,
                 system: vec![self.config.system_prompt.clone()],
                 tools: definitions.clone(),
-                messages: self.messages.clone(),
+                messages: self.request_messages(turn),
                 effort: self.config.effort,
             };
             let completed = receive_round(provider, request, cancel, usage, emit).await?;

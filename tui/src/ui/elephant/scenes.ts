@@ -30,11 +30,6 @@ export function introFrames(stageCols: number): Frame[] {
   ];
 }
 
-/// First prompt: walks right from wherever it was until it is wholly off the stage.
-export function exitFrames(fromX: number, stageCols: number): Frame[] {
-  return repeat(Math.max(1, stageCols - fromX + 1), i => ({ x: fromX + i, pose: { leg: stride(i) } }));
-}
-
 /// The perch stage is `stageCols` wide and the elephant rests flush right, facing into the chat.
 export function perchRest(stageCols: number): number {
   return stageCols - SPRITE_COLS;
@@ -45,7 +40,7 @@ export function perchFrame(stageCols: number): Frame {
   return { x: perchRest(stageCols), pose: { flip: true } };
 }
 
-/// After exiting the top stage it walks in from the right edge of the perch stage, facing left,
+/// After the first prompt it walks in from the right edge of the perch stage, facing left,
 /// and ends on the resting frame rather than mid-stride.
 export function perchEnterFrames(stageCols: number): Frame[] {
   const walk = repeat(stageCols - perchRest(stageCols), i => ({ x: stageCols - i, pose: { flip: true, leg: stride(i) } }));

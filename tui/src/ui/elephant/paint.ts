@@ -8,8 +8,6 @@ export type Stage = {
   pixelRows: number;
   /// Pixel row the sprite's top edge sits on.
   top: number;
-  /// Dotted ground on the last pixel row, as in the design.
-  ground: boolean;
 };
 
 const TRANSPARENT = RGBA.fromValues(0, 0, 0, 0);
@@ -23,7 +21,6 @@ const color = (pixel: string): RGBA => {
 /// Composes a frame into pixels. `null` is transparent.
 export function composePixels(frame: Frame, stage: Stage): (string | null)[][] {
   const pixels = Array.from({ length: stage.pixelRows }, () => Array<string | null>(stage.cols).fill(null));
-  if (stage.ground) for (let col = 0; col < stage.cols; col += 2) pixels[stage.pixelRows - 1][col] = "G";
   sprite(frame.pose).forEach((row, r) => {
     for (let c = 0; c < row.length; c++) {
       const x = frame.x + c, y = stage.top + r;

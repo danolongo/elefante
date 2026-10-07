@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { advance, exited, startState } from "../src/ui/elephant/phase";
+import { advance, startState } from "../src/ui/elephant/phase";
 import { composePixels } from "../src/ui/elephant/paint";
-import { exitFrames, flapFrames, introFrames, MAX_FLAP_PAUSE_MS, MIN_FLAP_PAUSE_MS, nextFlapDelayMs, perchEnterFrames, perchFrame, perchRest } from "../src/ui/elephant/scenes";
+import { flapFrames, introFrames, MAX_FLAP_PAUSE_MS, MIN_FLAP_PAUSE_MS, nextFlapDelayMs, perchEnterFrames, perchFrame, perchRest } from "../src/ui/elephant/scenes";
 import { PALETTE, SPRITE_COLS, SPRITE_ROWS, sprite } from "../src/ui/elephant/sprites";
 
 test("every pose is a 15 by 10 grid of palette pixels", () => {
@@ -37,26 +37,19 @@ test("the intro walks in from off-stage left and finishes standing, trunk down, 
   expect(frames.map(f => f.x).every((x, i, xs) => i === 0 || x >= xs[i - 1])).toBe(true);   // never walks backwards
 });
 
-test("the exit walks right from where it stood until it is wholly off the stage", () => {
-  const frames = exitFrames(28, 72);
-  expect(frames[0].x).toBe(28);
-  expect(frames.at(-1)!.x).toBeGreaterThanOrEqual(72);
-  expect(composePixels(frames.at(-1)!, { cols: 72, pixelRows: 12, top: 1, ground: false }).flat().every(p => p === null)).toBe(true);
-});
-
 test("the perch entrance comes in from the right edge facing left and ends at rest", () => {
-  const frames = perchEnterFrames(30);
-  expect(frames[0].x).toBe(30);
-  expect(frames.at(-1)).toEqual(perchFrame(30));                      // stops standing, not mid-stride
+  const frames = perchEnterFrames(16);
+  expect(frames[0].x).toBe(16);
+  expect(frames.at(-1)).toEqual(perchFrame(16));                      // stops standing, not mid-stride
   expect(frames.at(-2)!.pose.leg).not.toBe(0);                        // having been walking until the last step
   expect(frames.map(f => f.x).every((x, i, xs) => i === 0 || x <= xs[i - 1])).toBe(true);   // always moving left
   expect(frames.every(f => f.pose.flip)).toBe(true);
-  expect(perchFrame(30)).toEqual({ x: perchRest(30), pose: { flip: true } });
+  expect(perchFrame(16)).toEqual({ x: perchRest(16), pose: { flip: true } });
 });
 
 test("the idle flap stays in place, uses only soft and normal ears, and ends at rest", () => {
-  const frames = flapFrames(30);
-  expect(frames.every(f => f.x === perchRest(30) && f.pose.flip && (f.pose.ear === "s" || f.pose.ear === "n"))).toBe(true);
+  const frames = flapFrames(16);
+  expect(frames.every(f => f.x === perchRest(16) && f.pose.flip && (f.pose.ear === "s" || f.pose.ear === "n"))).toBe(true);
   expect(frames.some(f => f.pose.ear === "s")).toBe(true);
   expect(frames.at(-1)!.pose.ear).toBe("n");
 });
@@ -75,16 +68,14 @@ test("a new session starts with the intro; a resumed or non-empty one starts on 
   expect(startState(false, false)).toEqual({ phase: "perch", arrive: false });
 });
 
-test("the first prompt sends the intro to the exit, and finishing the exit arrives on the perch", () => {
+test("the first prompt takes the intro off the stage and the perch walks in at once", () => {
   const intro = startState(true, false);
   expect(advance(intro, { fresh: true, visible: true })).toBe(intro);                  // unchanged: same object
-  const leaving = advance(intro, { fresh: false, visible: true });
-  expect(leaving).toEqual({ phase: "exit", arrive: false });
-  expect(advance(leaving, { fresh: false, visible: true })).toBe(leaving);
-  expect(exited()).toEqual({ phase: "perch", arrive: true });
+  const perched = advance(intro, { fresh: false, visible: true });
+  expect(perched).toEqual({ phase: "perch", arrive: true });
+  expect(advance(perched, { fresh: false, visible: true })).toBe(perched);
 });
 
-test("a hidden mascot skips the walk off rather than waiting on an animation that cannot play", () => {
+test("a hidden mascot goes straight to its perch rather than walking in where it cannot be seen", () => {
   expect(advance({ phase: "intro", arrive: false }, { fresh: false, visible: false })).toEqual({ phase: "perch", arrive: false });
-  expect(advance({ phase: "exit", arrive: false }, { fresh: false, visible: false })).toEqual({ phase: "perch", arrive: false });
 });

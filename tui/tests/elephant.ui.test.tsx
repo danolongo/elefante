@@ -27,7 +27,7 @@ const found = (renderer: { root: { findDescendantById(id: string): unknown } }, 
 /// Half blocks come only from the elephant: nothing else in this UI draws them.
 const isPixel = (c: string) => c === "▀" || c === "▄";
 const count = (frame: string) => [...frame].filter(isPixel).length;
-/// Frame rows 1-5 are the top stage's sprite rows (row 0 is padding, row 6 the ground).
+/// Frame rows 1-5 are the top stage's sprite rows (row 0 is the app's padding).
 const spriteColumns = (frame: string) => frame.split("\n").slice(1, 6).flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
 
 async function mount(width: number, height: number, props: Partial<AppProps> = {}) {
@@ -47,13 +47,13 @@ test("a new session shows the elephant at the top, centred, and not on the perch
   expect(found(setup.renderer, "elephant-top")).toBe(true);
   expect(found(setup.renderer, "elephant-perch")).toBe(false);
   const frame = setup.captureCharFrame(), lines = frame.split("\n");
-  expect(count(lines.slice(0, 7).join("\n"))).toBeGreaterThan(20);        // drawn in the top rows
-  expect(count(lines.slice(7).join("\n"))).toBe(0);                       // and nowhere else
+  expect(count(lines.slice(0, 6).join("\n"))).toBeGreaterThan(20);        // drawn in the top rows
+  expect(count(lines.slice(6).join("\n"))).toBe(0);                       // and nowhere else: no floor under it
   const columns = spriteColumns(frame);
   expect(Math.min(...columns)).toBeGreaterThan(35); expect(Math.max(...columns)).toBeLessThan(65);
 }));
 
-test("sending the first prompt moves the elephant to the perch, bottom-right above the chat bar", () => run(100, 24, {}, async setup => {
+test("sending the first prompt moves the elephant to the perch, in the bottom-right corner beside the chat bar", () => run(100, 24, {}, async setup => {
   await setup.renderOnce();
   await send({ state: { ...initialSession("s"), pending_prompt: "hello" } });
   await settle();
@@ -63,9 +63,8 @@ test("sending the first prompt moves the elephant to the perch, bottom-right abo
   const lines = setup.captureCharFrame().split("\n");
   const rows = lines.flatMap((line, y) => [...line].some(isPixel) ? [y] : []);
   const columns = lines.flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
-  expect(Math.min(...columns)).toBeGreaterThan(80); expect(Math.max(...columns)).toBeLessThan(99);   // flush right, inside the padding
-  expect(Math.min(...rows)).toBeGreaterThan(10);                          // nothing left behind at the top
-  expect(Math.max(...rows)).toBeLessThan(19);                             // above the status row and the three-row input bar
+  expect(Math.min(...columns)).toBeGreaterThan(82); expect(Math.max(...columns)).toBeLessThan(99);   // flush right, inside the padding
+  expect(rows[0]).toBe(18); expect(rows.at(-1)).toBe(22);                 // five rows, ending on the input bar's last row
 }));
 
 test("a resumed session starts on the perch with no intro", () => run(100, 24, { resumed: true }, async setup => {
@@ -79,11 +78,19 @@ test("a terminal too small for it shows no elephant", async () => {
   await run(100, 12, {}, async setup => { await setup.renderOnce(); expect(count(setup.captureCharFrame())).toBe(0); });
 });
 
-test("the elephant never covers the status row or the input bar", () => run(100, 24, { resumed: true }, async setup => {
+test("the prompt bar stops short of the elephant, so it is never covered", () => run(100, 24, { resumed: true }, async setup => {
   await setup.renderOnce();
   const lines = setup.captureCharFrame().split("\n");
-  expect(count(lines.slice(-5).join("\n"))).toBe(0);
+  const pixels = lines.flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
+  const corner = lines.find(line => line.includes("┘"))!;                 // the input bar's bottom-right corner
+  expect(corner.indexOf("┘")).toBeLessThan(Math.min(...pixels));
   expect(lines.slice(-5).join("\n")).toContain("Message");
+}));
+
+test("without the elephant the prompt bar spans the full width", () => run(100, 24, {}, async setup => {
+  await setup.renderOnce();
+  const corner = setup.captureCharFrame().split("\n").find(line => line.includes("┘"))!;
+  expect(corner.indexOf("┘")).toBe(98);                                   // the intro elephant is up top, so the bar is not narrowed
 }));
 
 test("the intro plays on the engine's timeline and ends with the elephant standing at rest", () => run(100, 24, { animateMascot: true }, async setup => {
@@ -102,22 +109,20 @@ test("the intro plays on the engine's timeline and ends with the elephant standi
   expect(setup.captureCharFrame()).toBe(standing);
 }));
 
-test("the first prompt sends an animated elephant walking off to the right, then in again on the perch", () => run(100, 24, { animateMascot: true }, async setup => {
+test("the first prompt takes the top elephant away at once and the perch elephant walks in from the right", () => run(100, 24, { animateMascot: true }, async setup => {
   await act(async () => { engine.update(30_000); });                        // finish the intro
   await send({ animateMascot: true, state: { ...initialSession("s"), pending_prompt: "go" } });
   await settle();
-  await act(async () => { engine.update(1000); });                          // 12 ticks into the walk off
-  await setup.renderOnce();
-  expect(found(setup.renderer, "elephant-top")).toBe(true);
-  expect(Math.min(...spriteColumns(setup.captureCharFrame()))).toBeGreaterThan(50);   // moved right of where it stood
-  await act(async () => { engine.update(30_000); });                        // gone off the right edge
-  await settle();
-  expect(found(setup.renderer, "elephant-top")).toBe(false);
+  expect(found(setup.renderer, "elephant-top")).toBe(false);                // no walk off: gone as the prompt is sent
   expect(found(setup.renderer, "elephant-perch")).toBe(true);
-  await act(async () => { engine.update(30_000); });                        // and in again, resting
+  await act(async () => { engine.update(400); });                           // five ticks into the walk in
+  await setup.renderOnce();
+  const entering = setup.captureCharFrame().split("\n").flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
+  expect(Math.min(...entering)).toBeGreaterThan(90);                        // still at the right edge, not yet at rest
+  await act(async () => { engine.update(30_000); });                        // and in, resting
   await setup.renderOnce();
   const rows = setup.captureCharFrame().split("\n").flatMap((line, y) => [...line].some(isPixel) ? [y] : []);
-  expect(Math.min(...rows)).toBeGreaterThan(10);
+  expect(rows[0]).toBe(18); expect(rows.at(-1)).toBe(22);
 }));
 
 test("the perch flaps once after a random 30-90 s pause, then goes still and waits again", async () => {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { engine, FrameBufferRenderable, Timeline } from "@opentui/core";
 import { extend, useRenderer } from "@opentui/react";
 import { paintFrame, type Stage } from "./paint";
-import { exitFrames, flapFrames, introFrames, nextFlapDelayMs, perchEnterFrames, perchFrame, TICK_MS, type Frame } from "./scenes";
+import { flapFrames, introFrames, nextFlapDelayMs, perchEnterFrames, perchFrame, TICK_MS, type Frame } from "./scenes";
 import { SPRITE_COLS } from "./sprites";
 
 extend({ "frame-buffer": FrameBufferRenderable });
@@ -10,9 +10,12 @@ declare module "@opentui/react" {
   interface OpenTUIComponents { "frame-buffer": typeof FrameBufferRenderable }
 }
 
-export const PERCH_COLS = 30;
-export const topStage = (cols: number): Stage => ({ cols, pixelRows: 12, top: 1, ground: true });
-export const perchStage: Stage = { cols: PERCH_COLS, pixelRows: 10, top: 0, ground: false };
+/// The perch stage is the elephant and one cell on its left: it walks in from the stage's right edge
+/// and stays inside the space the app sets aside for it, never over the prompt bar.
+export const PERCH_COLS = SPRITE_COLS + 1;
+export const PERCH_ROWS = 5;
+export const topStage = (cols: number): Stage => ({ cols, pixelRows: 10, top: 0 });
+export const perchStage: Stage = { cols: PERCH_COLS, pixelRows: PERCH_ROWS * 2, top: 0 };
 const rows = (stage: Stage) => stage.pixelRows / 2;
 
 /// Plays clips into a frame buffer on an OpenTUI timeline.
@@ -72,39 +75,30 @@ function usePlayer(stage: Stage) {
 
 export type TopElephantProps = {
   cols: number;
-  phase: "intro" | "exit";
-  onExited: () => void;
-  /// Tests turn this off: the intro then shows its final pose and the exit completes at once.
+  /// Tests turn this off: the intro then shows its final pose.
   animate?: boolean;
 };
 
-/// New-session stage: walks in, raises its trunk, flaps and stands; on the first prompt walks off right.
-export function TopElephant({ cols, phase, onExited, animate = true }: TopElephantProps) {
+/// New-session stage: walks in, raises its trunk, flaps and stands. The first prompt unmounts it.
+export function TopElephant({ cols, animate = true }: TopElephantProps) {
   const stage = topStage(cols);
-  const { buffer, play, show, shown } = usePlayer(stage);
-  const exited = useRef(onExited);
-  exited.current = onExited;
+  const { buffer, play, show } = usePlayer(stage);
   useEffect(() => {
-    if (phase === "intro") {
-      const frames = introFrames(cols);
-      if (animate) play(frames); else show(frames[frames.length - 1]);
-    } else if (animate) {
-      const from = shown.current?.x ?? Math.round((cols - SPRITE_COLS) / 2);
-      play(exitFrames(from, cols), () => exited.current());
-    } else exited.current();
-  }, [phase]);
+    const frames = introFrames(cols);
+    if (animate) play(frames); else show(frames[frames.length - 1]);
+  }, []);
   return <frame-buffer id="elephant-top" ref={buffer} respectAlpha width={cols} height={rows(stage)} />;
 }
 
 export type PerchElephantProps = {
-  /// Walk in from the right edge, as after leaving the top stage; otherwise just stand there.
+  /// Walk in from the right edge, as after the first prompt; otherwise just stand there.
   arrive: boolean;
   animate?: boolean;
   /// Random source for the pause between flaps; injectable so tests need no 30-90 s wait.
   rng?: () => number;
 };
 
-/// Bottom-right, above the chat bar. Stands still, and flaps its ears once after each random 30-90 s pause.
+/// Bottom-right corner, beside the chat bar. Stands still, and flaps its ears once after each random 30-90 s pause.
 export function PerchElephant({ arrive, animate = true, rng = Math.random }: PerchElephantProps) {
   const { buffer, play, show } = usePlayer(perchStage);
   useEffect(() => {

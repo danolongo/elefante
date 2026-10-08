@@ -606,6 +606,31 @@ async fn a_read_is_previewed_as_its_path_alone_while_the_model_gets_the_whole_fi
 }
 
 #[tokio::test]
+async fn a_large_write_is_previewed_as_valid_json_with_its_content_clipped() {
+    let content = "é".repeat(3000);
+    let input = serde_json::json!({"path": "big.txt", "content": content}).to_string();
+    let (events, session) = run_tool("write", &input, &[]).await;
+    let (preview, _) = previews(&events);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&preview).expect("the preview is still JSON");
+    assert_eq!(parsed["path"], "big.txt");
+    let shown = parsed["content"].as_str().unwrap();
+    assert!(
+        shown.len() <= 512
+            && shown.ends_with("\n…")
+            && content.starts_with(&shown[..shown.len() - "\n…".len()])
+    );
+    assert!(matches!(&session.messages()[2].content[0],
+        ContentBlock::ToolResult { content, .. } if content == "write complete"));
+}
+
+#[tokio::test]
+async fn a_small_input_is_previewed_unchanged() {
+    let (events, _) = run_tool("grep", "{\"pattern\":\"fn\"}", &[]).await;
+    assert_eq!(previews(&events).0, "{\"pattern\":\"fn\"}");
+}
+
+#[tokio::test]
 async fn a_failed_read_keeps_its_error_so_the_user_sees_why() {
     let (events, _) = run_tool("read", "{\"path\":\"missing.txt\"}", &[]).await;
     let (input, output) = previews(&events);

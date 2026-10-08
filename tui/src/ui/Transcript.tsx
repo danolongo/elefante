@@ -1,15 +1,16 @@
 import { flatSegments, type SessionState } from "../session";
 import type { Tool } from "../protocol";
 import { MARKDOWN_STYLE } from "./markdown";
+import { toolView } from "./toolView";
 
 function ToolCall({ tool }: { tool: Tool }) {
   const glyph = { running: "◌", ok: "✓", error: "✗", cancelled: "⊘" };
-  // A read is only its path: the daemon sends no file text, so the header carries everything.
-  const inline = tool.name === "read";
+  const { subject, body, failed } = toolView(tool);
   return <box flexDirection="column">
-    <text>{glyph[tool.state]} {tool.name}{inline && tool.input_preview ? ` ${tool.input_preview}` : ""}{tool.duration_ms === undefined ? "" : ` (${tool.duration_ms} ms)`}</text>
-    {!inline && tool.input_preview && <text fg="#999999">{tool.input_preview}</text>}
-    {tool.output_preview && <text fg={tool.is_error ? "#ff7777" : "#999999"}>{tool.output_preview}</text>}
+    <text>{glyph[tool.state]} {tool.name}{subject && ` ${subject}`}{tool.duration_ms === undefined ? "" : ` (${tool.duration_ms} ms)`}</text>
+    {body.length > 0 && <box flexDirection="column" paddingLeft={4}>
+      {body.map((line, i) => <text key={i} fg={failed ? "#ff7777" : "#999999"}>{line}</text>)}
+    </box>}
   </box>;
 }
 /**

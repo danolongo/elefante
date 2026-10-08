@@ -446,7 +446,9 @@ removed span replaced by exactly `\n…`.
 **Previews are tool-aware.** A `read` is previewed as just the path it was given
 (`input_preview: "src/x.rs"`, falling back to the raw input if `path` is missing or not a string),
 and a successful `read` sends an empty `output_preview`; a failed one keeps its error text. The
-model still receives the whole file. Every other tool previews its raw input and its output.
+model still receives the whole file. Every other tool previews its input as JSON in which each
+string value is clipped to 512 bytes (the strings, not the serialized text, so a long `write` body
+cannot cut the JSON in half and clients can always parse it), and its output as text.
 
 ### Attach and resume
 

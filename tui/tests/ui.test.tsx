@@ -74,10 +74,21 @@ const drawn = async (state: ReturnType<typeof initialSession>) => {
 test("a read is one line with its path, whether it is running, done or failed", async () => {
   expect(await drawn(withTool("read", "src/x.rs"))).toEqual(["◌ read src/x.rs"]);
   expect(await drawn(withTool("read", "src/x.rs", { is_error: false, output_preview: "" }))).toEqual(["✓ read src/x.rs (3 ms)"]);
-  expect(await drawn(withTool("read", "src/x.rs", { is_error: true, output_preview: "read failed: nope" }))).toEqual(["✗ read src/x.rs (3 ms)", "read failed: nope"]);
+  expect(await drawn(withTool("read", "src/x.rs", { is_error: true, output_preview: "read failed: nope" }))).toEqual(["✗ read src/x.rs (3 ms)", "    read failed: nope"]);
 });
-test("other tools keep their input and output on lines of their own", async () => {
-  expect(await drawn(withTool("bash", "ls", { is_error: false, output_preview: "file" }))).toEqual(["✓ bash (3 ms)", "ls", "file"]);
+const done = (output_preview: string, is_error = false) => ({ is_error, output_preview });
+test("every tool is a header saying what it did and a body indented four spaces, running or done", async () => {
+  expect(await drawn(withTool("bash", '{"command":"ls src"}'))).toEqual(["◌ bash `ls src`"]);
+  expect(await drawn(withTool("bash", '{"command":"ls src"}', done("main.rs\nlib.rs")))).toEqual(["✓ bash `ls src` (3 ms)", "    main.rs", "    lib.rs"]);
+  expect(await drawn(withTool("bash", '{"command":"false"}', done("exit status: 1", true)))).toEqual(["✗ bash `false` (3 ms)", "    exit status: 1"]);
+  expect(await drawn(withTool("write", '{"path":"a.txt","content":"one\\ntwo"}', done("write complete")))).toEqual(["✓ write a.txt (3 ms)", "    one", "    two"]);
+  expect(await drawn(withTool("edit", '{"path":"x.rs","old_string":"foo","new_string":"bar\\nbaz"}', done("edit complete")))).toEqual(["✓ edit x.rs (3 ms)", "    - foo", "    + bar…"]);
+  expect(await drawn(withTool("glob", '{"pattern":"**/*.rs","path":"crates"}', done("crates/a.rs")))).toEqual(["✓ glob `**/*.rs` in crates (3 ms)", "    crates/a.rs"]);
+  expect(await drawn(withTool("grep", '{"pattern":"fn x"}', done("a.rs:1:fn x()")))).toEqual(["✓ grep `fn x` (3 ms)", "    a.rs:1:fn x()"]);
+  expect(await drawn(withTool("memory_search", '{"query":"where it lives","limit":5}', done("a.rs:1")))).toEqual(["✓ memory_search where it lives (limit: 5) (3 ms)", "    a.rs:1"]);
+});
+test("a body never runs past three lines", async () => {
+  expect(await drawn(withTool("bash", '{"command":"seq 9"}', done("1\n2\n3\n4\n5")))).toEqual(["✓ bash `seq 9` (3 ms)", "    1", "    2", "    3 …"]);
 });
 test("a turn restored from a snapshot, which has no ordering, draws its text and then its tools", async () => {
   const state = { ...initialSession("s"), turns: [{ turn_id: "t", prompt: "", text: "Restored text.", tools: [{ tool_call_id: "c", name: "bash", state: "ok" as const, is_error: false }], stop_reason: "end_turn" as const, usage: emptyUsage() }] };

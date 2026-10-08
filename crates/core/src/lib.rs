@@ -674,22 +674,46 @@ const TRUNCATION_MARKER: &str = "\n…";
 
 /// Client previews are bounded independently of model-facing tool results.
 fn preview(value: &str) -> String {
-    const LIMIT: usize = 2048;
-    if value.len() <= LIMIT {
+    clip(value, 2048)
+}
+
+/// Cut `value` to at most `limit` bytes, on a character boundary, ending in the truncation marker.
+fn clip(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
         return value.to_owned();
     }
-    let mut end = LIMIT - TRUNCATION_MARKER.len();
+    let mut end = limit - TRUNCATION_MARKER.len();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
     format!("{}{TRUNCATION_MARKER}", &value[..end])
 }
 
-/// The client preview of a tool call's input. A `read` is shown as just the path it was given.
+/// A copy of `value` with every string clipped to `limit` bytes. Clipping the values rather than the
+/// serialized text keeps a long field (a file being written) from cutting the JSON itself in half.
+fn clip_strings(value: &Value, limit: usize) -> Value {
+    match value {
+        Value::String(text) => Value::String(clip(text, limit)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| clip_strings(item, limit)).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, field)| (key.clone(), clip_strings(field, limit)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The client preview of a tool call's input. A `read` is shown as just the path it was given; any
+/// other call is its input as JSON with long strings clipped, so clients can still parse it.
 fn input_preview(tool: &str, input: &Value) -> String {
+    const STRING_LIMIT: usize = 512;
     match (tool, input.get("path").and_then(Value::as_str)) {
         ("read", Some(path)) => preview(path),
-        _ => preview(&input.to_string()),
+        _ => preview(&clip_strings(input, STRING_LIMIT).to_string()),
     }
 }
 

@@ -669,18 +669,34 @@ fn provider_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Marks where a client preview was cut, whether by size or by line count.
+const TRUNCATION_MARKER: &str = "\n…";
+/// A `read` result is shown to clients as only its opening lines; the model still gets all of it.
+const READ_PREVIEW_LINES: usize = 3;
+
 /// Client previews are bounded independently of model-facing tool results.
 fn preview(value: &str) -> String {
     const LIMIT: usize = 2048;
-    const MARKER: &str = "\n… [truncated]";
     if value.len() <= LIMIT {
         return value.to_owned();
     }
-    let mut end = LIMIT - MARKER.len();
+    let mut end = LIMIT - TRUNCATION_MARKER.len();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{MARKER}", &value[..end])
+    format!("{}{TRUNCATION_MARKER}", &value[..end])
+}
+
+/// The client preview of a finished tool. A successful `read` shows its first lines only.
+fn output_preview(tool: &str, result: &ToolResult) -> String {
+    if tool == "read" && !result.is_error {
+        let mut lines = result.content.lines();
+        let head: Vec<&str> = lines.by_ref().take(READ_PREVIEW_LINES).collect();
+        if lines.next().is_some() {
+            return preview(&format!("{}{TRUNCATION_MARKER}", head.join("\n")));
+        }
+    }
+    preview(&result.content)
 }
 
 fn tool_error(content: impl Into<String>) -> ToolResult {
@@ -827,7 +843,7 @@ where
                 if let Ok((index, result, duration_ms)) = joined {
                     let call = &calls[index];
                     emit(OutputEvent::ToolFinished { id: call.id.clone(), name: call.name.clone(),
-                        is_error: result.is_error, output_preview: preview(&result.content), duration_ms });
+                        is_error: result.is_error, output_preview: output_preview(&call.name, &result), duration_ms });
                     finished.insert(index);
                     results.insert(index, (result, duration_ms));
                 }
@@ -897,7 +913,7 @@ where
                     id: call.id.clone(),
                     name: call.name.clone(),
                     is_error: result.is_error,
-                    output_preview: preview(&result.content),
+                    output_preview: output_preview(&call.name, &result),
                     duration_ms,
                 });
             }

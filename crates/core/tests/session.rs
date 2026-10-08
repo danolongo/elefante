@@ -547,6 +547,48 @@ async fn cancellation_keeps_completed_results_and_pairs_pending_approval() {
 }
 
 #[tokio::test]
+async fn a_read_preview_shows_only_the_first_three_lines_while_the_model_gets_the_whole_file() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    std::fs::write(repo.path().join("long"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    std::fs::write(repo.path().join("short"), "one\ntwo\nthree\n").unwrap();
+    let read = |id: &str, path: &str| {
+        vec![
+            Event::ToolUseStart {
+                id: id.into(),
+                name: "read".into(),
+            },
+            Event::ToolUseInputDelta(format!("{{\"path\":\"{path}\"}}")),
+            Event::Stop(StopReason::ToolUse),
+        ]
+    };
+    let provider = Script::new(vec![read("a", "long"), read("b", "short"), end("done")]);
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "read",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    let previews: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            OutputEvent::ToolFinished { output_preview, .. } => Some(output_preview.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(previews, ["one\ntwo\nthree\n…", "one\ntwo\nthree\n"]);
+    assert!(matches!(&session.messages()[2].content[0],
+        ContentBlock::ToolResult { content, .. } if content == "one\ntwo\nthree\nfour\nfive\n"));
+}
+
+#[tokio::test]
 async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
     let repo = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(repo.path()).unwrap();
@@ -584,7 +626,7 @@ async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
     );
     assert!(events.iter().any(
         |event| matches!(event, OutputEvent::ToolFinished { output_preview, .. }
-        if output_preview.len() <= 2048 && output_preview.ends_with("\n… [truncated]"))
+        if output_preview.len() <= 2048 && output_preview.ends_with("\n…"))
     ));
     assert!(
         matches!(&session.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content == &text)

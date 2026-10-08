@@ -441,7 +441,7 @@ reported*, which is distinct from `0.0`:
 ```
 
 **Previews are cut at 2 KiB** on a UTF-8 character boundary, never mid-codepoint, with the
-removed span replaced by exactly `\n… [truncated]`.
+removed span replaced by exactly `\n…`.
 
 ### Attach and resume
 

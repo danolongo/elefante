@@ -328,7 +328,7 @@ fn previews_are_byte_capped_including_exact_marker_without_splitting_utf8() {
     for value in [String::new(), "hello".into(), "x".repeat(PREVIEW_BYTES)] {
         assert_eq!(truncate_preview(&value), value);
     }
-    assert_eq!(TRUNCATION_MARKER, "\n… [truncated]");
+    assert_eq!(TRUNCATION_MARKER, "\n…");
 }
 
 #[test]

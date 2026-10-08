@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use elefante_core::{
@@ -429,6 +430,97 @@ impl ApprovalSink for ControlledApproval {
     }
 }
 
+/// Waits a fixed time, as a person deciding would, and then approves.
+struct SlowApproval(Duration);
+
+impl ApprovalSink for SlowApproval {
+    fn request<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, ApprovalOutcome> {
+        Box::pin(async move {
+            tokio::time::sleep(self.0).await;
+            ApprovalOutcome::Approved
+        })
+    }
+}
+
+fn finished_duration(events: &[OutputEvent], call: &str) -> u64 {
+    events
+        .iter()
+        .find_map(|event| match event {
+            OutputEvent::ToolFinished {
+                id, duration_ms, ..
+            } if id == call => Some(*duration_ms),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no tool.finished for {call}"))
+}
+
+#[tokio::test]
+async fn waiting_for_approval_is_not_counted_in_a_tools_duration() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let mut round = tool("ask", "printf x > out");
+    round.push(Event::Stop(StopReason::ToolUse));
+    let provider = Script::new(vec![round, end("done")]);
+    let gate = ToolGate::new(Arc::new(SlowApproval(Duration::from_millis(600))));
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    let began = Instant::now();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &gate,
+            "test",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_millis(600),
+        "the approval wait happened"
+    );
+    assert!(repo.path().join("out").exists(), "and the command then ran");
+    let reported = finished_duration(&events, "ask");
+    assert!(
+        reported < 400,
+        "reported {reported} ms, which includes the wait"
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_never_ran_reports_zero() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("marker"), "keep").unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let mut round = Vec::new();
+    for (id, command) in [("deny", "rm marker"), ("ask", "touch created")] {
+        round.extend(tool(id, command));
+    }
+    round.push(Event::Stop(StopReason::ToolUse));
+    let provider = Script::new(vec![round, end("done")]);
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "test",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(!repo.path().join("created").exists());
+    assert_eq!(finished_duration(&events, "deny"), 0, "denied by policy");
+    assert_eq!(finished_duration(&events, "ask"), 0, "denied by the user");
+}
+
 #[tokio::test]
 async fn approval_suspends_then_executes_or_denies() {
     for outcome in [ApprovalOutcome::Approved, ApprovalOutcome::Denied] {
@@ -519,6 +611,8 @@ async fn cancellation_keeps_completed_results_and_pairs_pending_approval() {
     assert!(
         matches!(&results[1], ContentBlock::ToolResult { tool_use_id, is_error: true, content } if tool_use_id == "pending" && content == "interrupted")
     );
+    // Interrupted while still waiting for approval: it never ran, so it has no duration.
+    assert_eq!(finished_duration(&events, "pending"), 0);
     assert_eq!(
         events
             .iter()

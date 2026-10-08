@@ -5,7 +5,7 @@ pub mod memory;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -738,19 +738,47 @@ struct ToolEvent {
     published: Option<oneshot::Sender<()>>,
 }
 
-async fn execute_one(
-    tools: ToolExecutor,
-    call: ToolCall,
-    decision: GateDecision,
+/// When a call actually began executing; unset while it waits for approval and for a call that never
+/// ran. A shared cell, so an interrupted call's aborted task still leaves its start behind.
+type ExecClock = Arc<OnceLock<Instant>>;
+
+/// Milliseconds since execution began: what a tool call reports as its duration. Waiting for
+/// approval is not execution, so a call that never started reports 0.
+fn elapsed_ms(started: Option<&Instant>) -> u64 {
+    started.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// What one call needs to ask for approval, be cancelled, and record when it began executing.
+struct CallControl {
     approvals: Arc<dyn ApprovalSink>,
     approval_slot: Arc<Mutex<()>>,
     cancel: CancellationToken,
     events: mpsc::UnboundedSender<ToolEvent>,
+    clock: ExecClock,
+}
+
+async fn execute_one(
+    tools: ToolExecutor,
+    call: ToolCall,
+    decision: GateDecision,
+    control: CallControl,
 ) -> ToolResult {
+    let CallControl {
+        approvals,
+        approval_slot,
+        cancel,
+        events,
+        clock,
+    } = control;
     match decision {
         GateDecision::Deny { rule } => tool_error(format!("bash denied by policy: {rule}")),
         GateDecision::Allow if cancel.is_cancelled() => tool_error("interrupted"),
-        GateDecision::Allow => tools.execute(&call.name, call.input).await,
+        GateDecision::Allow => {
+            let _ = clock.set(Instant::now());
+            tools.execute(&call.name, call.input).await
+        }
         GateDecision::Escalate { rule, command } => {
             static APPROVAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
             let slot = tokio::select! {
@@ -792,6 +820,7 @@ async fn execute_one(
             });
             drop(slot);
             if approved {
+                let _ = clock.set(Instant::now());
                 tools.execute(&call.name, call.input).await
             } else if outcome == ApprovalOutcome::Cancelled || cancel.is_cancelled() {
                 tool_error("interrupted")
@@ -818,7 +847,7 @@ where
     let mut pending = HashSet::new();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let approval_slot = Arc::new(Mutex::new(()));
-    let started = Instant::now();
+    let clocks: Vec<ExecClock> = calls.iter().map(|_| ExecClock::default()).collect();
     for (index, call) in calls.iter().enumerate() {
         emit(OutputEvent::ToolStarted {
             id: call.id.clone(),
@@ -832,23 +861,17 @@ where
         let approval_slot = Arc::clone(&approval_slot);
         let cancel = cancel.clone();
         let events_tx = events_tx.clone();
+        let clock = Arc::clone(&clocks[index]);
         set.spawn(async move {
-            let start = Instant::now();
-            let result = execute_one(
-                tools,
-                call,
-                decision,
+            let control = CallControl {
                 approvals,
                 approval_slot,
                 cancel,
-                events_tx,
-            )
-            .await;
-            (
-                index,
-                result,
-                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )
+                events: events_tx,
+                clock: Arc::clone(&clock),
+            };
+            let result = execute_one(tools, call, decision, control).await;
+            (index, result, elapsed_ms(clock.get()))
         });
     }
     drop(events_tx);
@@ -887,7 +910,7 @@ where
             approved: false,
         });
     }
-    finish_calls(calls, results, &finished, cancel, started, emit)
+    finish_calls(calls, results, &finished, cancel, &clocks, emit)
 }
 
 fn publish_tool_event<F: FnMut(OutputEvent)>(
@@ -915,7 +938,7 @@ fn finish_calls<F>(
     mut results: HashMap<usize, (ToolResult, u64)>,
     finished: &HashSet<usize>,
     cancel: &CancellationToken,
-    started: Instant,
+    clocks: &[ExecClock],
     emit: &mut F,
 ) -> Vec<ToolResult>
 where
@@ -932,7 +955,7 @@ where
                     } else {
                         "tool task failed"
                     }),
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    elapsed_ms(clocks[index].get()),
                 )
             });
             if !finished.contains(&index) {

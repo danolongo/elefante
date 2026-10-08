@@ -421,6 +421,11 @@ a prose reason is the M4 triage-critic verdict.
 `approval.resolved` is required by fanout — with several clients attached, one resolves the
 prompt and the rest must dismiss their modal.
 
+**`duration_ms` is execution time only.** It starts when the tool begins running, so time spent
+queued for or waiting on an approval is not counted. A call that never ran (denied by policy or
+by the user, or interrupted while waiting for approval) reports `0`; one interrupted while running
+reports how long it ran.
+
 Reasoning *replay* state (`ReasoningDetails`) is never sent to clients. It exists so the next
 request can echo it verbatim; rendering it would present internal replay tokens as output.
 

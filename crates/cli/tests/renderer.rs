@@ -97,3 +97,15 @@ fn tool_lifecycle_is_visible_without_breaking_reasoning_deltas() {
         b"thought\n[read] note.txt\n[c1] done (2 ms): contents\n"
     );
 }
+
+#[test]
+fn a_tool_with_no_output_preview_ends_without_a_dangling_colon() {
+    let mut renderer = StreamRenderer::new(Vec::new(), false);
+    renderer
+        .render(&note(
+            "tool.finished",
+            json!({"tool_call_id":"c1","is_error":false,"output_preview":"","duration_ms":2}),
+        ))
+        .unwrap();
+    assert_eq!(renderer.into_inner(), b"[c1] done (2 ms)\n");
+}

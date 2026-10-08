@@ -1,6 +1,6 @@
 /// Pixel art for the mascot, ported from the "8-bit Elephant TUI Animations" design project.
 /// One character is one pixel; `.` is transparent. Two pixel rows share one terminal row.
-export const PALETTE: Record<string, string> = { A: "#464646", B: "#b4b4b4", C: "#000000", G: "#2b2d31" };
+export const PALETTE: Record<string, string> = { A: "#464646", B: "#b4b4b4", C: "#000000", L: "#d3d3d3" };
 
 export type Ear = "n" | "s" | "o";
 export type Trunk = "down" | "mid" | "up";

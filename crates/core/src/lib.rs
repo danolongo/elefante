@@ -5,7 +5,7 @@ pub mod memory;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -669,18 +669,61 @@ fn provider_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Marks where a client preview was cut.
+const TRUNCATION_MARKER: &str = "\n…";
+
 /// Client previews are bounded independently of model-facing tool results.
 fn preview(value: &str) -> String {
-    const LIMIT: usize = 2048;
-    const MARKER: &str = "\n… [truncated]";
-    if value.len() <= LIMIT {
+    clip(value, 2048)
+}
+
+/// Cut `value` to at most `limit` bytes, on a character boundary, ending in the truncation marker.
+fn clip(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
         return value.to_owned();
     }
-    let mut end = LIMIT - MARKER.len();
+    let mut end = limit - TRUNCATION_MARKER.len();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{MARKER}", &value[..end])
+    format!("{}{TRUNCATION_MARKER}", &value[..end])
+}
+
+/// A copy of `value` with every string clipped to `limit` bytes. Clipping the values rather than the
+/// serialized text keeps a long field (a file being written) from cutting the JSON itself in half.
+fn clip_strings(value: &Value, limit: usize) -> Value {
+    match value {
+        Value::String(text) => Value::String(clip(text, limit)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| clip_strings(item, limit)).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, field)| (key.clone(), clip_strings(field, limit)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The client preview of a tool call's input. A `read` is shown as just the path it was given; any
+/// other call is its input as JSON with long strings clipped, so clients can still parse it.
+fn input_preview(tool: &str, input: &Value) -> String {
+    const STRING_LIMIT: usize = 512;
+    match (tool, input.get("path").and_then(Value::as_str)) {
+        ("read", Some(path)) => preview(path),
+        _ => preview(&clip_strings(input, STRING_LIMIT).to_string()),
+    }
+}
+
+/// The client preview of a finished tool. A successful `read` shows nothing: the call line already
+/// says which file was read, and the model still gets all of it.
+fn output_preview(tool: &str, result: &ToolResult) -> String {
+    if tool == "read" && !result.is_error {
+        return String::new();
+    }
+    preview(&result.content)
 }
 
 fn tool_error(content: impl Into<String>) -> ToolResult {
@@ -695,19 +738,47 @@ struct ToolEvent {
     published: Option<oneshot::Sender<()>>,
 }
 
-async fn execute_one(
-    tools: ToolExecutor,
-    call: ToolCall,
-    decision: GateDecision,
+/// When a call actually began executing; unset while it waits for approval and for a call that never
+/// ran. A shared cell, so an interrupted call's aborted task still leaves its start behind.
+type ExecClock = Arc<OnceLock<Instant>>;
+
+/// Milliseconds since execution began: what a tool call reports as its duration. Waiting for
+/// approval is not execution, so a call that never started reports 0.
+fn elapsed_ms(started: Option<&Instant>) -> u64 {
+    started.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// What one call needs to ask for approval, be cancelled, and record when it began executing.
+struct CallControl {
     approvals: Arc<dyn ApprovalSink>,
     approval_slot: Arc<Mutex<()>>,
     cancel: CancellationToken,
     events: mpsc::UnboundedSender<ToolEvent>,
+    clock: ExecClock,
+}
+
+async fn execute_one(
+    tools: ToolExecutor,
+    call: ToolCall,
+    decision: GateDecision,
+    control: CallControl,
 ) -> ToolResult {
+    let CallControl {
+        approvals,
+        approval_slot,
+        cancel,
+        events,
+        clock,
+    } = control;
     match decision {
         GateDecision::Deny { rule } => tool_error(format!("bash denied by policy: {rule}")),
         GateDecision::Allow if cancel.is_cancelled() => tool_error("interrupted"),
-        GateDecision::Allow => tools.execute(&call.name, call.input).await,
+        GateDecision::Allow => {
+            let _ = clock.set(Instant::now());
+            tools.execute(&call.name, call.input).await
+        }
         GateDecision::Escalate { rule, command } => {
             static APPROVAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
             let slot = tokio::select! {
@@ -749,6 +820,7 @@ async fn execute_one(
             });
             drop(slot);
             if approved {
+                let _ = clock.set(Instant::now());
                 tools.execute(&call.name, call.input).await
             } else if outcome == ApprovalOutcome::Cancelled || cancel.is_cancelled() {
                 tool_error("interrupted")
@@ -775,12 +847,12 @@ where
     let mut pending = HashSet::new();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let approval_slot = Arc::new(Mutex::new(()));
-    let started = Instant::now();
+    let clocks: Vec<ExecClock> = calls.iter().map(|_| ExecClock::default()).collect();
     for (index, call) in calls.iter().enumerate() {
         emit(OutputEvent::ToolStarted {
             id: call.id.clone(),
             name: call.name.clone(),
-            input_preview: preview(&call.input.to_string()),
+            input_preview: input_preview(&call.name, &call.input),
         });
         let decision = gate.check_in(&call.name, &call.input, tools.root());
         let tools = tools.clone();
@@ -789,23 +861,17 @@ where
         let approval_slot = Arc::clone(&approval_slot);
         let cancel = cancel.clone();
         let events_tx = events_tx.clone();
+        let clock = Arc::clone(&clocks[index]);
         set.spawn(async move {
-            let start = Instant::now();
-            let result = execute_one(
-                tools,
-                call,
-                decision,
+            let control = CallControl {
                 approvals,
                 approval_slot,
                 cancel,
-                events_tx,
-            )
-            .await;
-            (
-                index,
-                result,
-                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )
+                events: events_tx,
+                clock: Arc::clone(&clock),
+            };
+            let result = execute_one(tools, call, decision, control).await;
+            (index, result, elapsed_ms(clock.get()))
         });
     }
     drop(events_tx);
@@ -827,7 +893,7 @@ where
                 if let Ok((index, result, duration_ms)) = joined {
                     let call = &calls[index];
                     emit(OutputEvent::ToolFinished { id: call.id.clone(), name: call.name.clone(),
-                        is_error: result.is_error, output_preview: preview(&result.content), duration_ms });
+                        is_error: result.is_error, output_preview: output_preview(&call.name, &result), duration_ms });
                     finished.insert(index);
                     results.insert(index, (result, duration_ms));
                 }
@@ -844,7 +910,7 @@ where
             approved: false,
         });
     }
-    finish_calls(calls, results, &finished, cancel, started, emit)
+    finish_calls(calls, results, &finished, cancel, &clocks, emit)
 }
 
 fn publish_tool_event<F: FnMut(OutputEvent)>(
@@ -872,7 +938,7 @@ fn finish_calls<F>(
     mut results: HashMap<usize, (ToolResult, u64)>,
     finished: &HashSet<usize>,
     cancel: &CancellationToken,
-    started: Instant,
+    clocks: &[ExecClock],
     emit: &mut F,
 ) -> Vec<ToolResult>
 where
@@ -889,7 +955,7 @@ where
                     } else {
                         "tool task failed"
                     }),
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    elapsed_ms(clocks[index].get()),
                 )
             });
             if !finished.contains(&index) {
@@ -897,7 +963,7 @@ where
                     id: call.id.clone(),
                     name: call.name.clone(),
                     is_error: result.is_error,
-                    output_preview: preview(&result.content),
+                    output_preview: output_preview(&call.name, &result),
                     duration_ms,
                 });
             }

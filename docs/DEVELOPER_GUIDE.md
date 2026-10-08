@@ -421,6 +421,11 @@ a prose reason is the M4 triage-critic verdict.
 `approval.resolved` is required by fanout — with several clients attached, one resolves the
 prompt and the rest must dismiss their modal.
 
+**`duration_ms` is execution time only.** It starts when the tool begins running, so time spent
+queued for or waiting on an approval is not counted. A call that never ran (denied by policy or
+by the user, or interrupted while waiting for approval) reports `0`; one interrupted while running
+reports how long it ran.
+
 Reasoning *replay* state (`ReasoningDetails`) is never sent to clients. It exists so the next
 request can echo it verbatim; rendering it would present internal replay tokens as output.
 
@@ -441,7 +446,14 @@ reported*, which is distinct from `0.0`:
 ```
 
 **Previews are cut at 2 KiB** on a UTF-8 character boundary, never mid-codepoint, with the
-removed span replaced by exactly `\n… [truncated]`.
+removed span replaced by exactly `\n…`.
+
+**Previews are tool-aware.** A `read` is previewed as just the path it was given
+(`input_preview: "src/x.rs"`, falling back to the raw input if `path` is missing or not a string),
+and a successful `read` sends an empty `output_preview`; a failed one keeps its error text. The
+model still receives the whole file. Every other tool previews its input as JSON in which each
+string value is clipped to 512 bytes (the strings, not the serialized text, so a long `write` body
+cannot cut the JSON in half and clients can always parse it), and its output as text.
 
 ### Attach and resume
 

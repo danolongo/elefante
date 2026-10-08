@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use elefante_core::{
@@ -429,6 +430,97 @@ impl ApprovalSink for ControlledApproval {
     }
 }
 
+/// Waits a fixed time, as a person deciding would, and then approves.
+struct SlowApproval(Duration);
+
+impl ApprovalSink for SlowApproval {
+    fn request<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, ApprovalOutcome> {
+        Box::pin(async move {
+            tokio::time::sleep(self.0).await;
+            ApprovalOutcome::Approved
+        })
+    }
+}
+
+fn finished_duration(events: &[OutputEvent], call: &str) -> u64 {
+    events
+        .iter()
+        .find_map(|event| match event {
+            OutputEvent::ToolFinished {
+                id, duration_ms, ..
+            } if id == call => Some(*duration_ms),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no tool.finished for {call}"))
+}
+
+#[tokio::test]
+async fn waiting_for_approval_is_not_counted_in_a_tools_duration() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let mut round = tool("ask", "printf x > out");
+    round.push(Event::Stop(StopReason::ToolUse));
+    let provider = Script::new(vec![round, end("done")]);
+    let gate = ToolGate::new(Arc::new(SlowApproval(Duration::from_millis(600))));
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    let began = Instant::now();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &gate,
+            "test",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_millis(600),
+        "the approval wait happened"
+    );
+    assert!(repo.path().join("out").exists(), "and the command then ran");
+    let reported = finished_duration(&events, "ask");
+    assert!(
+        reported < 400,
+        "reported {reported} ms, which includes the wait"
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_never_ran_reports_zero() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("marker"), "keep").unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let mut round = Vec::new();
+    for (id, command) in [("deny", "rm marker"), ("ask", "touch created")] {
+        round.extend(tool(id, command));
+    }
+    round.push(Event::Stop(StopReason::ToolUse));
+    let provider = Script::new(vec![round, end("done")]);
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "test",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(!repo.path().join("created").exists());
+    assert_eq!(finished_duration(&events, "deny"), 0, "denied by policy");
+    assert_eq!(finished_duration(&events, "ask"), 0, "denied by the user");
+}
+
 #[tokio::test]
 async fn approval_suspends_then_executes_or_denies() {
     for outcome in [ApprovalOutcome::Approved, ApprovalOutcome::Denied] {
@@ -519,6 +611,8 @@ async fn cancellation_keeps_completed_results_and_pairs_pending_approval() {
     assert!(
         matches!(&results[1], ContentBlock::ToolResult { tool_use_id, is_error: true, content } if tool_use_id == "pending" && content == "interrupted")
     );
+    // Interrupted while still waiting for approval: it never ran, so it has no duration.
+    assert_eq!(finished_duration(&events, "pending"), 0);
     assert_eq!(
         events
             .iter()
@@ -546,21 +640,20 @@ async fn cancellation_keeps_completed_results_and_pairs_pending_approval() {
     assert_eq!(provider.requests.lock().unwrap()[1].messages.len(), 4);
 }
 
-#[tokio::test]
-async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
+/// Runs one scripted tool call against a temp workspace and returns every event and the session.
+async fn run_tool(name: &str, input: &str, files: &[(&str, &str)]) -> (Vec<OutputEvent>, Session) {
     let repo = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(repo.path()).unwrap();
-    let text = "é".repeat(3000);
-    std::fs::write(repo.path().join("large"), &text).unwrap();
+    for (path, content) in files {
+        std::fs::write(repo.path().join(path), content).unwrap();
+    }
     let provider = Script::new(vec![
         vec![
             Event::ToolUseStart {
-                id: "read".into(),
-                name: "read".into(),
+                id: "c".into(),
+                name: name.into(),
             },
-            Event::ToolUseInputDelta("{\"path\":".into()),
-            Event::TextDelta("before dispatch".into()),
-            Event::ToolUseInputDelta("\"large\"}".into()),
+            Event::ToolUseInputDelta(input.into()),
             Event::Stop(StopReason::ToolUse),
         ],
         end("done"),
@@ -572,7 +665,106 @@ async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
             &provider,
             &executor,
             &ToolGate::default(),
-            "read",
+            "go",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    (events, session)
+}
+
+fn previews(events: &[OutputEvent]) -> (String, String) {
+    let started = events.iter().find_map(|event| match event {
+        OutputEvent::ToolStarted { input_preview, .. } => Some(input_preview.clone()),
+        _ => None,
+    });
+    let finished = events.iter().find_map(|event| match event {
+        OutputEvent::ToolFinished { output_preview, .. } => Some(output_preview.clone()),
+        _ => None,
+    });
+    (started.unwrap(), finished.unwrap())
+}
+
+#[tokio::test]
+async fn a_read_is_previewed_as_its_path_alone_while_the_model_gets_the_whole_file() {
+    let (events, session) = run_tool(
+        "read",
+        "{\"path\":\"notes.txt\"}",
+        &[("notes.txt", "one\ntwo\nthree\nfour\n")],
+    )
+    .await;
+    assert_eq!(previews(&events), ("notes.txt".to_owned(), String::new()));
+    assert!(matches!(&session.messages()[2].content[0],
+        ContentBlock::ToolResult { content, .. } if content == "one\ntwo\nthree\nfour\n"));
+}
+
+#[tokio::test]
+async fn a_large_write_is_previewed_as_valid_json_with_its_content_clipped() {
+    let content = "é".repeat(3000);
+    let input = serde_json::json!({"path": "big.txt", "content": content}).to_string();
+    let (events, session) = run_tool("write", &input, &[]).await;
+    let (preview, _) = previews(&events);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&preview).expect("the preview is still JSON");
+    assert_eq!(parsed["path"], "big.txt");
+    let shown = parsed["content"].as_str().unwrap();
+    assert!(
+        shown.len() <= 512
+            && shown.ends_with("\n…")
+            && content.starts_with(&shown[..shown.len() - "\n…".len()])
+    );
+    assert!(matches!(&session.messages()[2].content[0],
+        ContentBlock::ToolResult { content, .. } if content == "write complete"));
+}
+
+#[tokio::test]
+async fn a_small_input_is_previewed_unchanged() {
+    let (events, _) = run_tool("grep", "{\"pattern\":\"fn\"}", &[]).await;
+    assert_eq!(previews(&events).0, "{\"pattern\":\"fn\"}");
+}
+
+#[tokio::test]
+async fn a_failed_read_keeps_its_error_so_the_user_sees_why() {
+    let (events, _) = run_tool("read", "{\"path\":\"missing.txt\"}", &[]).await;
+    let (input, output) = previews(&events);
+    assert_eq!(input, "missing.txt");
+    assert!(output.starts_with("read failed:"), "{output}");
+}
+
+#[tokio::test]
+async fn a_read_without_a_string_path_falls_back_to_its_raw_input() {
+    let (events, _) = run_tool("read", "{\"path\":7}", &[]).await;
+    assert_eq!(previews(&events).0, "{\"path\":7}");
+}
+
+#[tokio::test]
+async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let text = "é".repeat(3000);
+    std::fs::write(repo.path().join("large"), &text).unwrap();
+    let provider = Script::new(vec![
+        vec![
+            Event::ToolUseStart {
+                id: "grep".into(),
+                name: "grep".into(),
+            },
+            Event::ToolUseInputDelta("{\"pattern\":".into()),
+            Event::TextDelta("before dispatch".into()),
+            Event::ToolUseInputDelta("\"é\"}".into()),
+            Event::Stop(StopReason::ToolUse),
+        ],
+        end("done"),
+    ]);
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "grep",
             CancellationToken::new(),
             |event| events.push(event),
         )
@@ -580,14 +772,14 @@ async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
         .unwrap();
     assert!(matches!(&events[1], OutputEvent::TextDelta(_)));
     assert!(
-        matches!(&events[2], OutputEvent::ToolStarted { input_preview, .. } if input_preview == "{\"path\":\"large\"}")
+        matches!(&events[2], OutputEvent::ToolStarted { input_preview, .. } if input_preview == "{\"pattern\":\"é\"}")
     );
     assert!(events.iter().any(
         |event| matches!(event, OutputEvent::ToolFinished { output_preview, .. }
-        if output_preview.len() <= 2048 && output_preview.ends_with("\n… [truncated]"))
+        if output_preview.len() <= 2048 && output_preview.ends_with("\n…"))
     ));
     assert!(
-        matches!(&session.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content == &text)
+        matches!(&session.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content.len() > 2048 && content.contains(&text))
     );
 }
 

@@ -51,8 +51,13 @@ impl<W: Write> StreamRenderer<W> {
             } => self.write(
                 Channel::Tool,
                 &format!(
-                    "[{tool_call_id}] {} ({duration_ms} ms): {output_preview}\n",
-                    if *is_error { "error" } else { "done" }
+                    "[{tool_call_id}] {} ({duration_ms} ms){}\n",
+                    if *is_error { "error" } else { "done" },
+                    if output_preview.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {output_preview}")
+                    }
                 ),
                 false,
             ),

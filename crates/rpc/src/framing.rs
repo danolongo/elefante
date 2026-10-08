@@ -3,7 +3,7 @@ use std::fmt;
 
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const PREVIEW_BYTES: usize = 2 * 1024;
-pub const TRUNCATION_MARKER: &str = "\n… [truncated]";
+pub const TRUNCATION_MARKER: &str = "\n…";
 
 /// Cap the complete preview, including its marker, to 2 KiB of UTF-8.
 #[must_use]

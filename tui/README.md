@@ -23,13 +23,15 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | File | Lines | Contents |
 |---|---:|---|
 | `src/protocol.ts` | 238 | Framing, sequence windows, attach and gap handling, `connectOrExplain`. |
-| `src/session.ts` | 39 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. |
+| `src/session.ts` | 51 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. Keeps each turn's output as ordered `segments` (reasoning, text, tool calls). |
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
 | `src/main.tsx` | 102 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
-| `src/ui/Transcript.tsx` | 26 | Completed turns and the live turn; reasoning and answer as separate renderables. |
+| `src/ui/Transcript.tsx` | 46 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
-| `src/ui/App.tsx` | 35 | Composition and key handling; the prompt bar shares a row with the perched elephant. |
+| `src/ui/App.tsx` | 44 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
+| `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
+| `src/ui/copy.ts` | 22 | Where selected text goes: OSC52, plus `pbcopy` on macOS. |
 | `src/ui/Mascot.tsx` | 57 | `useMascot` decides which stage the elephant is on; `TopMascot` (with the wordmark) and `PerchMascot` place it. |
 | `src/ui/elephant/Elephant.tsx` | 113 | `TopElephant` and `PerchElephant`: a frame-buffer renderable played by an OpenTUI timeline. |
 | `src/ui/elephant/scenes.ts` | 61 | Pure frame clips (intro, perch entrance, idle flap) and the 30–90 s flap pause. |
@@ -50,8 +52,15 @@ and `--max-tokens` configure a new one. `ELEFANTE_SOCKET` selects an isolated da
 effort, and limits also read `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`, `ELEFANTE_MAX_ROUNDS`, and
 `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.
 
-Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**. Approval
+Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
+the model's reasoning (hidden at start; the "Thinking" line stays either way). Approval
 modals accept Y/N, and Esc there means *deny* — it does not also interrupt the turn.
+
+The answer is rendered as markdown (headings, lists, bold, italic, inline and fenced code).
+**Copying:** the terminal's own selection is blocked while the mouse is captured, so drag to select
+inside the TUI and the text is copied when you let go, through OSC52 and, on macOS, `pbcopy`.
+OSC52 works in Ghostty and iTerm2 (turn on "applications in terminal may access clipboard") and in
+tmux with `set-clipboard on`; macOS Terminal.app relies on the `pbcopy` path.
 
 "Exit" is a detach, not a shutdown: it closes this client's socket and leaves the session, its
 running turn, and the daemon untouched (`exit()` in `main.tsx` never sends `session.close`). A
@@ -119,21 +128,23 @@ sequence entries. Multiple live approvals are retained locally, while a snapshot
 the one pending approval the contract provides.
 
 Snapshots do not include completed reasoning, the active prompt, or the elapsed start time, so
-those cannot be reconstructed on a fresh attachment. The daemon's retained history is unbounded
+those cannot be reconstructed on a fresh attachment. They also carry text and tool calls as two
+flat lists, so a turn restored from one is drawn text first and its tool calls after; only turns
+streamed live keep the interleaved order. The daemon's retained history is unbounded
 — see [`../docs/DEVELOPER_GUIDE.md`](../docs/DEVELOPER_GUIDE.md) §14.
 
 ## Testing
 
 ```sh
-bun test              # 47 tests
+bun test              # 56 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (8)
+no-daemon failure path. `tests/session.test.ts` (8) covers the reducer. `tests/ui.test.tsx` (14)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
 asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, wordmark, clips, flap pause and phase transitions
-as pure functions; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling
+as pure functions; `tests/copy.test.ts` (2) covers where copied text goes; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling
 `engine.update(ms)`, so no test waits on a real clock. `App`'s `animateMascot={false}` makes the elephant
 paint its resting pose.
 

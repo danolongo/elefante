@@ -6,7 +6,7 @@ import { createTestRenderer } from "@opentui/core/testing";
 import { publish } from "../src/store";
 import { Root } from "../src/ui/Root";
 import type { AppProps } from "../src/ui/App";
-import { initialSession, reduceSession } from "../src/session";
+import { emptyUsage, initialSession, reduceSession } from "../src/session";
 import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
 import { Input } from "../src/ui/Input";
@@ -16,24 +16,62 @@ import { note, stream } from "./fixtures";
 
 // A lone ESC byte is ambiguous with the start of an escape sequence, so OpenTUI's stdin parser
 // holds it for 20 ms before reporting it. Real terminals see the same delay.
+/// Markdown is highlighted by a tree-sitter worker, so its first frame lands a moment after the render.
+const until = async (setup: { renderOnce(): Promise<void>; captureCharFrame(): string }, text: string) => {
+  for (let i = 0; i < 40 && !setup.captureCharFrame().includes(text); i++) { await new Promise(resolve => setTimeout(resolve, 50)); await setup.renderOnce(); }
+};
+const answered = (text: string, reasoning = "") => [
+  note(1, "turn.started"), ...(reasoning ? [note(2, "reasoning.delta", { text: reasoning })] : []),
+  note(3, "text.delta", { text }), note(4, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }),
+].reduce((s, n) => reduceSession(s, n), initialSession("s"));
 const pressEscape = async (setup: { mockInput: { pressEscape(): void } }) => {
   await act(async () => setup.mockInput.pressEscape());
   await new Promise(resolve => setTimeout(resolve, 60));
 };
 
-test("actual transcript output gives reasoning and answer separate headings and renderables", async () => {
+test("actual transcript output gives reasoning and answer separate renderables without headings", async () => {
   const state = stream().reduce((s, n) => reduceSession(s, n), initialSession("s"));
-  const setup = await testRender(<Transcript state={state} />, { width: 80, height: 20 });
+  const setup = await testRender(<Transcript state={state} showReasoning />, { width: 80, height: 20 });
   try {
     await setup.renderOnce();
+    await until(setup, "The answer");
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("Reasoning"); expect(frame).toContain("Think carefully");
-    expect(frame).toContain("elefante"); expect(frame).toContain("The answer");
+    expect(frame).toContain("Think carefully"); expect(frame).toContain("The answer");
+    expect(frame).not.toContain("reasoning"); expect(frame).not.toContain("elefante");
     expect(frame).not.toContain("Think carefullyThe answer");
-    expect(setup.renderer.root.findDescendantById("reasoning-t")).toBeDefined();
-    expect(setup.renderer.root.findDescendantById("answer-t")).toBeDefined();
+    expect(setup.renderer.root.findDescendantById("reasoning-t-0")).toBeDefined();
+    expect(setup.renderer.root.findDescendantById("answer-t-2")).toBeDefined();
     expect(frame).toContain("✓ bash");
   } finally { await act(async () => setup.renderer.destroy()); }
+});
+const rowOf = (frame: string, text: string) => frame.split("\n").findIndex(row => row.includes(text));
+test("a tool call is drawn between the text before it and the text after it", async () => {
+  const state = [
+    note(1, "turn.started"), note(2, "text.delta", { text: "Before the tool." }),
+    note(3, "tool.started", { tool_call_id: "c", name: "bash", input_preview: "ls" }),
+    note(4, "tool.finished", { tool_call_id: "c", is_error: false, output_preview: "file", duration_ms: 3 }),
+    note(5, "text.delta", { text: "After the tool." }), note(6, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }),
+  ].reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 20 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "After the tool.");
+    const frame = setup.captureCharFrame();
+    expect(rowOf(frame, "Before the tool.")).toBeGreaterThanOrEqual(0);
+    expect(rowOf(frame, "Before the tool.")).toBeLessThan(rowOf(frame, "✓ bash"));
+    expect(rowOf(frame, "✓ bash")).toBeLessThan(rowOf(frame, "After the tool."));
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
+});
+test("a turn restored from a snapshot, which has no ordering, draws its text and then its tools", async () => {
+  const state = { ...initialSession("s"), turns: [{ turn_id: "t", prompt: "", text: "Restored text.", tools: [{ tool_call_id: "c", name: "bash", state: "ok" as const, is_error: false }], stop_reason: "end_turn" as const, usage: emptyUsage() }] };
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 20 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "Restored text.");
+    const frame = setup.captureCharFrame();
+    expect(rowOf(frame, "Restored text.")).toBeGreaterThanOrEqual(0);
+    expect(rowOf(frame, "Restored text.")).toBeLessThan(rowOf(frame, "✓ bash"));
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
 });
 test("reasoning-only status remains visible at five seconds with a nonzero labeled estimate", async () => {
   const started = reduceSession(initialSession("s"), note(1, "turn.started"), 1000);
@@ -125,4 +163,67 @@ test("repeated updates register keypress listeners once, not once per update", a
   expect(initial).toBeGreaterThan(0);
   expect(listeners()).toBe(initial);
   renderer.destroy();
+});
+
+const app = (state = initialSession("s")) => <App state={state} now={0} connected message={null} modal={null} animateMascot={false} onSubmit={() => {}} onInterrupt={() => {}} onExit={() => {}} />;
+
+test("Ctrl+R shows and hides reasoning, which starts hidden, and the thinking line stays either way", async () => {
+  const state = answered("Done.", "Weighing options");
+  const setup = await testRender(app(state), { width: 100, height: 24 });
+  try {
+    await setup.renderOnce();
+    const shown = () => setup.renderer.root.findDescendantById(`reasoning-t-0`) !== undefined;
+    expect(shown()).toBe(false);
+    await act(async () => setup.mockInput.pressKey("r", { ctrl: true })); await setup.renderOnce();
+    expect(shown()).toBe(true); expect(setup.captureCharFrame()).toContain("Weighing options");
+    await act(async () => setup.mockInput.pressKey("r", { ctrl: true })); await setup.renderOnce();
+    expect(shown()).toBe(false); expect(setup.captureCharFrame()).not.toContain("Weighing options");
+  } finally { await act(async () => setup.renderer.destroy()); }
+  const live = reduceSession(reduceSession(initialSession("s"), note(1, "turn.started"), 1000), note(2, "reasoning.delta", { text: "hmm" }), 2000);
+  const thinking = await testRender(<App state={live} now={4000} connected message={null} modal={null} animateMascot={false} onSubmit={() => {}} onInterrupt={() => {}} onExit={() => {}} />, { width: 100, height: 24 });
+  try { await thinking.renderOnce(); expect(thinking.captureCharFrame()).toContain("Thinking"); expect(thinking.captureCharFrame()).not.toContain("hmm"); }
+  finally { await act(async () => thinking.renderer.destroy()); }
+});
+
+test("the answer is rendered as markdown: no heading hashes, asterisks or backticks, and the words stay", async () => {
+  const setup = await testRender(app(answered("This is *elefante*, a thing.\n\n## What it does\n\n- `cli` runs headless\n- **tui** is this")), { width: 100, height: 24 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "What it does");
+    const frame = setup.captureCharFrame();
+    for (const word of ["elefante", "What it does", "cli", "runs headless", "tui"]) expect(frame).toContain(word);
+    for (const marker of ["##", "*elefante*", "`", "**"]) expect(frame).not.toContain(marker);
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
+});
+
+test("a screenful of answer never paints over the status line or the prompt bar", async () => {
+  const lines = Array.from({ length: 60 }, (_, i) => `line ${i} of a long answer`).join("\n\n");
+  const setup = await testRender(app(answered(lines)), { width: 60, height: 16 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "line 59");
+    const rows = setup.captureCharFrame().split("\n");
+    expect(rows.at(-6)).toContain("default model  | 0 in / 0 out / 0 reasoning | cost: ?");   // status, intact
+    expect(rows.at(-5)).toMatch(/^ ┌─+┐ $/);                                                      // the prompt bar, unbroken
+    expect(rows.at(-4)).toContain("Message");
+    expect(rows.at(-3)).toMatch(/^ └─+┘ $/);
+    for (const row of rows.slice(-6, -2)) expect(row).not.toMatch(/line \d/);                     // nothing from the transcript in them
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
+});
+
+test("dragging across the answer selects its words and copies them", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: "linux" });   // keeps the test off the real macOS clipboard
+  const setup = await testRender(app(answered("Selectable words here")), { width: 100, height: 24 });
+  try {
+    const copied: string[] = [];
+    setup.renderer.copyToClipboardOSC52 = text => (copied.push(text), true);
+    await setup.renderOnce();
+    await until(setup, "Selectable words here");
+    const row = setup.captureCharFrame().split("\n").findIndex(line => line.includes("Selectable words here"));
+    const col = setup.captureCharFrame().split("\n")[row].indexOf("Selectable");
+    await act(async () => { await setup.mockMouse.drag(col, row, col + "Selectable words here".length, row); });
+    await setup.renderOnce();
+    expect(copied.join("")).toContain("Selectable words");
+  } finally { Object.defineProperty(process, "platform", platform); await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
 });

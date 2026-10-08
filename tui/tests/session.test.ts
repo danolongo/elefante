@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { addUsage, emptyUsage, initialSession, reduceSession, restoreSnapshot } from "../src/session";
+import { addUsage, emptyUsage, initialSession, reduceSession, restoreSnapshot, type Segment } from "../src/session";
 import { note, snapshot, stream } from "./fixtures";
 
 test("two clients deterministically preserve reasoning and answer, tools, approval and usage", () => {
@@ -55,12 +55,28 @@ test("interruption and provider error leave completed turn with cancelled tools 
   expect(state.turns[0].tools[0].state).toBe("cancelled");
   expect(state.turns[0].stop_reason).toEqual({ other: "provider" });
 });
+test("segments keep text, reasoning and tool calls in the order they happened and merge adjacent deltas", () => {
+  const events = [
+    note(1, "turn.started"), note(2, "reasoning.delta", { text: "think " }), note(3, "reasoning.delta", { text: "first" }),
+    note(4, "text.delta", { text: "Before " }), note(5, "text.delta", { text: "tool" }), note(6, "text.delta", { text: "" }),
+    note(7, "tool.started", { tool_call_id: "a", name: "bash", input_preview: "ls" }),
+    note(8, "tool.started", { tool_call_id: "b", name: "bash", input_preview: "pwd" }),
+    note(9, "tool.finished", { tool_call_id: "a", is_error: false, output_preview: "x", duration_ms: 1 }),
+    note(10, "reasoning.delta", { text: "think again" }), note(11, "text.delta", { text: "After" }),
+  ];
+  const live = events.reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  const expected: Segment[] = [{ kind: "reasoning", text: "think first" }, { kind: "text", text: "Before tool" }, { kind: "tool", tool_call_id: "a" }, { kind: "tool", tool_call_id: "b" }, { kind: "reasoning", text: "think again" }, { kind: "text", text: "After" }];
+  expect(live.active_turn!.segments).toEqual(expected);
+  expect(live.active_turn).toMatchObject({ reasoning: "think firstthink again", text: "Before toolAfter" });   // the flat fields are unchanged
+  const done = reduceSession(live, note(12, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }));
+  expect(done.turns[0].segments).toEqual(expected);
+});
 test("snapshots replace local state and rebuild cumulative usage and active reasoning", () => {
   const complete = stream().reduce((s, n) => reduceSession(s, n), initialSession("s"));
   const snap = { ...snapshot(), seq: 20, turns: complete.turns, active_turn: { turn_id: "next", text_so_far: "", reasoning_so_far: "work", tools: [], pending_approval: { approval_id: "a", command: "cmd", rule: "ask" } } };
   const state = restoreSnapshot(snap, 5000, "high");
   expect(state.usage).toEqual(complete.usage);
-  expect(state.active_turn).toMatchObject({ reasoning: "work", reasoning_tokens: 1, thinking_since: 5000, pending_approvals: [snap.active_turn.pending_approval] });
+  expect(state.active_turn).toMatchObject({ reasoning: "work", segments: [{ kind: "reasoning", text: "work" }], reasoning_tokens: 1, thinking_since: 5000, pending_approvals: [snap.active_turn.pending_approval] });
   expect(state.effort).toBe("high");
   expect(reduceSession(state, { ...note(21, "text.delta", { text: "wrong" }), session_id: "other" })).toBe(state);
 });

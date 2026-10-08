@@ -24,11 +24,10 @@ relevant context and gives the model a search tool. The implemented vertical sli
 - continue the conversation until the provider ends the turn, refuses, is interrupted, or
   reaches a configured round limit.
 
-M0 and M1 gates are green, including the credentialed OpenRouter cache-hit test and the live
-repository edit. M2's hermetic gate is green; its one credentialed check —
-`live_memory_context_reaches_the_model` — has been written and compiled but **not yet run**, and the
-milestone record says so rather than claiming it. CI runs the hermetic gates on every push and the
-credentialed tests behind `workflow_dispatch`; see `.github/workflows/`.
+All three milestone gates are green, including the credentialed tests: the OpenRouter cache hit, the
+live repository edit, and `live_memory_context_reaches_the_model`, which proves a real provider accepts
+the injected message shape and that a real model uses the index it is sent. CI runs the hermetic gates
+on every push and the credentialed tests behind `workflow_dispatch`; see `.github/workflows/`.
 
 ## 2. Design principles
 

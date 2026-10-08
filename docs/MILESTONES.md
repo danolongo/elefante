@@ -165,14 +165,14 @@ was corrected in the same pass.*
 
 ---
 
-## M2 — Repo cache + mechanical graph            (implemented 2026-10-02; one credentialed check not yet run)
+## M2 — Repo cache + mechanical graph            (completed 2026-10-08)
 
-**Status, stated plainly.** Every hermetic item of the gate is green from a clean checkout. The
-gate's last item — `live_memory_context_reaches_the_model`, which proves a real provider accepts the
-injected message shape and that a real model uses the index it is sent — has been written, compiled
-and wired into `credentialed.yml`, but **has not been run**. By this project's own rule the
-milestone is not complete until it has. Run it, then change this heading's parenthetical to a
-completion date and `README.md`'s status paragraph with it.
+**Status.** Every item of the gate is green, the credentialed ones included. On 2026-10-08, against
+`anthropic/claude-sonnet-5`, `live_memory_context_reaches_the_model` passed — a real provider accepted
+the injected preamble-and-block request shape, and with `--max-rounds 1` the model named a function it
+could only know from the index it was sent. Because `tools`, `core` and `srv` changed, the two M0/M1
+credentialed tests were re-run too and also pass: `live_second_identical_request_reads_prompt_cache`
+and `live_edit_lands_in_a_scratch_repository`.
 
 **Shipped.** A per-repository index in `elefante-mem`: a walk that honours ignore files and prunes
 secret paths unread; stat-based change detection with a racy-timestamp rule; a content-addressed
@@ -246,4 +246,4 @@ explained in `PLAN.md` or the crate README.
 
 ---
 
-_Next: M3 — learned memory. First, run `live_memory_context_reaches_the_model` and close M2._
+_Next: M3 — learned memory._

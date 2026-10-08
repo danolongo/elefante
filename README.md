@@ -11,13 +11,11 @@ milestone-gated.
 
 ## Project status
 
-M0 and M1 are complete, with their gates green — including a real prompt-cache hit through
-OpenRouter and a live edit in a scratch repository, both described in
-[`docs/MILESTONES.md`](docs/MILESTONES.md). M2 — the repository index — is implemented and its
-hermetic gate is green: 350 Rust tests and 24 TypeScript tests. Its one credentialed check, that a
-real model uses the index it is sent, has been written but not yet run, so the milestone is not yet
-recorded as complete. CI runs the hermetic gates on every push and the credentialed tests on
-dispatch.
+M0, M1 and M2 are complete, with their gates green — 350 hermetic Rust tests and 24 TypeScript
+tests, plus three credentialed checks run against a live provider: a real prompt-cache hit through
+OpenRouter, a live edit in a scratch repository, and a real model using the repository index it is
+sent. See [`docs/MILESTONES.md`](docs/MILESTONES.md). CI runs the hermetic gates on every push and the
+credentialed tests on dispatch. M3 — learned memory — has not begun.
 
 ## Quick start
 

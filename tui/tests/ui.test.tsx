@@ -28,7 +28,7 @@ test("actual transcript output gives reasoning and answer separate headings and 
     await setup.renderOnce();
     const frame = setup.captureCharFrame();
     expect(frame).toContain("Reasoning"); expect(frame).toContain("Think carefully");
-    expect(frame).toContain("Answer"); expect(frame).toContain("The answer");
+    expect(frame).toContain("elefante"); expect(frame).toContain("The answer");
     expect(frame).not.toContain("Think carefullyThe answer");
     expect(setup.renderer.root.findDescendantById("reasoning-t")).toBeDefined();
     expect(setup.renderer.root.findDescendantById("answer-t")).toBeDefined();

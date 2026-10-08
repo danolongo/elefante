@@ -14,12 +14,12 @@ export function Transcript({ state }: { state: SessionState }) {
   const turns = [...state.turns, ...(state.active_turn ? [state.active_turn] : [])];
   return <scrollbox flexGrow={1} stickyScroll stickyStart="bottom" scrollX={false} contentOptions={{ flexDirection: "column", minHeight: 0 }}>
     {turns.map(turn => <box key={turn.turn_id} id={`turn-${turn.turn_id}`} flexDirection="column" marginBottom={1}>
-      {turn.prompt && <box flexDirection="column"><text fg="#88bbff">You</text><text>{turn.prompt}</text></box>}
+      {turn.prompt && <box flexDirection="column"><text fg="#88bbff">you</text><text>{turn.prompt}</text></box>}
       {turn.reasoning && <box id={`reasoning-${turn.turn_id}`} flexDirection="column">
         <text fg="#777777">Reasoning</text>
         <text fg="#777777">{turn.reasoning}</text>
       </box>}
-      {turn.text && <box id={`answer-${turn.turn_id}`} flexDirection="column"><text fg="#88ccaa">Answer</text><text>{turn.text}</text></box>}
+      {turn.text && <box id={`answer-${turn.turn_id}`} flexDirection="column"><text fg="#88ccaa">elefante</text><text>{turn.text}</text></box>}
       <Tools tools={turn.tools} />
     </box>)}
   </scrollbox>;

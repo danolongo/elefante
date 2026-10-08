@@ -108,7 +108,7 @@ test("reasoning-only status remains visible at five seconds with a nonzero label
   try {
     await setup.renderOnce();
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("Thinking · 5s · ~4 reasoning tokens (estimate; exact usage at turn end)");
+    expect(frame).toContain("Thinking · 5s · ~4 reasoning token estimate");
     expect(frame).toContain("0 in / 0 out / 0 reasoning | cost: ?");
   }
   finally { await act(async () => setup.renderer.destroy()); }
@@ -132,7 +132,7 @@ test("the status line, prompt border and placeholder are tints of one blue: ligh
     const fg = (text: string) => spans.find(span => span.text.includes(text))!.fg.toInts().slice(0, 3);
     expect(fg("┌")).toEqual([78, 126, 163]);
     expect(fg("default model")).toEqual([0x9d, 0xba, 0xd2]);
-    expect(fg("Message")).toEqual([0x5f, 0x80, 0x9b]);
+    expect(fg("Ctrl+R show reasoning")).toEqual([0x5f, 0x80, 0x9b]);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
 test("approval modal emits a decision and key modal masks typed and pasted secrets", async () => {
@@ -233,7 +233,7 @@ test("a screenful of answer never paints over the status line or the prompt bar"
     const rows = setup.captureCharFrame().split("\n");
     expect(rows.at(-6)).toContain("default model  | 0 in / 0 out / 0 reasoning | cost: ?");   // status, intact
     expect(rows.at(-5)).toMatch(/^ ┌─+┐ $/);                                                      // the prompt bar, unbroken
-    expect(rows.at(-4)).toContain("Message");
+    expect(rows.at(-4)).toContain("Ctrl+R show reasoning");
     expect(rows.at(-3)).toMatch(/^ └─+┘ $/);
     for (const row of rows.slice(-6, -2)) expect(row).not.toMatch(/line \d/);                     // nothing from the transcript in them
   } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }

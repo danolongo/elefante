@@ -95,7 +95,7 @@ test("the prompt bar stops short of the elephant, so it is never covered", () =>
   const pixels = lines.flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
   const corner = lines.find(line => line.includes("┘"))!;                 // the input bar's bottom-right corner
   expect(corner.indexOf("┘")).toBeLessThan(Math.min(...pixels));
-  expect(lines.slice(-5).join("\n")).toContain("Message");
+  expect(lines.slice(-5).join("\n")).toContain("Ctrl+R show reasoning");
 }));
 
 test("without the elephant the prompt bar spans the full width", () => run(100, 24, {}, async setup => {

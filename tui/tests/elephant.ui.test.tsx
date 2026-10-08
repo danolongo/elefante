@@ -48,10 +48,20 @@ test("a new session shows the elephant at the top, centred, and not on the perch
   expect(found(setup.renderer, "elephant-perch")).toBe(false);
   const frame = setup.captureCharFrame(), lines = frame.split("\n");
   expect(count(lines.slice(0, 6).join("\n"))).toBeGreaterThan(20);        // drawn in the top rows
-  expect(count(lines.slice(6).join("\n"))).toBe(0);                       // and nowhere else: no floor under it
+  expect(count(lines.slice(6, 9).join("\n"))).toBe(0);                    // no floor under it: three blank rows, then the wordmark
+  expect(count(lines.slice(9, 14).join("\n"))).toBeGreaterThan(60);      // "elefante", five rows tall
+  expect(count(lines.slice(14).join("\n"))).toBe(0);
   const columns = spriteColumns(frame);
   expect(Math.min(...columns)).toBeGreaterThan(35); expect(Math.max(...columns)).toBeLessThan(65);
+  const wordmark = lines.slice(9, 14).flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
+  expect(Math.min(...wordmark)).toBe(20); expect(Math.max(...wordmark)).toBe(80);   // 61 columns, centred like the elephant
 }));
+
+test("the wordmark needs 61 columns and 20 rows; short of either the elephant is shown alone", async () => {
+  await run(62, 24, {}, async setup => { await setup.renderOnce(); expect(count(setup.captureCharFrame().split("\n").slice(6).join("\n"))).toBe(0); });
+  await run(100, 19, {}, async setup => { await setup.renderOnce(); const lines = setup.captureCharFrame().split("\n"); expect(count(lines.slice(0, 6).join("\n"))).toBeGreaterThan(20); expect(count(lines.slice(6).join("\n"))).toBe(0); });
+  await run(100, 20, {}, async setup => { await setup.renderOnce(); expect(count(setup.captureCharFrame().split("\n").slice(9, 14).join("\n"))).toBeGreaterThan(60); });
+});
 
 test("sending the first prompt moves the elephant to the perch, in the bottom-right corner beside the chat bar", () => run(100, 24, {}, async setup => {
   await setup.renderOnce();
@@ -65,6 +75,7 @@ test("sending the first prompt moves the elephant to the perch, in the bottom-ri
   const columns = lines.flatMap(line => [...line].flatMap((c, x) => isPixel(c) ? [x] : []));
   expect(Math.min(...columns)).toBeGreaterThan(82); expect(Math.max(...columns)).toBeLessThan(99);   // flush right, inside the padding
   expect(rows[0]).toBe(18); expect(rows.at(-1)).toBe(22);                 // five rows, ending on the input bar's last row
+  expect(rows.filter(y => y < 18)).toEqual([]);                           // and the wordmark went with the top elephant
 }));
 
 test("a resumed session starts on the perch with no intro", () => run(100, 24, { resumed: true }, async setup => {

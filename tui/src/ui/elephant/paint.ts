@@ -30,17 +30,18 @@ export function composePixels(frame: Frame, stage: Stage): (string | null)[][] {
   return pixels;
 }
 
-/// Paints a frame with half-block cells: `▀` carries the top pixel in its foreground and the
+/// Paints pixels with half-block cells: `▀` carries the top pixel in its foreground and the
 /// bottom pixel in its background, and a lone bottom pixel is `▄`. Pixels with nothing behind
 /// them stay transparent so the transcript shows through around the elephant.
-export function paintFrame(buffer: OptimizedBuffer, frame: Frame, stage: Stage): void {
+export function paintPixels(buffer: OptimizedBuffer, pixels: (string | null)[][]): void {
   buffer.clear(TRANSPARENT);
-  const pixels = composePixels(frame, stage);
-  for (let row = 0; row < stage.pixelRows; row += 2) {
-    for (let col = 0; col < stage.cols; col++) {
+  for (let row = 0; row < pixels.length; row += 2) {
+    for (let col = 0; col < pixels[row].length; col++) {
       const top = pixels[row][col], bottom = pixels[row + 1]?.[col] ?? null;
       if (top) buffer.setCellWithAlphaBlending(col, row / 2, "▀", color(top), bottom ? color(bottom) : TRANSPARENT);
       else if (bottom) buffer.setCellWithAlphaBlending(col, row / 2, "▄", color(bottom), TRANSPARENT);
     }
   }
 }
+
+export const paintFrame = (buffer: OptimizedBuffer, frame: Frame, stage: Stage): void => paintPixels(buffer, composePixels(frame, stage));

@@ -3,6 +3,7 @@ import { advance, startState } from "../src/ui/elephant/phase";
 import { composePixels } from "../src/ui/elephant/paint";
 import { flapFrames, introFrames, MAX_FLAP_PAUSE_MS, MIN_FLAP_PAUSE_MS, nextFlapDelayMs, perchEnterFrames, perchFrame, perchRest } from "../src/ui/elephant/scenes";
 import { PALETTE, SPRITE_COLS, SPRITE_ROWS, sprite } from "../src/ui/elephant/sprites";
+import { LOGO, LOGO_COLS, LOGO_ROWS } from "../src/ui/elephant/wordmark";
 
 test("every pose is a 15 by 10 grid of palette pixels", () => {
   for (const ear of ["n", "s", "o"] as const) for (const trunk of ["down", "mid", "up"] as const) for (const leg of [0, 1, 2, 3]) {
@@ -26,6 +27,12 @@ test("the soft ear pose differs from the normal one, and the stride poses differ
   expect(sprite({ leg: 1 })).not.toEqual(sprite());
   expect(sprite({ leg: 3 })).not.toEqual(sprite({ leg: 1 }));
   expect(sprite({ leg: 2 })).toEqual(sprite());                      // the design's even strides are the standing legs
+});
+
+test("the wordmark is a 61 by 10 grid of lit and transparent pixels, five terminal rows tall", () => {
+  expect(LOGO).toHaveLength(10); expect(LOGO_COLS).toBe(61); expect(LOGO_ROWS).toBe(5);
+  for (const row of LOGO) { expect(row).toHaveLength(61); for (const pixel of row) expect(pixel === "." || pixel in PALETTE).toBe(true); }
+  expect(LOGO.join("")).toContain("L");
 });
 
 test("the intro walks in from off-stage left and finishes standing, trunk down, at the centre", () => {

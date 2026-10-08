@@ -30,14 +30,16 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/Transcript.tsx` | 26 | Completed turns and the live turn; reasoning and answer as separate renderables. |
 | `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
 | `src/ui/App.tsx` | 35 | Composition and key handling; the prompt bar shares a row with the perched elephant. |
-| `src/ui/Mascot.tsx` | 47 | `useMascot` decides which stage the elephant is on; `TopMascot` and `PerchMascot` place it. |
+| `src/ui/Mascot.tsx` | 57 | `useMascot` decides which stage the elephant is on; `TopMascot` (with the wordmark) and `PerchMascot` place it. |
 | `src/ui/elephant/Elephant.tsx` | 113 | `TopElephant` and `PerchElephant`: a frame-buffer renderable played by an OpenTUI timeline. |
 | `src/ui/elephant/scenes.ts` | 61 | Pure frame clips (intro, perch entrance, idle flap) and the 30–90 s flap pause. |
 | `src/ui/elephant/sprites.ts` | 48 | The pixel art and its palette, ported from the design project. |
-| `src/ui/elephant/paint.ts` | 46 | Composes a frame into pixels and paints it as half-block cells. |
+| `src/ui/elephant/wordmark.ts`, `Logo.tsx` | 16, 19 | The "elefante" wordmark as pixel rows, and the component that paints it once. |
+| `src/ui/elephant/paint.ts` | 47 | Composes a frame into pixels and paints it as half-block cells. |
 | `src/ui/elephant/phase.ts` | 21 | The `intro → perch` transition, as pure functions. |
-| `src/ui/Status.tsx` | 9 | Thinking indicator, elapsed time, usage. |
-| `src/ui/Input.tsx` | 5 | Prompt entry. |
+| `src/ui/Status.tsx` | 10 | Thinking indicator, elapsed time, usage. |
+| `src/ui/Input.tsx` | 6 | Prompt entry. |
+| `src/ui/theme.ts` | 6 | The blue behind the prompt border and its two neighbouring tints. |
 
 `session.ts` is short but dense — single-line functions, not a stub.
 
@@ -66,7 +68,8 @@ cost yet (`null`); once any turn reports one it reads `cost: $0.0123`, and a rep
 ## The elephant
 
 A pixel-art elephant (from the "8-bit Elephant TUI Animations" design) keeps the transcript company.
-A new session opens with it walking in from the left edge of the terminal at the top, raising its trunk, flapping its ears and standing;
+A new session opens with it walking in from the left edge of the terminal at the top, raising its trunk, flapping its ears and standing, with the "elefante" wordmark three rows below it
+(left out under 61 columns or 20 rows);
 the first prompt takes it off the stage at once, and the same elephant walks in at the
 bottom-right corner, beside the prompt bar (which narrows to leave it room), where it stands facing the chat. It flaps its ears once after each random
 30–90 second pause and is otherwise still. `--session ID` skips the intro and starts it on the perch, and
@@ -122,15 +125,15 @@ those cannot be reconstructed on a fresh attachment. The daemon's retained histo
 ## Testing
 
 ```sh
-bun test              # 44 tests
+bun test              # 47 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (7)
+no-daemon failure path. `tests/session.test.ts` (7) covers the reducer. `tests/ui.test.tsx` (8)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
-asserted in CI. `tests/elephant.test.ts` (10) covers the sprites, clips, flap pause and phase transitions
-as pure functions; `tests/elephant.ui.test.tsx` (10) renders the app and steps the animation by calling
+asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, wordmark, clips, flap pause and phase transitions
+as pure functions; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling
 `engine.update(ms)`, so no test waits on a real clock. `App`'s `animateMascot={false}` makes the elephant
 paint its resting pose.
 

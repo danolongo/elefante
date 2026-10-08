@@ -9,6 +9,7 @@ import type { AppProps } from "../src/ui/App";
 import { initialSession, reduceSession } from "../src/session";
 import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
+import { Input } from "../src/ui/Input";
 import { Modal } from "../src/ui/Modal";
 import { App } from "../src/ui/App";
 import { note, stream } from "./fixtures";
@@ -55,6 +56,17 @@ test("finished status displays provider reasoning usage and removes the live est
     expect(frame).toContain("5 out / 9 reasoning | cost: $0.0000");
     expect(frame).not.toContain("Thinking");
     expect(frame).not.toContain("estimate");
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("the status line, prompt border and placeholder are tints of one blue: light, rgb(78, 126, 163), darker", async () => {
+  const setup = await testRender(<box flexDirection="column"><Status state={initialSession("s")} now={0} /><Input disabled={false} onSubmit={() => {}} /></box>, { width: 60, height: 6 });
+  try {
+    await setup.renderOnce();
+    const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+    const fg = (text: string) => spans.find(span => span.text.includes(text))!.fg.toInts().slice(0, 3);
+    expect(fg("┌")).toEqual([78, 126, 163]);
+    expect(fg("default model")).toEqual([0x9d, 0xba, 0xd2]);
+    expect(fg("Message")).toEqual([0x5f, 0x80, 0x9b]);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
 test("approval modal emits a decision and key modal masks typed and pasted secrets", async () => {

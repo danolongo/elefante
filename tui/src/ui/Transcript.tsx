@@ -4,9 +4,11 @@ import { MARKDOWN_STYLE } from "./markdown";
 
 function ToolCall({ tool }: { tool: Tool }) {
   const glyph = { running: "◌", ok: "✓", error: "✗", cancelled: "⊘" };
+  // A read is only its path: the daemon sends no file text, so the header carries everything.
+  const inline = tool.name === "read";
   return <box flexDirection="column">
-    <text>{glyph[tool.state]} {tool.name}{tool.duration_ms === undefined ? "" : ` (${tool.duration_ms} ms)`}</text>
-    {tool.input_preview && <text fg="#999999">{tool.input_preview}</text>}
+    <text>{glyph[tool.state]} {tool.name}{inline && tool.input_preview ? ` ${tool.input_preview}` : ""}{tool.duration_ms === undefined ? "" : ` (${tool.duration_ms} ms)`}</text>
+    {!inline && tool.input_preview && <text fg="#999999">{tool.input_preview}</text>}
     {tool.output_preview && <text fg={tool.is_error ? "#ff7777" : "#999999"}>{tool.output_preview}</text>}
   </box>;
 }

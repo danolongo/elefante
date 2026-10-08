@@ -62,6 +62,23 @@ test("a tool call is drawn between the text before it and the text after it", as
     expect(rowOf(frame, "✓ bash")).toBeLessThan(rowOf(frame, "After the tool."));
   } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
 });
+const withTool = (name: string, input: string, finish?: { is_error: boolean; output_preview: string }) => [
+  note(1, "turn.started"), note(2, "tool.started", { tool_call_id: "c", name, input_preview: input }),
+  ...(finish ? [note(3, "tool.finished", { tool_call_id: "c", ...finish, duration_ms: 3 })] : []),
+].reduce((s, n) => reduceSession(s, n), initialSession("s"));
+const drawn = async (state: ReturnType<typeof initialSession>) => {
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 20 });
+  try { await setup.renderOnce(); return setup.captureCharFrame().split("\n").map(row => row.trimEnd()).filter(Boolean); }
+  finally { await act(async () => setup.renderer.destroy()); }
+};
+test("a read is one line with its path, whether it is running, done or failed", async () => {
+  expect(await drawn(withTool("read", "src/x.rs"))).toEqual(["◌ read src/x.rs"]);
+  expect(await drawn(withTool("read", "src/x.rs", { is_error: false, output_preview: "" }))).toEqual(["✓ read src/x.rs (3 ms)"]);
+  expect(await drawn(withTool("read", "src/x.rs", { is_error: true, output_preview: "read failed: nope" }))).toEqual(["✗ read src/x.rs (3 ms)", "read failed: nope"]);
+});
+test("other tools keep their input and output on lines of their own", async () => {
+  expect(await drawn(withTool("bash", "ls", { is_error: false, output_preview: "file" }))).toEqual(["✓ bash (3 ms)", "ls", "file"]);
+});
 test("a turn restored from a snapshot, which has no ordering, draws its text and then its tools", async () => {
   const state = { ...initialSession("s"), turns: [{ turn_id: "t", prompt: "", text: "Restored text.", tools: [{ tool_call_id: "c", name: "bash", state: "ok" as const, is_error: false }], stop_reason: "end_turn" as const, usage: emptyUsage() }] };
   const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 20 });

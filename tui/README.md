@@ -27,7 +27,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
 | `src/main.tsx` | 102 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
-| `src/ui/Transcript.tsx` | 46 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
+| `src/ui/Transcript.tsx` | 48 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened (a `read` is one line, `✓ read path (N ms)`, never the file), as separate renderables with no text labels. |
 | `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
 | `src/ui/App.tsx` | 44 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
 | `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
@@ -136,12 +136,12 @@ streamed live keep the interleaved order. The daemon's retained history is unbou
 ## Testing
 
 ```sh
-bun test              # 56 tests
+bun test              # 58 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (8) covers the reducer. `tests/ui.test.tsx` (14)
+no-daemon failure path. `tests/session.test.ts` (8) covers the reducer. `tests/ui.test.tsx` (16)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
 asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, wordmark, clips, flap pause and phase transitions
 as pure functions; `tests/copy.test.ts` (2) covers where copied text goes; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling

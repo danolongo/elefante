@@ -443,6 +443,11 @@ reported*, which is distinct from `0.0`:
 **Previews are cut at 2 KiB** on a UTF-8 character boundary, never mid-codepoint, with the
 removed span replaced by exactly `\n…`.
 
+**Previews are tool-aware.** A `read` is previewed as just the path it was given
+(`input_preview: "src/x.rs"`, falling back to the raw input if `path` is missing or not a string),
+and a successful `read` sends an empty `output_preview`; a failed one keeps its error text. The
+model still receives the whole file. Every other tool previews its raw input and its output.
+
 ### Attach and resume
 
 `session.attach` has three outcomes and a client must handle all three:

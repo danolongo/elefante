@@ -546,63 +546,20 @@ async fn cancellation_keeps_completed_results_and_pairs_pending_approval() {
     assert_eq!(provider.requests.lock().unwrap()[1].messages.len(), 4);
 }
 
-#[tokio::test]
-async fn a_read_preview_shows_only_the_first_three_lines_while_the_model_gets_the_whole_file() {
+/// Runs one scripted tool call against a temp workspace and returns every event and the session.
+async fn run_tool(name: &str, input: &str, files: &[(&str, &str)]) -> (Vec<OutputEvent>, Session) {
     let repo = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(repo.path()).unwrap();
-    std::fs::write(repo.path().join("long"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
-    std::fs::write(repo.path().join("short"), "one\ntwo\nthree\n").unwrap();
-    let read = |id: &str, path: &str| {
-        vec![
-            Event::ToolUseStart {
-                id: id.into(),
-                name: "read".into(),
-            },
-            Event::ToolUseInputDelta(format!("{{\"path\":\"{path}\"}}")),
-            Event::Stop(StopReason::ToolUse),
-        ]
-    };
-    let provider = Script::new(vec![read("a", "long"), read("b", "short"), end("done")]);
-    let mut session = Session::new(RunConfig::new("test"));
-    let mut events = Vec::new();
-    session
-        .prompt(
-            &provider,
-            &executor,
-            &ToolGate::default(),
-            "read",
-            CancellationToken::new(),
-            |event| events.push(event),
-        )
-        .await
-        .unwrap();
-    let previews: Vec<&str> = events
-        .iter()
-        .filter_map(|event| match event {
-            OutputEvent::ToolFinished { output_preview, .. } => Some(output_preview.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(previews, ["one\ntwo\nthree\n…", "one\ntwo\nthree\n"]);
-    assert!(matches!(&session.messages()[2].content[0],
-        ContentBlock::ToolResult { content, .. } if content == "one\ntwo\nthree\nfour\nfive\n"));
-}
-
-#[tokio::test]
-async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
-    let repo = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(repo.path()).unwrap();
-    let text = "é".repeat(3000);
-    std::fs::write(repo.path().join("large"), &text).unwrap();
+    for (path, content) in files {
+        std::fs::write(repo.path().join(path), content).unwrap();
+    }
     let provider = Script::new(vec![
         vec![
             Event::ToolUseStart {
-                id: "read".into(),
-                name: "read".into(),
+                id: "c".into(),
+                name: name.into(),
             },
-            Event::ToolUseInputDelta("{\"path\":".into()),
-            Event::TextDelta("before dispatch".into()),
-            Event::ToolUseInputDelta("\"large\"}".into()),
+            Event::ToolUseInputDelta(input.into()),
             Event::Stop(StopReason::ToolUse),
         ],
         end("done"),
@@ -614,7 +571,81 @@ async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
             &provider,
             &executor,
             &ToolGate::default(),
-            "read",
+            "go",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    (events, session)
+}
+
+fn previews(events: &[OutputEvent]) -> (String, String) {
+    let started = events.iter().find_map(|event| match event {
+        OutputEvent::ToolStarted { input_preview, .. } => Some(input_preview.clone()),
+        _ => None,
+    });
+    let finished = events.iter().find_map(|event| match event {
+        OutputEvent::ToolFinished { output_preview, .. } => Some(output_preview.clone()),
+        _ => None,
+    });
+    (started.unwrap(), finished.unwrap())
+}
+
+#[tokio::test]
+async fn a_read_is_previewed_as_its_path_alone_while_the_model_gets_the_whole_file() {
+    let (events, session) = run_tool(
+        "read",
+        "{\"path\":\"notes.txt\"}",
+        &[("notes.txt", "one\ntwo\nthree\nfour\n")],
+    )
+    .await;
+    assert_eq!(previews(&events), ("notes.txt".to_owned(), String::new()));
+    assert!(matches!(&session.messages()[2].content[0],
+        ContentBlock::ToolResult { content, .. } if content == "one\ntwo\nthree\nfour\n"));
+}
+
+#[tokio::test]
+async fn a_failed_read_keeps_its_error_so_the_user_sees_why() {
+    let (events, _) = run_tool("read", "{\"path\":\"missing.txt\"}", &[]).await;
+    let (input, output) = previews(&events);
+    assert_eq!(input, "missing.txt");
+    assert!(output.starts_with("read failed:"), "{output}");
+}
+
+#[tokio::test]
+async fn a_read_without_a_string_path_falls_back_to_its_raw_input() {
+    let (events, _) = run_tool("read", "{\"path\":7}", &[]).await;
+    assert_eq!(previews(&events).0, "{\"path\":7}");
+}
+
+#[tokio::test]
+async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let text = "é".repeat(3000);
+    std::fs::write(repo.path().join("large"), &text).unwrap();
+    let provider = Script::new(vec![
+        vec![
+            Event::ToolUseStart {
+                id: "grep".into(),
+                name: "grep".into(),
+            },
+            Event::ToolUseInputDelta("{\"pattern\":".into()),
+            Event::TextDelta("before dispatch".into()),
+            Event::ToolUseInputDelta("\"é\"}".into()),
+            Event::Stop(StopReason::ToolUse),
+        ],
+        end("done"),
+    ]);
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "grep",
             CancellationToken::new(),
             |event| events.push(event),
         )
@@ -622,14 +653,14 @@ async fn tool_started_waits_for_complete_arguments_and_previews_are_bounded() {
         .unwrap();
     assert!(matches!(&events[1], OutputEvent::TextDelta(_)));
     assert!(
-        matches!(&events[2], OutputEvent::ToolStarted { input_preview, .. } if input_preview == "{\"path\":\"large\"}")
+        matches!(&events[2], OutputEvent::ToolStarted { input_preview, .. } if input_preview == "{\"pattern\":\"é\"}")
     );
     assert!(events.iter().any(
         |event| matches!(event, OutputEvent::ToolFinished { output_preview, .. }
         if output_preview.len() <= 2048 && output_preview.ends_with("\n…"))
     ));
     assert!(
-        matches!(&session.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content == &text)
+        matches!(&session.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content.len() > 2048 && content.contains(&text))
     );
 }
 

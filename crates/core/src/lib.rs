@@ -669,10 +669,8 @@ fn provider_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// Marks where a client preview was cut, whether by size or by line count.
+/// Marks where a client preview was cut.
 const TRUNCATION_MARKER: &str = "\n…";
-/// A `read` result is shown to clients as only its opening lines; the model still gets all of it.
-const READ_PREVIEW_LINES: usize = 3;
 
 /// Client previews are bounded independently of model-facing tool results.
 fn preview(value: &str) -> String {
@@ -687,14 +685,19 @@ fn preview(value: &str) -> String {
     format!("{}{TRUNCATION_MARKER}", &value[..end])
 }
 
-/// The client preview of a finished tool. A successful `read` shows its first lines only.
+/// The client preview of a tool call's input. A `read` is shown as just the path it was given.
+fn input_preview(tool: &str, input: &Value) -> String {
+    match (tool, input.get("path").and_then(Value::as_str)) {
+        ("read", Some(path)) => preview(path),
+        _ => preview(&input.to_string()),
+    }
+}
+
+/// The client preview of a finished tool. A successful `read` shows nothing: the call line already
+/// says which file was read, and the model still gets all of it.
 fn output_preview(tool: &str, result: &ToolResult) -> String {
     if tool == "read" && !result.is_error {
-        let mut lines = result.content.lines();
-        let head: Vec<&str> = lines.by_ref().take(READ_PREVIEW_LINES).collect();
-        if lines.next().is_some() {
-            return preview(&format!("{}{TRUNCATION_MARKER}", head.join("\n")));
-        }
+        return String::new();
     }
     preview(&result.content)
 }
@@ -796,7 +799,7 @@ where
         emit(OutputEvent::ToolStarted {
             id: call.id.clone(),
             name: call.name.clone(),
-            input_preview: preview(&call.input.to_string()),
+            input_preview: input_preview(&call.name, &call.input),
         });
         let decision = gate.check_in(&call.name, &call.input, tools.root());
         let tools = tools.clone();

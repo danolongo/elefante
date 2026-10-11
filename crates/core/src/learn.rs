@@ -14,11 +14,15 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt::Write as _,
+    fs::OpenOptions,
+    io::Write as _,
+    os::unix::fs::OpenOptionsExt as _,
+    path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use elefante_guard::Scrubber;
@@ -40,6 +44,8 @@ pub const EXTRACTOR_SYSTEM_PROMPT: &str = "You maintain a short list of durable 
 /// Which environment variables configure the extractor role. Read by the daemon.
 pub const ENV_MODEL: &str = "ELEFANTE_EXTRACT_MODEL";
 pub const ENV_EFFORT: &str = "ELEFANTE_EXTRACT_EFFORT";
+/// A file to which the daemon appends one JSON line per extraction attempt saying how it ended.
+pub const ENV_LOG: &str = "ELEFANTE_LEARN_LOG";
 
 #[derive(Clone, Debug)]
 pub struct LearnConfig {
@@ -61,6 +67,10 @@ pub struct LearnConfig {
     pub retry_delay: Duration,
     /// Existing notes shown to the model.
     pub shown: usize,
+    /// Where to append the outcome of each attempt, for a person debugging why nothing was learned.
+    /// The lines hold the start of the model's reply, which quotes the conversation; the file is
+    /// created private (0600) and only when [`ENV_LOG`] asks for it.
+    pub log: Option<PathBuf>,
 }
 
 impl LearnConfig {
@@ -78,6 +88,7 @@ impl LearnConfig {
             max_failures: 3,
             retry_delay: Duration::from_secs(2),
             shown: 8,
+            log: None,
         }
     }
 
@@ -93,6 +104,9 @@ impl LearnConfig {
         if let Some(effort) = get(ENV_EFFORT).as_deref().and_then(parse_effort) {
             config.effort = Some(effort);
         }
+        config.log = get(ENV_LOG)
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from);
         config
     }
 }
@@ -470,6 +484,43 @@ impl Learner {
         );
     }
 
+    /// Appends one line saying how an attempt ended, if a log was asked for. Best effort: a log
+    /// that cannot be written must never change what is learned.
+    fn log(&self, outcome: &str, detail: serde_json::Value) {
+        let Some(path) = &self.config.log else {
+            return;
+        };
+        let mut line = json!({
+            "at_ms": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()),
+            "model": self.config.model.to_string(),
+            "outcome": outcome,
+            "stop": self.diagnostics().last_stop,
+            "schema_sent": self.sends_schema(),
+        });
+        if let (Some(line), serde_json::Value::Object(detail)) = (line.as_object_mut(), detail) {
+            line.extend(detail);
+        }
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{line}"));
+    }
+
+    fn log_ingested(&self, report: &learn::IngestReport, invalid: usize, reply: &str) {
+        self.log(
+            "ingested",
+            json!({
+                "added": report.added.len(), "reinforced": report.reinforced.len(),
+                "promoted": report.promoted.len(), "superseded": report.superseded.len(),
+                "rejections": report.rejected.iter()
+                    .map(|(index, reason)| format!("candidate {index}: {reason:?}")).collect::<Vec<_>>(),
+                "invalid_entries": invalid, "reply_head": cut(reply),
+            }),
+        );
+    }
+
     fn record_usage(&self, usage: Usage) {
         if usage.is_empty() {
             return;
@@ -769,6 +820,10 @@ impl Learner {
             .join("\n");
         let Ok(shown) = learn::nearest_async(&self.store, said, self.config.shown).await else {
             self.note(|d| d.last_error = Some("could not read the existing notes".to_owned()));
+            self.log(
+                "store_error",
+                json!({"error": "could not read the existing notes"}),
+            );
             self.record_failure(LearnFailure::Store);
             self.fail(taken);
             return Step::Done;
@@ -776,6 +831,7 @@ impl Learner {
         let reply = match self.ask(&shown, &batch).await {
             Ok(reply) => reply,
             Err(failure) => {
+                self.log("provider_error", json!({"error": failure.message}));
                 self.note(|d| d.last_error = Some(failure.message));
                 self.record_failure(failure.class);
                 self.fail(taken);
@@ -786,13 +842,22 @@ impl Learner {
         let Some(outcome) = learn::parse_output(&reply) else {
             add!(self.stats, invalid_replies, 1);
             self.note(|d| d.last_unreadable_reply = Some(cut(&reply)));
+            self.log(
+                "unreadable_reply",
+                json!({"reply_chars": reply.chars().count(), "reply_head": cut(&reply)}),
+            );
             self.record_failure(LearnFailure::UnreadableReply);
             self.fail(taken);
             return Step::Done;
         };
+        let outcome_invalid = outcome.invalid;
         add!(self.stats, invalid_entries, outcome.invalid);
         if outcome.candidates.is_empty() {
             add!(self.stats, empty, 1);
+            self.log(
+                "no_notes",
+                json!({"invalid_entries": outcome.invalid, "reply_head": cut(&reply)}),
+            );
             self.clear_failure_diagnostics();
             self.record_success();
             self.advance(taken);
@@ -801,6 +866,7 @@ impl Learner {
         let ids: Vec<i64> = shown.iter().map(|n| n.id).collect();
         let Ok(report) = learn::ingest_async(&self.store, outcome.candidates, batch, ids).await
         else {
+            self.log("store_error", json!({"error": "ingest failed"}));
             self.record_failure(LearnFailure::Store);
             self.fail(taken);
             return Step::Done;
@@ -820,6 +886,7 @@ impl Learner {
                 .map(|(index, reason)| format!("candidate {index}: {reason:?}"))
                 .collect();
         });
+        self.log_ingested(&report, outcome_invalid, &reply);
         // The ingest already committed. Learned events are hints, so a reporting read must not
         // retain and re-extract the same conversation if it fails.
         if let Ok(changes) = self.changed_notes(&report).await

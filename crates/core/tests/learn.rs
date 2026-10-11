@@ -393,6 +393,12 @@ fn the_extractor_role_comes_from_the_environment_or_falls_back_to_the_author() {
         Some(Effort::Low),
         "an unknown effort is ignored"
     );
+    assert_eq!(unset.log, None, "no log unless one is asked for");
+    assert_eq!(junk.log, None);
+    let logged = LearnConfig::from_env(&author, &env(&[("ELEFANTE_LEARN_LOG", "/tmp/learn.log")]));
+    assert_eq!(logged.log, Some("/tmp/learn.log".into()));
+    let blank = LearnConfig::from_env(&author, &env(&[("ELEFANTE_LEARN_LOG", "  ")]));
+    assert_eq!(blank.log, None, "a blank path is the same as none");
 }
 
 // ----- the gate -----
@@ -578,6 +584,96 @@ async fn an_empty_reply_is_counted_and_still_advances() {
     let stats = learner.stats();
     assert_eq!((stats.empty, stats.added), (1, 0));
     assert_eq!(learner.pending_turns(), 0);
+}
+
+fn log_lines(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_asked_for_log_says_how_each_attempt_ended_and_a_missing_one_changes_nothing() {
+    let (_tmp2, store2) = store();
+    let (_tmp, store) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("learn.log");
+    let mut logging = config();
+    logging.log = Some(path.clone());
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Text("I would record that tests use should_.".to_owned()),
+        reply(&json!([])),
+        reply(&json!([note(
+            "Test functions use the prefix should_.",
+            "every test is named should_"
+        )])),
+    ]);
+    let learner = learner(&store, &script, logging);
+    let mut history = Vec::new();
+    for said in [
+        "Remember: nothing in particular.",
+        "Remember: every test is named should_",
+    ] {
+        history.push(user(said));
+        learner.observe(&history);
+        settle(&learner).await;
+    }
+    let lines = log_lines(&path);
+    let outcomes: Vec<&str> = lines
+        .iter()
+        .map(|l| l["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes[0], "provider_error", "{lines:?}");
+    assert!(
+        lines[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("scripted failure")
+    );
+    assert!(outcomes.contains(&"unreadable_reply"), "{outcomes:?}");
+    let unreadable = lines
+        .iter()
+        .find(|l| l["outcome"] == "unreadable_reply")
+        .unwrap();
+    assert!(
+        unreadable["reply_head"]
+            .as_str()
+            .unwrap()
+            .starts_with("I would record")
+    );
+    assert!(outcomes.contains(&"no_notes"), "{outcomes:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["model"] == "test/extractor" && l["at_ms"].is_number())
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["outcome"], "ingested", "{lines:?}");
+    assert_eq!(last["added"], 1);
+    assert!(last["reply_head"].as_str().unwrap().contains("should_"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // An unwritable path is ignored: learning proceeds exactly as with no log.
+    let mut broken = config();
+    broken.log = Some(dir.path().join("no/such/dir/learn.log"));
+    let script2 = Script::new(vec![reply(&json!([note(
+        "Test functions use the prefix should_.",
+        "every test is named should_"
+    )]))]);
+    let learner2 = self::learner(&store2, &script2, broken);
+    learner2.observe(&[user("Remember: every test is named should_")]);
+    settle(&learner2).await;
+    assert_eq!(learned(&store2).await.len(), 1);
 }
 
 #[tokio::test]

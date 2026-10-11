@@ -91,6 +91,12 @@ answer to `elefante-mem`, which decides what is kept. The model's reply is a *pr
 - **The watermark** is what is still pending: it shrinks only after a batch has been committed.
   Anything a future compactor drops from the history has therefore already been read, provided it
   calls `flush` first.
+- **The log.** `ELEFANTE_LEARN_LOG=<file>` makes the daemon append one JSON line per attempt: the
+  outcome (`provider_error`, `unreadable_reply`, `no_notes`, `ingested`, `store_error`), the stop
+  reason, whether the schema was sent, counts, the verifier's rejections (`QuoteNotFound` and so on),
+  and the first 400 characters of the reply. That is the only place a silent "nothing was learned"
+  is explained. The file holds fragments of the conversation, so it is created `0600`, only on
+  request, and a path that cannot be written is ignored.
 - **The role.** `ELEFANTE_EXTRACT_MODEL` and `ELEFANTE_EXTRACT_EFFORT` (default low); with no model
   set, the session's own. The request carries no tools and a response schema, which the provider
   sends only to models that declare structured output; the reply is validated either way. If a

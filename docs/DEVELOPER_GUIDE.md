@@ -1019,6 +1019,7 @@ Configuration precedence and defaults:
 | Extractor effort | — | `ELEFANTE_EXTRACT_EFFORT` | `low` |
 | Learning | — | `ELEFANTE_LEARN`: `1`/`on` consents, `0`/`off` disables | ask once (consent file) |
 | Idle flush | — | `ELEFANTE_LEARN_IDLE_SECS` | `300` |
+| Extraction log | — | `ELEFANTE_LEARN_LOG`: a file to append to | off |
 
 Models are named by OpenRouter slug, not by vendor model name. The default routes to Claude
 through OpenRouter; a different vendor's model is a different slug, not a different transport.

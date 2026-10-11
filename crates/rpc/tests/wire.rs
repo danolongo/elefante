@@ -227,7 +227,7 @@ fn method_results_and_all_application_errors_round_trip() {
     round_trip::<CreateResult>(json!({"session_id":"s1","seq":0}));
     round_trip::<CreateResult>(json!({
         "session_id":"s1", "seq":0,
-        "memory":{"consent":"unset","extractor":"provider/model"}
+        "memory":memory_status()
     }));
     round_trip::<MemoryConsentResult>(json!({"consent":"granted"}));
     round_trip::<MemoryStatus>(memory_status());
@@ -276,7 +276,7 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
         json!({"kind":"resumed","from":413,"events":[note(413,"text.delta",json!({"text":"continued"}))]}),
     );
     round_trip::<AttachResult>(
-        json!({"kind":"resumed","from":413,"events":[],"memory":{"consent":"declined","extractor":"provider/model"}}),
+        json!({"kind":"resumed","from":413,"events":[],"memory":memory_status()}),
     );
     let tools = json!([
         {"tool_call_id":"c1","name":"read","state":"running","is_error":false},
@@ -293,7 +293,7 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
     round_trip::<AttachResult>(json!({"kind":"snapshot","seq":981,"snapshot":snapshot}));
     round_trip::<AttachResult>(json!({
         "kind":"snapshot", "seq":981, "snapshot":snapshot,
-        "memory":{"consent":"off","extractor":null}
+        "memory":memory_status()
     }));
     snapshot["active_turn"]["pending_approval"] = Value::Null;
     round_trip::<SessionSnapshot>(snapshot.clone());

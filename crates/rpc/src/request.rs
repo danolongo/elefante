@@ -241,12 +241,12 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateResult {
     pub session_id: String,
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemorySeed>,
+    pub memory: Option<MemoryStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

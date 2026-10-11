@@ -10,7 +10,17 @@ export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_fa
 export type Snapshot = { session_id: string; seq: number; cwd: string; model: string; turns: CompletedTurn[]; active_turn: ActiveTurn | null };
 export type Consent = "unset" | "granted" | "declined" | "off";
 export type MemorySeed = { consent: Consent; extractor: string | null };
-export type CreateResult = { session_id: string; seq: number; memory?: MemorySeed };
+export type MemoryStatus = MemorySeed & {
+  enabled: boolean;
+  learning: "working" | "paused" | "failing";
+  notes: { active: number; pending: number };
+  index: "off" | "building" | "ready";
+  spend: Usage;
+  problem: string | null;
+};
+export type MemoryInfo = MemorySeed | MemoryStatus;
+export type MemoryNote = { id: number; kind: string; status: string; statement: string; origin: string };
+export type CreateResult = { session_id: string; seq: number; memory?: MemoryInfo };
 type EventParams = {
   "turn.started": Record<string, never>;
   "reasoning.delta": { text: string };
@@ -21,9 +31,12 @@ type EventParams = {
   "approval.resolved": { approval_id: string; approved: boolean };
   "turn.finished": { stop_reason: StopReason; usage: Usage };
   "session.error": { message: string };
+  "memory.status": MemoryStatus;
+  "memory.learned": { note: MemoryNote; change: "added" | "promoted" | "superseded" | "revived"; replaced?: MemoryNote };
+  "memory.context": { notes: MemoryNote[] };
 };
 export type Notification = { [K in keyof EventParams]: { session_id: string; turn_id: string | null; method: K; params: EventParams[K] } & ({ seq: number; seq_from?: never; seq_to?: never } | { seq?: never; seq_from: number; seq_to: number }) }[keyof EventParams];
-export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemorySeed };
+export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemoryInfo };
 export class ProtocolError extends Error {}
 export class RpcError extends Error { constructor(public code: number, message: string) { super(message); } }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -32,11 +45,19 @@ const strings = (v: Record<string, unknown>, ...keys: string[]) => keys.every(k 
 const usage = (v: unknown): v is Usage => object(v) && ["input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "cache_write_tokens"].every(k => integer(v[k])) && (v.cost === null || typeof v.cost === "number" && Number.isFinite(v.cost) && v.cost >= 0);
 const stopReason = (v: unknown): v is StopReason => typeof v === "string" ? ["end_turn", "tool_use", "max_tokens", "refusal", "stop_sequence", "interrupted"].includes(v) : object(v) && typeof v.other === "string";
 const consents: Consent[] = ["unset", "granted", "declined", "off"];
-function parseMemory(value: unknown): MemorySeed | undefined {
+const memoryNote = (v: unknown): v is MemoryNote => object(v) && integer(v.id) && strings(v, "kind", "status", "statement", "origin");
+function parseMemory(value: unknown): MemoryInfo | undefined {
   if (value === undefined) return undefined;
   if (!object(value) || !consents.includes(value.consent as Consent) || !(value.extractor === null || typeof value.extractor === "string")) throw new ProtocolError("Invalid memory state");
-  return { consent: value.consent as Consent, extractor: value.extractor as string | null };
+  const seed: MemorySeed = { consent: value.consent as Consent, extractor: value.extractor as string | null };
+  if (value.enabled === undefined) return seed; // M3.1 daemon: consent only.
+  if (typeof value.enabled !== "boolean" || !["working", "paused", "failing"].includes(value.learning as string)
+    || !object(value.notes) || !integer(value.notes.active) || !integer(value.notes.pending)
+    || !["off", "building", "ready"].includes(value.index as string) || !usage(value.spend)
+    || !(value.problem === null || typeof value.problem === "string")) throw new ProtocolError("Invalid memory status");
+  return { ...seed, enabled: value.enabled, learning: value.learning as MemoryStatus["learning"], notes: { active: value.notes.active, pending: value.notes.pending }, index: value.index as MemoryStatus["index"], spend: value.spend, problem: value.problem as string | null };
 }
+export const isMemoryStatus = (memory: MemoryInfo | undefined): memory is MemoryStatus => memory !== undefined && "enabled" in memory;
 export function parseCreate(value: unknown): CreateResult {
   if (!object(value) || !strings(value, "session_id") || !integer(value.seq)) throw new ProtocolError("Invalid create response");
   const memory = parseMemory(value.memory);
@@ -64,6 +85,9 @@ export function parseNotification(value: unknown): Notification {
     case "approval.resolved": valid = strings(p, "approval_id") && typeof p.approved === "boolean"; break;
     case "turn.finished": valid = stopReason(p.stop_reason) && usage(p.usage); break;
     case "session.error": valid = strings(p, "message"); break;
+    case "memory.status": valid = isMemoryStatus(parseMemory(p)); break;
+    case "memory.learned": valid = memoryNote(p.note) && ["added", "promoted", "superseded", "revived"].includes(p.change as string) && (p.replaced === undefined || memoryNote(p.replaced)); break;
+    case "memory.context": valid = Array.isArray(p.notes) && p.notes.every(memoryNote); break;
   }
   if (!valid) throw new ProtocolError("Invalid notification params");
   return value as Notification;

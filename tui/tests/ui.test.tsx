@@ -12,7 +12,7 @@ import { Status } from "../src/ui/Status";
 import { Input } from "../src/ui/Input";
 import { Modal } from "../src/ui/Modal";
 import { App } from "../src/ui/App";
-import { note, stream } from "./fixtures";
+import { memoryStatus, note, stream } from "./fixtures";
 
 // A lone ESC byte is ambiguous with the start of an escape sequence, so OpenTUI's stdin parser
 // holds it for 20 ms before reporting it. Real terminals see the same delay.
@@ -123,6 +123,21 @@ test("finished status displays provider reasoning usage and removes the live est
     expect(frame).not.toContain("Thinking");
     expect(frame).not.toContain("estimate");
   } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("memory spend joins the single total and only exceptional memory state adds a suffix", async () => {
+  const base = stream().reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  const render = async (memory: ReturnType<typeof memoryStatus>) => {
+    const setup = await testRender(<Status state={{ ...base, memory }} now={6000} />, { width: 150, height: 5 });
+    try { await setup.renderOnce(); return setup.captureCharFrame(); }
+    finally { await act(async () => setup.renderer.destroy()); }
+  };
+  const healthy = await render(memoryStatus());
+  expect(healthy).toContain("20 in / 10 out / 9 reasoning | cost: $0.0100");
+  expect(healthy).not.toContain("memory:");
+  expect(await render(memoryStatus({ consent: "unset", learning: "paused" }))).toContain("memory: paused  /memory");
+  expect(await render(memoryStatus({ learning: "failing", problem: "no reply from the provider" }))).toContain("memory: not saving  /memory");
+  expect(await render(memoryStatus({ enabled: false, learning: "paused", problem: "the memory key is unavailable" }))).toContain("memory: unavailable");
+  expect(await render(memoryStatus({ consent: "declined", learning: "paused" }))).not.toContain("memory:");
 });
 test("the status line, prompt border and placeholder are tints of one blue: light, rgb(78, 126, 163), darker", async () => {
   const setup = await testRender(<box flexDirection="column"><Status state={initialSession("s")} now={0} /><Input disabled={false} onSubmit={() => {}} /></box>, { width: 60, height: 6 });

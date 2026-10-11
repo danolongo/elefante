@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseConsentResult, parseCreate, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
-import { note, snapshot, stream } from "./fixtures";
+import { memoryStatus, note, snapshot, stream } from "./fixtures";
 
 test("NDJSON handles every byte split including UTF-8, escaped newline and multiple frames", () => {
   const frames = [note(1, "text.delta", { text: "🐘\nanswer" }), note(2, "turn.started")];
@@ -60,6 +60,12 @@ test("create and both attach shapes validate optional additive memory consent", 
     expect(() => parseCreate({ session_id: "s", seq: 0, memory: invalid })).toThrow(ProtocolError);
   }
   expect(() => parseConsentResult({ consent: "maybe" })).toThrow(ProtocolError);
+
+  const full = memoryStatus();
+  expect(parseCreate({ session_id: "s", seq: 0, memory: full }).memory).toEqual(full);
+  expect(parseNotification({ ...note(3, "memory.status", full), turn_id: null }).params).toEqual(full);
+  expect(() => parseNotification({ ...note(3, "memory.status", { ...full, spend: {} }), turn_id: null })).toThrow(ProtocolError);
+  expect(parseNotification({ ...note(4, "memory.learned", { note: { id: 14, kind: "convention", status: "active", statement: "Use pnpm.", origin: "explicit" }, change: "added" }), turn_id: null }).method).toBe("memory.learned");
 });
 
 test("the seen resume window remains bounded for large coalesced ranges", () => {

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { addUsage, emptyUsage, initialSession, reduceSession, restoreSnapshot, type Segment } from "../src/session";
-import { note, snapshot, stream } from "./fixtures";
+import { memoryStatus, note, snapshot, stream } from "./fixtures";
 
 test("two clients deterministically preserve reasoning and answer, tools, approval and usage", () => {
   const run = () => stream().reduce((state, event) => reduceSession(state, event, event.seq!), { ...initialSession("s"), pending_prompt: "hello" });
@@ -87,4 +87,14 @@ test("usage distinguishes no report and reported zero and accumulates across tur
   state = stream().map(n => note(n.seq! + 10, n.method, n.params, "t2")).reduce((s, n) => reduceSession(s, n), state);
   expect(state.usage.output_tokens).toBe(10);
   expect(state.turns).toHaveLength(2);
+});
+
+test("turn-less memory status is state, advances sequence, and survives snapshot restore", () => {
+  const status = memoryStatus({ learning: "failing", problem: "no reply from the provider" });
+  const running = reduceSession(initialSession("s"), note(1, "turn.started"), 10);
+  const updated = reduceSession(running, note(2, "memory.status", status, null));
+  expect(updated.seq).toBe(2);
+  expect(updated.memory).toEqual(status);
+  expect(updated.active_turn?.turn_id).toBe("t");
+  expect(restoreSnapshot(snapshot(), 0, "high", status).memory).toEqual(status);
 });

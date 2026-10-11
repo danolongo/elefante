@@ -395,8 +395,9 @@ Constraints that follow from the existing design, to be honoured when the design
   prompt cache once its TTL has lapsed; that is a cost, not a defect.
 - **Transcripts are secrets-adjacent.** User prompts are not scrubbed today and can contain a
   pasted key. Every durable write goes through `Scrubber`, the same call site M3 uses for memory
-  rows. The path policy also denies only `.elefante/credentials.toml`; once transcripts live in
-  `<repo>/.elefante/`, whether the agent may read its own history is a decision, not a default.
+  rows. The path policy now denies everything beneath `.elefante/` (harness state: learned notes, the
+  index, keys), for tools and for bash arguments alike; a transcript store placed there is therefore
+  hidden from the agent by default, and exposing it would be a deliberate exception.
 - **Snapshot growth gets decided here.** Developer guide §14 open question 1 — snapshots grow
   without bound per session — becomes real once conversations live for weeks. Paging completed
   turns, or capping the snapshot to the last N with the rest fetched on demand, is part of M6.

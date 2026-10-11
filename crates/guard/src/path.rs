@@ -248,6 +248,12 @@ pub(crate) fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
         if *component == ".elefante" && components.get(index + 1) == Some(&"credentials.toml") {
             return Some(".elefante/credentials.toml");
         }
+        // The harness's own state: learned notes, the index and its keys. The agent reaches them
+        // through the injected context and `memory_search`, never as files, so a pending note or a
+        // superseded one cannot be read around the rule that hides it.
+        if *component == ".elefante" && components.get(index + 1).is_some() {
+            return Some(".elefante/** (harness state)");
+        }
         if *component == ".env" || component.starts_with(".env.") {
             return Some(".env or .env.*");
         }

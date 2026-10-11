@@ -76,6 +76,9 @@ fn denies_credentials_for_readers_transformers_and_redirects() {
         "sed 's/sk-ant/changed/' ${HOME}/.elefante/credentials.toml",
         "tr a b < '.elefante/credentials.toml'",
         "base64 .elefante/credentials.toml",
+        "sqlite3 .elefante/memory.db '.schema'",
+        "cat .elefante/memory.db",
+        "grep -c note ./.elefante/cache.db",
         "grep SECRET .e''nv",
         "sed -n 1p .e''nv",
     ] {

@@ -36,6 +36,10 @@ assert_eq!(decision.rule, "destructive-command");
 let clean = Scrubber::new().scrub(&tool_output);
 ```
 
+Everything beneath a `.elefante/` directory is denied as harness state (learned notes, the index,
+keys): the agent sees notes through the injected context and `memory_search`, never as files, so
+it cannot read a pending or superseded note around the rule that hides it.
+
 `PathPolicy::with_denied_patterns` adds repository-relative globs on top of the built-in secret
 rules. `BashClassifier::classify` is the same as `classify_in` rooted at `.`.
 

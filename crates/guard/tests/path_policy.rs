@@ -34,6 +34,9 @@ fn denies_traversal_and_secret_variants() {
         ".aws/credentials",
         ".elefante/credentials.toml",
         ".elefante/memory.key",
+        ".elefante/memory.db",
+        ".elefante/cache.db-wal",
+        "sub/.elefante/anything",
     ] {
         assert!(
             matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
@@ -184,6 +187,7 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         ".ssh/config",
         "home/.aws/credentials",
         ".elefante/credentials.toml",
+        ".elefante/memory.db",
         "id_rsa",
         "id_rsa.pub",
         ".netrc",
@@ -199,7 +203,7 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         "docs/keys.md",
         "monkey.rs",
         ".github/workflows/ci.yml",
-        ".elefante/memory.db",
+        ".elefante",
         ".aws/config",
     ] {
         // `.envrc.md.bak` is a directory name that merely begins with `.env`; it does not match

@@ -5,10 +5,12 @@ import { Transcript } from "./Transcript";
 import { Status } from "./Status";
 import { Input } from "./Input";
 import { Modal, type ModalProps } from "./Modal";
+import { MemoryPanel } from "./MemoryPanel";
+import type { Command } from "../commands";
 import { PerchMascot, TopMascot, useMascot } from "./Mascot";
 import { copyText, systemTargets } from "./copy";
 // `resumed` skips the new-session intro; `animateMascot` is false only under test.
-export type AppProps = { state: SessionState; now: number; connected: boolean; submitting?: boolean; resumed?: boolean; animateMascot?: boolean; message: string | null; modal: ModalProps | null; onSubmit: (text: string) => void; onInterrupt: () => void; onExit: () => void };
+export type AppProps = { state: SessionState; now: number; connected: boolean; submitting?: boolean; resumed?: boolean; animateMascot?: boolean; message: string | null; notice?: string | null; modal: ModalProps | null; onSubmit: (text: string) => void; onCommand: (command: Exclude<Command, { kind: "prompt" }>) => void; onInterrupt: () => void; onExit: () => void };
 export function App(props: AppProps) {
   const mascot = useMascot(props.state, props.resumed);
   const renderer = useRenderer();
@@ -34,11 +36,13 @@ export function App(props: AppProps) {
       <box flexDirection="column" flexGrow={1}>
         <Status state={props.state} now={props.now} />
         {props.message && <text fg="#ffaaaa">{props.message}</text>}
+        {props.notice && <text fg="#777777">{props.notice}</text>}
         {!props.connected && <text>Reconnecting… the turn continues in the daemon.</text>}
-        <Input disabled={!props.connected || !!props.submitting || !!props.state.active_turn || !!props.modal} onSubmit={props.onSubmit} />
+        <Input disabled={!props.connected || !!props.submitting || !!props.state.active_turn || !!props.modal} onSubmit={props.onSubmit} onCommand={props.onCommand} />
       </box>
       <PerchMascot view={mascot} animate={props.animateMascot} />
     </box>
-    {props.modal && <Modal key={props.modal.kind === "approval" ? props.modal.approval.approval_id : props.modal.kind} {...props.modal} />}
+    {props.modal?.kind === "memory" ? <MemoryPanel {...props.modal} />
+      : props.modal && <Modal key={props.modal.kind === "approval" ? props.modal.approval.approval_id : props.modal.kind} {...props.modal} />}
   </box>;
 }

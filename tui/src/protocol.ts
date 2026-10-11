@@ -52,6 +52,17 @@ export function displaySafe(text: string): string {
 export function safeMemoryNote(note: MemoryNote): MemoryNote {
   return { ...note, kind: displaySafe(note.kind), status: displaySafe(note.status), statement: displaySafe(note.statement), origin: displaySafe(note.origin) };
 }
+export type MemoryRow = MemoryNote & { confidence: number; verified: boolean; reinforcements: number };
+/** The `memory.list` result, with every text column made safe to draw. */
+export function parseMemoryList(value: unknown): MemoryRow[] {
+  if (!object(value) || !Array.isArray(value.notes)) throw new ProtocolError("Invalid memory list");
+  return value.notes.map(row => {
+    if (!object(row) || !memoryNote(row)) throw new ProtocolError("Invalid memory note");
+    const { confidence, verified, reinforcements } = row as Record<string, unknown>;
+    if (typeof confidence !== "number" || typeof verified !== "boolean" || !integer(reinforcements)) throw new ProtocolError("Invalid memory note");
+    return { ...safeMemoryNote(row), confidence, verified, reinforcements };
+  });
+}
 const memoryNote = (v: unknown): v is MemoryNote => object(v) && integer(v.id) && strings(v, "kind", "status", "statement", "origin");
 function parseMemory(value: unknown): MemoryInfo | undefined {
   if (value === undefined) return undefined;

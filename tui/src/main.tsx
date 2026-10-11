@@ -2,7 +2,9 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, type CreateResult, type MemorySeed } from "./protocol";
+import { RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, parseMemoryList, type CreateResult, type MemoryRow, type MemorySeed } from "./protocol";
+import type { Command } from "./commands";
+import { learningLine } from "./memoryView";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
 import { Root } from "./ui/Root";
 import { publish } from "./store";
@@ -38,6 +40,8 @@ let retryPrompt = "";
 let stopped = false;
 let reconnecting = false;
 let consentPrompt: MemorySeed | null = null;
+let panel: { rows: MemoryRow[] | null; error: string | null; busy: boolean } | null = null;
+let notice: string | null = null;
 let timer: ReturnType<typeof setInterval>;
 const exit = () => { stopped = true; clearInterval(timer); rpc.close(); renderer.destroy(); };
 const fail = (error: unknown) => { message = error instanceof Error ? error.message : String(error); draw(); };
@@ -45,7 +49,7 @@ async function prompt(text: string) {
   if (submitting) return;
   submitting = true;
   state = { ...state, pending_prompt: text };
-  message = null;
+  message = null; notice = null;
   draw();
   try { await rpc.request("session.prompt", { session_id: state.session_id, text }); }
   catch (error) {
@@ -55,11 +59,36 @@ async function prompt(text: string) {
   submitting = false;
   draw();
 }
+const memoryError = (error: unknown, id?: number) =>
+  error instanceof RpcError && error.code === -32006 ? `No saved note #${id}.`
+  : error instanceof RpcError && error.code === -32007 ? "Memory is switched off for this repository."
+  : error instanceof Error ? error.message : String(error);
+async function refreshNotes() {
+  try { const rows = parseMemoryList(await rpc.request("memory.list", { cwd: state.cwd })); panel = { rows, error: null, busy: false }; }
+  catch (error) { panel = { rows: panel?.rows ?? null, error: memoryError(error), busy: false }; }
+}
+async function forgetNote(id: number) {
+  if (panel) panel = { ...panel, busy: true, error: null };
+  draw();
+  try { await rpc.request("memory.forget", { cwd: state.cwd, id }); notice = `Forgot note #${id}.`; if (panel) await refreshNotes(); }
+  catch (error) { if (panel) panel = { ...panel, error: memoryError(error, id) }; else fail(memoryError(error, id)); }
+  if (panel) panel = { ...panel, busy: false };
+  draw();
+}
+async function command(c: Exclude<Command, { kind: "prompt" }>) {
+  message = null; notice = null;
+  if (c.kind === "forget") return forgetNote(c.id);
+  panel = { rows: null, error: null, busy: false };
+  draw();
+  await refreshNotes();
+  draw();
+}
 function draw() {
   if (stopped) return;
   const approval = state.active_turn?.pending_approvals[0];
   let modal: ModalProps | null = null;
-  if (consentPrompt) modal = { kind: "consent", extractor: consentPrompt.extractor!, sameModel: consentPrompt.extractor === state.model, busy, onDecision: async decision => {
+  if (panel) modal = { kind: "memory", cwd: state.cwd, rows: panel.rows, error: panel.error, learning: learningLine(state.memory), extractor: state.memory?.extractor ?? null, busy: panel.busy, onForget: id => void forgetNote(id), onClose: () => { panel = null; draw(); } };
+  else if (consentPrompt) modal = { kind: "consent", extractor: consentPrompt.extractor!, sameModel: consentPrompt.extractor === state.model, busy, onDecision: async decision => {
     if (decision === "later") { consentPrompt = null; draw(); return; }
     busy = true; draw();
     try {
@@ -82,7 +111,7 @@ function draw() {
   } };
   // Publish, never re-render: `root.render()` remounts the tree on every call, so calling it
   // per update leaked one keypress listener each time — four a second, unbounded.
-  publish({ state, now: Date.now(), connected, submitting, resumed, message: message ?? state.error, modal, onSubmit: text => void prompt(text), onInterrupt: () => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }, onExit: exit });
+  publish({ state, now: Date.now(), connected, submitting, resumed, message: message ?? state.error, notice, modal, onSubmit: text => void prompt(text), onCommand: c => void command(c), onInterrupt: () => { void rpc.request("session.interrupt", { session_id: state.session_id }).catch(fail); }, onExit: exit });
 }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function recover() {

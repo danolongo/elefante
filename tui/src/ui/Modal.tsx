@@ -1,11 +1,13 @@
 import { useKeyboard, usePaste } from "@opentui/react";
 import { useState } from "react";
 import type { Approval } from "../protocol";
-export type ModalProps =
+import type { MemoryPanelProps } from "./MemoryPanel";
+type DialogProps =
   | { kind: "approval"; approval: Approval; busy: boolean; onDecision: (decision: "allow" | "deny") => void }
   | { kind: "key"; busy: boolean; onKey: (key: string) => void }
   | { kind: "consent"; extractor: string; sameModel: boolean; busy: boolean; onDecision: (decision: "learn" | "off" | "later") => void };
-export function Modal(props: ModalProps) {
+export type ModalProps = DialogProps | MemoryPanelProps;
+export function Modal(props: DialogProps) {
   const [secret, setSecret] = useState("");
   usePaste(event => { if (props.kind === "key" && !props.busy) { event.preventDefault(); setSecret(s => s + new TextDecoder().decode(event.bytes).replace(/[\r\n]/g, "")); } });
   useKeyboard(key => {

@@ -408,7 +408,11 @@ async fn memory_search_rejects_bad_input_without_asking_the_index() {
         let result = executor.execute("memory_search", input.clone()).await;
         assert!(result.is_error, "{input} must be rejected, got {result:?}");
     }
-    assert!(index.requests().is_empty());
+    assert_eq!(
+        index.requests().len(),
+        0,
+        "a rejected input must not reach the index"
+    );
 }
 
 #[tokio::test]

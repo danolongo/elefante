@@ -1,5 +1,6 @@
 //! Provider-neutral agent loop.
 
+pub mod learn;
 pub mod memory;
 
 use std::{
@@ -358,6 +359,7 @@ impl Session {
                 tools: definitions.clone(),
                 messages: self.request_messages(turn),
                 effort: self.config.effort,
+                response_schema: None,
             };
             let completed = receive_round(provider, request, cancel, usage, emit).await?;
             full_text.push_str(&completed.text);

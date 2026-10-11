@@ -93,6 +93,20 @@ impl OpenRouterProvider {
         {
             body.insert("reasoning".into(), json!({ "effort": effort }));
         }
+        if capabilities.structured_output
+            && let Some(schema) = &request.response_schema
+        {
+            body.insert(
+                "response_format".into(),
+                json!({
+                    "type": "json_schema",
+                    "json_schema": { "name": schema.name, "strict": true, "schema": schema.schema },
+                }),
+            );
+            // Without this an endpoint that does not implement structured outputs may ignore the
+            // field and return prose, which the caller would then have to reject.
+            body.insert("provider".into(), json!({ "require_parameters": true }));
+        }
         Value::Object(body)
     }
 }

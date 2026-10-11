@@ -92,6 +92,9 @@ impl Harness {
             stub_provider: Some(script),
             idle_timeout: Duration::from_secs(60),
             memory,
+            learn: false,
+            learn_idle: Duration::from_secs(300),
+            learn_timeout: Duration::from_secs(60),
         };
         let task = tokio::spawn(run(config.clone()));
         for _ in 0..200 {

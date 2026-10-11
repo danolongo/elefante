@@ -1168,3 +1168,27 @@ async fn a_cancelled_learner_does_not_retry_a_failed_batch_or_take_new_text() {
         "text offered after cancel is not read"
     );
 }
+
+#[tokio::test]
+async fn the_log_never_carries_control_or_bidirectional_characters_from_a_reply() {
+    let (_tmp, store) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("learn.log");
+    let mut logging = config();
+    logging.log = Some(path.clone());
+    logging.max_failures = 1;
+    let script = Script::new(vec![Reply::Text(
+        "\u{1b}[31mred\u{202e}reversed\u{200b}zero\u{85}c1 and not json".to_owned(),
+    )]);
+    let learner = learner(&store, &script, logging);
+    learner.observe(&[user("Remember: this is only to trigger a call.")]);
+    settle(&learner).await;
+    let lines = log_lines(&path);
+    let head = lines[0]["reply_head"].as_str().unwrap();
+    assert!(head.contains("red"), "{head}");
+    assert!(
+        head.chars()
+            .all(|c| !c.is_control() && !matches!(c, '\u{202e}' | '\u{200b}' | '\u{85}')),
+        "{head:?}"
+    );
+}

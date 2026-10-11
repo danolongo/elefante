@@ -480,3 +480,33 @@ async fn cloned_executor_supports_parallel_calls() {
     assert_eq!((a.content.as_str(), a.is_error), ("alpha", false));
     assert_eq!((b.content.as_str(), b.is_error), ("beta", false));
 }
+
+#[tokio::test]
+async fn memory_search_accepts_note_and_a_bad_kind_names_every_valid_one() {
+    let index = FakeIndex::replying(Ok("memory convention — Use pnpm.".to_owned()));
+    let (_temp, executor) = indexed(&index);
+    let ok = executor
+        .execute("memory_search", json!({"query": "pnpm", "kind": "note"}))
+        .await;
+    assert!(!ok.is_error, "{ok:?}");
+    assert_eq!(
+        index.requests()[0].kind,
+        Some(elefante_tools::SearchKind::Note)
+    );
+
+    let bad = executor
+        .execute(
+            "memory_search",
+            json!({"query": "pnpm", "kind": "convention"}),
+        )
+        .await;
+    assert!(bad.is_error);
+    for kind in ["file", "symbol", "note"] {
+        assert!(bad.content.contains(kind), "{}", bad.content);
+    }
+    assert_eq!(
+        index.requests().len(),
+        1,
+        "the bad request never reached the index"
+    );
+}

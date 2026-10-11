@@ -672,6 +672,17 @@ fn a_note_search_keeps_a_full_length_statement_and_never_returns_a_pending_one()
             .unwrap()
         })
         .unwrap();
+    let stored = live
+        .store
+        .reader()
+        .call_blocking(move |s| learn::list(&s.memory, &key(), true, T0).unwrap())
+        .unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|row| row.status == "pending" && row.statement.contains("hardware key")),
+        "the assistant-only claim was stored, pending: {stored:?}"
+    );
     let found = live
         .store
         .reader()

@@ -371,6 +371,12 @@ fn cut(text: &str) -> String {
     text.chars().take(400).collect()
 }
 
+/// The start of a model reply for the log: cut, and stripped of control, bidirectional and
+/// zero-width characters so reading the file in a terminal cannot be steered by it.
+fn log_head(text: &str) -> String {
+    learn::display_safe(&cut(text))
+}
+
 // ----- the learner -----
 
 #[derive(Default)]
@@ -531,7 +537,7 @@ impl Learner {
                 "promoted": report.promoted.len(), "superseded": report.superseded.len(),
                 "rejections": report.rejected.iter()
                     .map(|(index, reason)| format!("candidate {index}: {reason:?}")).collect::<Vec<_>>(),
-                "invalid_entries": invalid, "reply_head": cut(reply),
+                "invalid_entries": invalid, "reply_head": log_head(reply),
             }),
         );
     }
@@ -903,7 +909,7 @@ impl Learner {
             self.note(|d| d.last_unreadable_reply = Some(cut(&reply)));
             self.log(
                 "unreadable_reply",
-                json!({"reply_chars": reply.chars().count(), "reply_head": cut(&reply)}),
+                json!({"reply_chars": reply.chars().count(), "reply_head": log_head(&reply)}),
             );
             self.record_failure(LearnFailure::UnreadableReply);
             self.fail(taken);
@@ -915,7 +921,7 @@ impl Learner {
             add!(self.stats, empty, 1);
             self.log(
                 "no_notes",
-                json!({"invalid_entries": outcome.invalid, "reply_head": cut(&reply)}),
+                json!({"invalid_entries": outcome.invalid, "reply_head": log_head(&reply)}),
             );
             self.clear_failure_diagnostics();
             self.record_success();

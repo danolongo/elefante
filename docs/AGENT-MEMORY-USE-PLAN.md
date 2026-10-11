@@ -71,12 +71,15 @@ CI (flaky, billable).
 - **mem:** `note` returns only `memory …` lines and never a pending note; `file`/`symbol` return no
   note; the notice appears exactly when a note line is returned (unfiltered and `note`), not for
   code-only output; no "still being built" suffix under `note`; empty `note` result wording; a
-  200-character statement survives.
-- **core:** `MemSearchTool` maps `Note`; a session with a context source lists `memory_search` and
-  carries the hint in its single system string; a session without one lists neither; the standing
-  prompt with the hint stays under the word cap.
-- **srv:** a session with an index has the hint and the tool in its first request; with
-  `ELEFANTE_MEMORY=0` it has neither and `system` equals `DEFAULT_SYSTEM_PROMPT`.
+  statement of 161–180 characters survives (the injected block's cap is 200 with the prefix).
+- **core:** `MemSearchTool` maps `Note` over a real store (`core/tests/memory_search.rs`); the tool
+  follows the executor and the hint follows the context source, in one fixed system string
+  (`core/tests/context.rs`); the standing prompt with both hints stays under the word cap.
+- **srv:** `srv/tests/learn.rs::the_learning_sentence_is_sent_only_where_learning_can_run` checks the
+  hints and the tool list across learning modes and with memory off.
+
+(An earlier revision of this plan listed these tests before they existed; the review caught that. They
+are written now.)
 
 ## 5. Measurement (manual, credentialed; not a CI gate)
 

@@ -340,7 +340,8 @@ one-line stderr notice from a headless terminal client while consent is unset.
   from the first request after a grant (`srv/tests/learn.rs`). The answer persists across a daemon
   restart, applies to a second live session, is bound to the extractor (a different one reads
   `unset`), `ELEFANTE_LEARN=1` needs no file, `0` beats a granted file, a tampered file reads `unset`,
-  and revoking discards held text before idle, close or exit can flush it.
+  and revoking stops the learner (see *PR #15 review remediation* below for exactly what that
+  guarantees).
 - *Skew.* The Rust types and the TS parser accept a result with and without `memory`
   (`rpc/tests/wire.rs`, `tui/tests/protocol.test.ts`).
 - The consent modal discloses the extractor and offers only Y, N and Esc; typing and Esc stay in it
@@ -477,6 +478,61 @@ In a one-shot `elefante "prompt"` the session closes before extraction usually f
 **Amended.** `MEMORY-UI-DESIGN.md` is now an implemented design, with the unbuilt parts marked;
 `DEVELOPER_GUIDE.md` § 5 gained **Memory wire**; `PLAN.md` marks M3.1 and the memory parts of M5, M6 and
 M7 shipped.
+
+---
+
+## PR #15 review remediation            (implemented 2026-10-11, branch `fix/agent-memory-use`)
+
+Two adversarial reviews of PR #15 found the defects below; each was reproduced by a failing test
+first, then fixed. Plan: `docs/PR15-REVIEW-FIXES-PLAN.md`.
+
+- **Revoking consent now stops a running learner** (was: dropped the session's handle but left the
+  learner retrying and reporting). `Learner::cancel()` forgets what is waiting, drops a call in
+  flight, discards its reply (cost still counted) and reports nothing. *Guarantee, and its limit:*
+  after the revoke is answered no new extraction request starts and no new note is reported; a write
+  already committing on the store's writer thread may complete. Covered by `core/tests/learn.rs`
+  (cancel in flight; no retry after cancel) and `srv/tests/learn.rs` (withdrawal while an extraction
+  is out; 15 interleavings of a turn against a withdrawal; health cleared across revoke and
+  re-grant). The check-then-act gap in `observe_learning` is closed by holding the consent guard
+  until the learner has the text (reasoned from the lock order, regression-guarded by the
+  interleaving test, not proved).
+- **Consent is kept per extractor model.** One record had let `elefante memory learn on` grant for a
+  model the session would not use and overwrite another model's answer. The file holds one verified
+  record per extractor, `memory.consent` takes `extractor`, `memory learn` takes `--model` and names
+  the model, and the daemon re-reads the file when it changes (`mem/tests/consent.rs`,
+  `cli/tests/memory.rs`, `srv/tests/learn.rs`).
+- **`memory.*` by cwd never creates or rebuilds a store.** A plain directory is no longer given a
+  `.elefante`; a foreign-stamped store is refused and left byte-identical; absent means empty.
+  Repository status is deterministic (latest session speaks, spend summed, failing wins).
+- **Older daemons.** `memory.*` answered "method not found" no longer makes the CLI hard-fail; it
+  falls back to the store, and `learn` writes the file and warns that the daemon must be restarted
+  (`cli/tests/client.rs`, using a fake daemon).
+- **Provenance.** The panel read every note as "assistant — you confirmed" because the daemon sent
+  `learned:stated`; the daemon now sends the unprefixed origin (as `memory.learned` does) and the TUI
+  parser tolerates both (`srv/tests/learn.rs`, `tui/tests/commands.test.ts`). Reconnect now applies
+  the attach result's memory state; `/forget` accepts any run of spaces; the extractor and cwd are
+  made display-safe.
+- **Guard.** A bare `.elefante` argument, glob forms (`.elef*`, `.[e]lefante`), recursive `grep` or
+  `rg -u` over the workspace root, and a workspace sitting under any `.elefante` directory were
+  wrong; the first three now `Deny`/`Escalate` and the last is allowed. *The guard reduces accidental
+  reads; it is not a sandbox.* Still unguarded and listed in `BashClassifier::known_gaps()`: shell
+  variables, `cd` then a relative path, interpreters and `sqlite3` with a runtime-assembled path,
+  `xargs` and command substitution producing a path.
+- **Prompts.** The "harness may save preferences" sentence is no longer in `DEFAULT_SYSTEM_PROMPT`;
+  the daemon adds it (`LEARNING_HINT`) only where learning can run. `memory_search` is listed
+  according to the executor, not the context source. The extractor is told to skip a claim the
+  assistant has shown to be wrong rather than to keep it. `ELEFANTE_LEARN_LOG` heads are made
+  display-safe.
+
+**Still not covered by a test:** the `.elefante` bypass classes in the known-gaps list (asserted as
+`Allow` precisely so the limit is documented); the bun-built binary against a real older daemon; the
+credentialed suite on this tree (run it from a shell with a key; `live_learned_memory_is_extracted_
+stored_and_used` must run against the new extractor prompt).
+
+**Deferred, with reasons.** The learner's held history grows for the whole session (needs the
+watermark/history ownership reworked); both parsers reject a *new value* of a known enum (a protocol
+policy decision wider than this PR); `kind:"note"` returns at most about six text-matched notes;
+notes may rank below code in unfiltered search (unmeasured; predates this work).
 
 ---
 

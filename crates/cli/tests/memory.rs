@@ -339,7 +339,7 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
         output.stdout,
         b"memory learning is granted for vendor/extractor\n"
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
 
     let key_path = home.join(".elefante/memory.key");
     let key = MemKey::load_or_create(&key_path).unwrap();

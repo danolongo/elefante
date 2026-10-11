@@ -113,8 +113,8 @@ fn with_nothing_learned_the_block_is_byte_identical_to_code_only_retrieval() {
         .unwrap();
     let with_key = block(&live.store, query, T0).unwrap();
     assert_eq!(plain.rendered, with_key.rendered);
-    assert!(plain.learned.is_empty());
-    assert!(with_key.learned.is_empty());
+    assert_eq!(plain.learned.len(), 0);
+    assert_eq!(with_key.learned.len(), 0);
     assert!(!with_key.rendered.contains("repo-memory"));
 }
 

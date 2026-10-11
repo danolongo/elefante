@@ -444,7 +444,7 @@ fn parser_ignores_unknown_future_fields_and_chunks() {
             r#"{"choices":[{"index":0,"delta":{},"native_finish_reason":"end_turn"}]}"#,
         ],
     );
-    assert!(events.is_empty());
+    assert_eq!(events.len(), 0);
 }
 
 #[test]

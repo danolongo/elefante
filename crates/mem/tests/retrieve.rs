@@ -410,7 +410,7 @@ fn scope_confines_hits_to_a_subdirectory_while_the_index_covers_everything() {
             "{scope}: {:?}",
             paths(&scoped)
         );
-        assert!(!paths(&scoped).is_empty());
+        assert_ne!(paths(&scoped).len(), 0);
     }
 }
 

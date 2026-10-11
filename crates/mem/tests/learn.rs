@@ -413,7 +413,7 @@ fn a_quote_that_is_not_in_the_conversation_is_rejected() {
         T0,
     );
     assert_eq!(report.rejected, vec![(0, Rejection::QuoteNotFound)]);
-    assert!(nodes(&live.store).is_empty());
+    assert_eq!(nodes(&live.store).len(), 0);
     assert!(!report.changed);
 }
 
@@ -586,7 +586,7 @@ fn a_command_or_url_must_be_in_the_users_own_words() {
         &[],
         T0,
     );
-    assert!(report.rejected.is_empty());
+    assert_eq!(report.rejected.len(), 0);
     let report = run(
         &live.store,
         &[cand(
@@ -764,7 +764,7 @@ fn the_same_fact_twice_in_reordered_words_is_one_note_with_raised_confidence() {
     );
     let report = run(&live.store, &[again], &tabs_turn(), &[], T0 + DAY);
     assert_eq!(report.reinforced, vec![first.id]);
-    assert!(report.added.is_empty());
+    assert_eq!(report.added.len(), 0);
     let all = nodes(&live.store);
     assert_eq!(all.len(), 1);
     // The turn carries a cue, so the note starts at 0.9; one reinforcement: 1 - 0.1 * 0.7 = 0.93.
@@ -843,7 +843,7 @@ fn a_verdict_naming_something_not_shown_is_discarded() {
             T0 + DAY,
         );
         assert_eq!(report.verdicts_rejected, 1, "{relation:?}");
-        assert!(report.reinforced.is_empty());
+        assert_eq!(report.reinforced.len(), 0);
         assert_eq!(
             nodes(&live.store).len(),
             2,
@@ -887,7 +887,7 @@ fn a_verdict_across_kinds_or_between_strangers_is_discarded() {
         T0 + DAY,
     );
     assert_eq!(report.verdicts_rejected, 1);
-    assert!(report.reinforced.is_empty());
+    assert_eq!(report.reinforced.len(), 0);
 }
 
 #[test]
@@ -953,7 +953,7 @@ fn a_contradiction_is_never_merged_and_replaces_needs_the_users_words() {
         &[old.id],
         T0 + DAY,
     );
-    assert!(report.superseded.is_empty());
+    assert_eq!(report.superseded.len(), 0);
     assert_eq!(report.verdicts_rejected, 1);
     assert_eq!(nodes(&live.store).len(), 2);
     assert!(
@@ -1018,7 +1018,7 @@ fn an_unmarked_flip_with_one_extra_not_is_stored_beside_not_merged() {
         T0 + DAY,
     );
     assert_eq!(report.added.len(), 1);
-    assert!(report.reinforced.is_empty());
+    assert_eq!(report.reinforced.len(), 0);
     assert_eq!(nodes(&live.store).len(), 2);
 }
 
@@ -1226,7 +1226,7 @@ fn a_row_whose_text_was_altered_is_treated_as_absent() {
         )
         .unwrap();
     });
-    assert!(nodes(&live.store).is_empty());
+    assert_eq!(nodes(&live.store).len(), 0);
 
     let (rows, failed) = {
         let rows = live
@@ -1264,7 +1264,7 @@ fn a_row_signed_with_another_key_is_treated_as_absent() {
         .reader()
         .call_blocking(move |s| learn::load_active_and_pending(&s.memory, &other).unwrap())
         .unwrap();
-    assert!(seen.0.is_empty());
+    assert_eq!(seen.0.len(), 0);
     assert_eq!(seen.1, 1);
 }
 
@@ -1319,7 +1319,7 @@ fn compaction_removes_the_decayed_the_expired_and_the_unverifiable() {
 
     let report = compact(T0 + 600 * DAY);
     assert_eq!(report.below_floor, 1, "and the convention after it");
-    assert!(nodes(&live.store).is_empty());
+    assert_eq!(nodes(&live.store).len(), 0);
     assert_eq!(fts_rows(&live.store), 0);
 }
 
@@ -1536,7 +1536,7 @@ fn list_forget_approve_and_clear() {
         .call_blocking(|s| learn::clear(&mut s.memory).unwrap())
         .unwrap();
     assert_eq!(cleared, 1);
-    assert!(nodes(&live.store).is_empty());
+    assert_eq!(nodes(&live.store).len(), 0);
     assert_eq!(fts_rows(&live.store), 0);
     let files: i64 = raw(&live.store, |c| {
         c.query_row("SELECT count(*) FROM node WHERE kind = 'file'", [], |r| {
@@ -1577,7 +1577,7 @@ fn nearest_lists_what_is_already_known_best_first_for_showing_a_model() {
         vec!["Rust indentation"]
     );
     assert_eq!(near("which postgresql version"), vec!["Db"]);
-    assert!(near("completely unrelated zebra").is_empty());
+    assert_eq!(near("completely unrelated zebra").len(), 0);
 }
 
 #[test]

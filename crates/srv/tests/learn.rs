@@ -362,8 +362,8 @@ async fn unset_consent_reads_no_text_and_grant_is_not_retroactive() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(h.extractions().is_empty());
-    assert!(h.notes().is_empty());
+    assert_eq!(h.extractions().len(), 0);
+    assert_eq!(h.notes().len(), 0);
 
     assert_eq!(
         client
@@ -550,8 +550,8 @@ async fn revocation_discards_pending_text_before_idle_close_or_shutdown_flushes(
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(h.extractions().is_empty());
-    assert!(h.notes().is_empty());
+    assert_eq!(h.extractions().len(), 0);
+    assert_eq!(h.notes().len(), 0);
 }
 
 #[tokio::test]
@@ -899,8 +899,8 @@ async fn learning_off_asks_nothing_but_memory_still_works() {
         .rpc(3, "session.close", json!({"session_id": session}))
         .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(h.extractions().is_empty());
-    assert!(h.notes().is_empty());
+    assert_eq!(h.extractions().len(), 0);
+    assert_eq!(h.notes().len(), 0);
     assert!(
         all_text(h.turns().last().unwrap()).contains("<repo-brief>")
             || all_text(h.turns().last().unwrap()).contains("repo-index"),
@@ -929,7 +929,7 @@ async fn memory_off_creates_nothing_and_asks_nothing() {
         .rpc(3, "session.close", json!({"session_id": session}))
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(h.extractions().is_empty());
+    assert_eq!(h.extractions().len(), 0);
     assert!(!h.repo.path().join(".elefante").exists());
 }
 
@@ -987,7 +987,7 @@ async fn an_invented_quote_is_refused_and_a_real_one_is_kept() {
     h.prompt(&mut client, &session, "Remember: keep going.")
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(h.notes().is_empty());
+    assert_eq!(h.notes().len(), 0);
     h.prompt(
         &mut client,
         &session,

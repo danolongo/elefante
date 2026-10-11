@@ -310,7 +310,7 @@ fn the_request_is_a_fixed_prompt_over_escaped_data_with_no_tools() {
     ];
     let request = build_request(&config, &[], &turns);
     assert_eq!(request.system, vec![EXTRACTOR_SYSTEM_PROMPT.to_owned()]);
-    assert!(request.tools.is_empty());
+    assert_eq!(request.tools.len(), 0);
     assert_eq!(request.model.as_str(), "test/extractor");
     assert_eq!(request.effort, Some(Effort::Low));
     assert_eq!(request.max_tokens, 2_048);
@@ -780,7 +780,7 @@ async fn three_failures_in_a_row_give_the_batch_up() {
         0,
         "a poisoned slice is not retried for ever"
     );
-    assert!(learned(&store).await.is_empty());
+    assert_eq!(learned(&store).await.len(), 0);
     assert_eq!(
         learner.health(),
         LearnHealth {
@@ -879,7 +879,7 @@ async fn a_note_whose_quote_is_invented_is_refused_by_the_store() {
     let learner = learner(&store, &script, config());
     learner.observe(&[user("Remember to be careful with deploys.")]);
     settle(&learner).await;
-    assert!(learned(&store).await.is_empty());
+    assert_eq!(learned(&store).await.len(), 0);
     let stats = learner.stats();
     assert_eq!((stats.added, stats.rejected), (0, 1));
     assert_eq!(
@@ -1161,7 +1161,7 @@ async fn a_cancelled_learner_does_not_retry_a_failed_batch_or_take_new_text() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(script.count(), 1, "the failed batch was not sent again");
-    assert!(learned(&store).await.is_empty());
+    assert_eq!(learned(&store).await.len(), 0);
     assert_eq!(
         learner.pending_turns(),
         0,

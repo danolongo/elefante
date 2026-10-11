@@ -31,7 +31,7 @@ fn sibling_daemon_startup_failure_reports_captured_stderr() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("daemon startup detail"), "{stderr}");
     assert!(!stderr.contains("within 2 seconds"), "{stderr}");
@@ -84,7 +84,7 @@ fn memory_learn_prefers_a_listening_daemon_without_touching_the_local_file() {
         output.stdout,
         b"memory learning is granted for vendor/extractor\n"
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     assert!(!home.join(".elefante/memory-consent").exists());
     assert!(!home.join(".elefante/memory.key").exists());
 }
@@ -122,7 +122,7 @@ fn memory_list_prefers_a_listening_daemon_and_renders_safe_rows() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Use pnpm."), "{stdout}");
     assert!(stdout.contains("explicit"), "{stdout}");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn budgets_reach_daemon_and_coalesced_duplicates_render_once() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"answer\n");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn disconnected_headless_client_resumes_from_its_last_delivered_event() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"first second\n");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
 }
 
 fn refuse(peer: &mut BufReader<UnixStream>, request: &Value, code: i64) {

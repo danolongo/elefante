@@ -286,7 +286,7 @@ mod tests {
         assert!(queue.closed.is_cancelled());
         let mut received = Vec::new();
         stopped_reader.read_to_end(&mut received).await.unwrap();
-        assert!(!received.is_empty());
+        assert_ne!(received.len(), 0);
         assert!(
             !received
                 .windows(b"session.error".len())

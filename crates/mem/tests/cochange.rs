@@ -82,8 +82,8 @@ fn parses_every_status_shape() {
 
 #[test]
 fn tolerates_empty_garbage_and_truncated_input() {
-    assert!(parse_log(b"").is_empty());
-    assert!(parse_log(b"warning: something\0\0junk").is_empty());
+    assert_eq!(parse_log(b"").len(), 0);
+    assert_eq!(parse_log(b"warning: something\0\0junk").len(), 0);
     // A rename cut off before its second path must not invent one.
     let mut raw = framed(&[(H1, &[&[b"M", b"keep.rs"]])]);
     raw.extend_from_slice(b"R100\0only-one-path");
@@ -95,7 +95,7 @@ fn tolerates_empty_garbage_and_truncated_input() {
 fn a_commit_with_no_changes_is_still_a_commit() {
     let commits = parse_log(&framed(&[(H1, &[]), (H2, &[&[b"M", b"a.rs"]])]));
     assert_eq!(commits.len(), 2);
-    assert!(commits[0].changes.is_empty());
+    assert_eq!(commits[0].changes.len(), 0);
 }
 
 #[test]
@@ -205,14 +205,17 @@ fn the_size_threshold_counts_every_path_in_the_commit_not_only_current_files() {
         &set(&["a", "b"]),
         &config,
     );
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
 fn the_support_floor_is_configurable() {
     let history = [commit(&["a", "b"])];
     let files = set(&["a", "b"]);
-    assert!(compute(&history, &files, &CoChangeConfig::default()).is_empty());
+    assert_eq!(
+        compute(&history, &files, &CoChangeConfig::default()).len(),
+        0
+    );
     let config = CoChangeConfig {
         min_support: 1,
         ..CoChangeConfig::default()
@@ -588,7 +591,7 @@ fn an_unborn_branch_has_no_head_and_no_edges() {
     let indexed = open(&git);
     let (stats, _) = refresh(&indexed);
     assert_eq!(stats.git_log_runs, 0);
-    assert!(co_edges(&snapshot(&indexed)).is_empty());
+    assert_eq!(co_edges(&snapshot(&indexed)).len(), 0);
 }
 
 #[test]

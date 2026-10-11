@@ -69,7 +69,7 @@ fn each_faint_span_is_reset_before_an_error() {
 fn finish_is_idempotent_and_does_not_create_output_on_idle_stream() {
     let mut idle = StreamRenderer::new(Vec::new(), false);
     idle.finish().unwrap();
-    assert!(idle.into_inner().is_empty());
+    assert_eq!(idle.into_inner().len(), 0);
     let mut renderer = StreamRenderer::new(Vec::new(), false);
     renderer
         .render(&note("text.delta", json!({"text":"answer"})))

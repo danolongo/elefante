@@ -199,8 +199,8 @@ fn edges_survive_a_crash_after_the_content_committed_but_before_they_were_derive
     assert!(tree.refresh_with(&options).is_err());
     // The window: every file and import is in the graph, no edge is, and the flag says so.
     let snapshot = tree.snapshot();
-    assert!(!snapshot.imports.is_empty());
-    assert!(edges(&snapshot).is_empty());
+    assert_ne!(snapshot.imports.len(), 0);
+    assert_eq!(edges(&snapshot).len(), 0);
     assert_eq!(tree.meta("edges_dirty").as_deref(), Some("1"));
 
     tree.close();

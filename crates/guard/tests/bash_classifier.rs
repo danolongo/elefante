@@ -72,7 +72,7 @@ fn documents_known_not_caught_obfuscation() {
             "known-not-caught fixture changed: {known_not_caught}"
         );
     }
-    assert!(!BashClassifier::known_gaps().is_empty());
+    assert_ne!(BashClassifier::known_gaps().len(), 0);
 }
 
 #[test]

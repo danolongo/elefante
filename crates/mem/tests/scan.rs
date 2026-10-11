@@ -227,10 +227,9 @@ fn an_incomplete_walk_never_reports_deletions() {
         .writer()
         .call_blocking(|s| state::load(&s.cache).unwrap())
         .unwrap();
-    assert!(
-        diff(&partial, &prior, &Counters::default())
-            .deleted
-            .is_empty()
+    assert_eq!(
+        diff(&partial, &prior, &Counters::default()).deleted.len(),
+        0
     );
 }
 
@@ -340,7 +339,7 @@ fn the_racy_window_boundary_is_exact() {
         vec![file("f", 1, mtime)],
         vec![row("f", 1, mtime, mtime + RACY_WINDOW_NS + 1)],
     );
-    assert!(past_edge.is_empty());
+    assert_eq!(past_edge.len(), 0);
     // An mtime in the future of its own hash (clock skew) is always suspect.
     let skewed = to_hash(
         vec![file("f", 1, mtime)],
@@ -354,7 +353,10 @@ fn a_remembered_skip_is_trusted_on_stat_like_any_other_row() {
     let mtime = 1_000;
     let mut binary = row("logo.png", 8, mtime, mtime + RACY_WINDOW_NS * 5);
     binary.skip = true;
-    assert!(to_hash(vec![file("logo.png", 8, mtime)], vec![binary]).is_empty());
+    assert_eq!(
+        to_hash(vec![file("logo.png", 8, mtime)], vec![binary]).len(),
+        0
+    );
 }
 
 #[test]

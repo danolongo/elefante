@@ -29,7 +29,7 @@ fn frame_limit_is_exact_and_overflow_is_terminal() {
     assert_eq!(frame.len(), MAX_FRAME_BYTES + 1);
     assert_eq!(decode_frame::<Value>(&frame).unwrap(), value);
     let mut decoder = FrameDecoder::default();
-    assert!(decoder.push(&frame[..MAX_FRAME_BYTES]).unwrap().is_empty());
+    assert_eq!(decoder.push(&frame[..MAX_FRAME_BYTES]).unwrap().len(), 0);
     assert_eq!(decoder.push(b"\n").unwrap(), vec![frame]);
     decoder.finish().unwrap();
     assert!(matches!(
@@ -37,12 +37,7 @@ fn frame_limit_is_exact_and_overflow_is_terminal() {
         Err(FrameError::TooLarge)
     ));
     let mut decoder = FrameDecoder::default();
-    assert!(
-        decoder
-            .push(&vec![b' '; MAX_FRAME_BYTES])
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(decoder.push(&vec![b' '; MAX_FRAME_BYTES]).unwrap().len(), 0);
     assert!(matches!(decoder.push(b"x"), Err(FrameError::TooLarge)));
     assert!(matches!(decoder.push(b"{}\n"), Err(FrameError::TooLarge)));
     assert!(matches!(decoder.finish(), Err(FrameError::TooLarge)));

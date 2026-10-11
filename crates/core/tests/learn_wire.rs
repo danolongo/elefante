@@ -296,7 +296,7 @@ async fn a_reply_cut_off_before_any_text_is_reported_with_its_stop_reason() {
     let run = run_against(&server, "anthropic/claude-sonnet-5");
     learn_from(&run).await;
 
-    assert!(notes(&run).await.is_empty());
+    assert_eq!(notes(&run).await.len(), 0);
     let why = run.learner.diagnostics();
     assert!(
         why.last_stop
@@ -360,7 +360,7 @@ async fn a_note_the_store_refuses_is_named_so_it_can_be_understood() {
     });
     let run = run_against(&server, "anthropic/claude-sonnet-5");
     learn_from(&run).await;
-    assert!(notes(&run).await.is_empty());
+    assert_eq!(notes(&run).await.len(), 0);
     assert_eq!(
         run.learner.diagnostics().last_rejections,
         vec!["candidate 0: DangerousToken".to_owned()]

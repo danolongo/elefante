@@ -5,8 +5,8 @@ export type Usage = { input_tokens: number; output_tokens: number; reasoning_tok
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "stop_sequence" | "interrupted" | { other: string };
 export type Approval = { approval_id: string; command: string; rule: string };
 export type Tool = { tool_call_id: string; name: string; state: "running" | "ok" | "error" | "cancelled"; is_error: boolean; input_preview?: string; output_preview?: string; duration_ms?: number };
-export type CompletedTurn = { turn_id: string; prompt: string; text: string; reasoning?: string; tools: Tool[]; stop_reason: StopReason; usage: Usage };
-export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_far: string; tools: Tool[]; pending_approval: Approval | null };
+export type CompletedTurn = { turn_id: string; prompt: string; text: string; reasoning?: string; tools: Tool[]; stop_reason: StopReason; usage: Usage; memory_note_ids?: number[] };
+export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_far: string; tools: Tool[]; pending_approval: Approval | null; memory_note_ids?: number[] };
 export type Snapshot = { session_id: string; seq: number; cwd: string; model: string; turns: CompletedTurn[]; active_turn: ActiveTurn | null };
 export type Consent = "unset" | "granted" | "declined" | "off";
 export type MemorySeed = { consent: Consent; extractor: string | null };
@@ -95,9 +95,10 @@ export function parseNotification(value: unknown): Notification {
 function parseSnapshot(value: unknown): Snapshot {
   if (!object(value) || !strings(value, "session_id", "cwd", "model") || !integer(value.seq) || !Array.isArray(value.turns)) throw new ProtocolError("Invalid snapshot");
   const tools = (v: unknown) => Array.isArray(v) && v.every(t => object(t) && strings(t, "tool_call_id", "name") && ["running", "ok", "error", "cancelled"].includes(t.state as string) && typeof t.is_error === "boolean");
-  for (const turn of value.turns) if (!object(turn) || !strings(turn, "turn_id", "prompt", "text") || !tools(turn.tools) || !stopReason(turn.stop_reason) || !usage(turn.usage)) throw new ProtocolError("Invalid completed turn");
+  const ids = (v: unknown) => v === undefined || Array.isArray(v) && v.every(integer);
+  for (const turn of value.turns) if (!object(turn) || !strings(turn, "turn_id", "prompt", "text") || !tools(turn.tools) || !stopReason(turn.stop_reason) || !usage(turn.usage) || !ids(turn.memory_note_ids)) throw new ProtocolError("Invalid completed turn");
   const a = value.active_turn;
-  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !(a.pending_approval === null || object(a.pending_approval) && strings(a.pending_approval, "approval_id", "command", "rule")))) throw new ProtocolError("Invalid active turn");
+  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !ids(a.memory_note_ids) || !(a.pending_approval === null || object(a.pending_approval) && strings(a.pending_approval, "approval_id", "command", "rule")))) throw new ProtocolError("Invalid active turn");
   return value as Snapshot;
 }
 export function parseAttach(value: unknown, sessionId: string, since?: number): AttachResult {

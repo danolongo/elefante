@@ -9,7 +9,8 @@ use std::{
 };
 
 use elefante_core::{
-    CancellationToken, ContextSource, InjectedContext, Note, RunConfig, Session, ToolGate,
+    CancellationToken, ContextSource, InjectedContext, Note, OutputEvent, RunConfig, Session,
+    ToolGate,
 };
 use elefante_provider::{
     Capabilities, ContentBlock, Event, Message, ModelId, Provider, ProviderError, Request, Role,
@@ -169,6 +170,52 @@ async fn only_context_text_reaches_the_provider_and_note_metadata_is_not_history
             .iter()
             .any(|text| text.contains("NOTE-METADATA-ONLY"))
     );
+}
+
+#[tokio::test]
+async fn learned_context_is_emitted_after_turn_start_without_its_rendered_text() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let provider = Script::new(vec![end("done")]);
+    let expected = Note {
+        id: 42,
+        kind: "convention".to_owned(),
+        status: "active".to_owned(),
+        statement: "Use pnpm.".to_owned(),
+        origin: "explicit".to_owned(),
+    };
+    let source = Arc::new(Source {
+        blocks: Mutex::new(
+            [Some(InjectedContext {
+                text: "SECRET-RENDERED-BLOCK".to_owned(),
+                notes: vec![expected.clone()],
+            })]
+            .into(),
+        ),
+        ..Source::default()
+    });
+    let mut session = Session::new(RunConfig::new("test")).with_context(source);
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "hello",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(events[0], OutputEvent::TurnStarted));
+    assert_eq!(
+        events[1],
+        OutputEvent::Context {
+            notes: vec![expected]
+        }
+    );
+    assert!(!format!("{events:?}").contains("SECRET-RENDERED-BLOCK"));
 }
 
 async fn ask(session: &mut Session, provider: &Script, executor: &ToolExecutor, text: &str) {

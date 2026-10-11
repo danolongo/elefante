@@ -101,6 +101,14 @@ test("a turn restored from a snapshot, which has no ordering, draws its text and
     expect(rowOf(frame, "Restored text.")).toBeLessThan(rowOf(frame, "✓ bash"));
   } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
 });
+test("a turn that used learned context shows one persistent audit line", async () => {
+  const state = { ...initialSession("s"), turns: [{ turn_id: "t", prompt: "Question", text: "Answer", tools: [], stop_reason: "end_turn" as const, usage: emptyUsage(), memory_note_ids: [14, 15] }] };
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 12 });
+  try {
+    await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("◇ used 2 saved notes");
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
 test("reasoning-only status remains visible at five seconds with a nonzero labeled estimate", async () => {
   const started = reduceSession(initialSession("s"), note(1, "turn.started"), 1000);
   const state = reduceSession(started, note(2, "reasoning.delta", { text: "still thinking" }), 6000);

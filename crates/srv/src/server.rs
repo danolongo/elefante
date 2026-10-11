@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::Context as _;
 use elefante_core::{
-    ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate,
+    ApprovalOutcome, ApprovalSink, Note as CoreNote, OutputEvent, RunConfig, Session, ToolGate,
     learn::{
         ChangedNote, ENV_MODEL, LearnChange, LearnConfig, LearnFailure, LearnHealth, LearnSink,
         Learner,
@@ -563,8 +563,18 @@ impl View {
                 }
                 "approval.requested" => active["pending_approval"] = params.clone(),
                 "approval.resolved" => active["pending_approval"] = Value::Null,
+                "memory.context" => {
+                    active["memory_note_ids"] = Value::Array(
+                        params["notes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|note| note["id"].as_i64().map(Value::from))
+                            .collect(),
+                    );
+                }
                 "turn.finished" => {
-                    self.turns.push(json!({"turn_id":active["turn_id"],"prompt":active["prompt"],"text":active["text_so_far"],"tools":active["tools"],"stop_reason":params["stop_reason"],"usage":params["usage"]}));
+                    self.turns.push(json!({"turn_id":active["turn_id"],"prompt":active["prompt"],"text":active["text_so_far"],"tools":active["tools"],"stop_reason":params["stop_reason"],"usage":params["usage"],"memory_note_ids":active["memory_note_ids"]}));
                     self.active = None;
                     self.cancel = None;
                 }
@@ -603,6 +613,9 @@ impl View {
 fn output(event: OutputEvent) -> NotificationEvent {
     match event {
         OutputEvent::TurnStarted => NotificationEvent::TurnStarted {},
+        OutputEvent::Context { notes } => NotificationEvent::MemoryContext {
+            notes: notes.iter().map(wire_context_note).collect(),
+        },
         OutputEvent::ReasoningDelta(text) => NotificationEvent::ReasoningDelta { text },
         OutputEvent::TextDelta(text) => NotificationEvent::TextDelta { text },
         OutputEvent::ToolStarted {
@@ -646,6 +659,16 @@ fn output(event: OutputEvent) -> NotificationEvent {
             NotificationEvent::TurnFinished { stop_reason, usage }
         }
         OutputEvent::Error { message } => NotificationEvent::SessionError { message },
+    }
+}
+
+fn wire_context_note(note: &CoreNote) -> MemoryNote {
+    MemoryNote {
+        id: note.id,
+        kind: learn::display_safe(&note.kind),
+        status: learn::display_safe(&note.status),
+        statement: learn::display_safe(&note.statement),
+        origin: learn::display_safe(&note.origin),
     }
 }
 
@@ -1385,7 +1408,7 @@ fn prompt_session(
         (consent.granted(extractor(entry)), consent.revision)
     };
     view.active = Some(
-        json!({"turn_id":turn_id,"prompt":text,"text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null}),
+        json!({"turn_id":turn_id,"prompt":text,"text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null,"memory_note_ids":[]}),
     );
     view.cancel = Some(cancel.clone());
     view.subscribe(queue);

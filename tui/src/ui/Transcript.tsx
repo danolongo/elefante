@@ -43,6 +43,7 @@ export function Transcript({ state, showReasoning }: { state: SessionState; show
           const tool = turn.tools.find(t => t.tool_call_id === segment.tool_call_id);
           return tool && <box key={index} flexDirection="column" marginBottom={gap}><ToolCall tool={tool} /></box>;
         })}
+        {(turn.memory_note_ids?.length ?? 0) > 0 && <text fg="#777777">◇ used {turn.memory_note_ids!.length} saved {turn.memory_note_ids!.length === 1 ? "note" : "notes"}</text>}
       </box>;
     })}
   </scrollbox>;

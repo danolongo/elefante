@@ -285,10 +285,10 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
         {"tool_call_id":"c4","name":"write","state":"cancelled","is_error":true}
     ]);
     let mut snapshot = json!({"session_id":"s1","seq":981,"cwd":"/tmp","model":"m","turns":[
-        {"turn_id":"t1","prompt":"hi","text":"hello","tools":tools,"stop_reason":"end_turn","usage":usage()}
+        {"turn_id":"t1","prompt":"hi","text":"hello","tools":tools,"stop_reason":"end_turn","usage":usage(),"memory_note_ids":[14]}
     ],"active_turn":{
         "turn_id":"t7","text_so_far":"answer","reasoning_so_far":"think","tools":tools,
-        "pending_approval":{"approval_id":"a1","command":"echo x","rule":"shell"}
+        "pending_approval":{"approval_id":"a1","command":"echo x","rule":"shell"},"memory_note_ids":[15]
     }});
     round_trip::<AttachResult>(json!({"kind":"snapshot","seq":981,"snapshot":snapshot}));
     round_trip::<AttachResult>(json!({

@@ -98,3 +98,16 @@ test("turn-less memory status is state, advances sequence, and survives snapshot
   expect(updated.active_turn?.turn_id).toBe("t");
   expect(restoreSnapshot(snapshot(), 0, "high", status).memory).toEqual(status);
 });
+
+test("memory context belongs to its turn and snapshot note ids restore the audit count", () => {
+  let state = reduceSession(initialSession("s"), note(1, "turn.started"));
+  state = reduceSession(state, note(2, "memory.context", { notes: [
+    { id: 14, kind: "convention", status: "active", statement: "Use pnpm.", origin: "explicit" },
+    { id: 15, kind: "fact", status: "active", statement: "CI uses Bun.", origin: "stated" },
+  ] }));
+  expect(state.active_turn?.memory_note_ids).toEqual([14, 15]);
+  state = reduceSession(state, note(3, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }));
+  expect(state.turns[0].memory_note_ids).toEqual([14, 15]);
+  const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "next", text_so_far: "", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [21] } });
+  expect(restored.active_turn?.memory_note_ids).toEqual([21]);
+});

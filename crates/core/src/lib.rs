@@ -63,6 +63,11 @@ impl RunConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
     TurnStarted,
+    /// Learned notes that were injected into this turn. The rendered context text is deliberately
+    /// absent: clients receive only the safe structured audit surface.
+    Context {
+        notes: Vec<Note>,
+    },
     /// A display fragment of the model's reasoning. Safe to render.
     ReasoningDelta(String),
     TextDelta(String),
@@ -305,6 +310,13 @@ impl Session {
             injected: self.gather_context(&prompt).await,
         };
         emit(OutputEvent::TurnStarted);
+        if let Some(injected) = &turn.injected
+            && !injected.notes.is_empty()
+        {
+            emit(OutputEvent::Context {
+                notes: injected.notes.clone(),
+            });
+        }
         let mut usage = Usage::default();
         let result = self
             .run_turn(provider, tools, gate, &cancel, &turn, &mut usage, &mut emit)

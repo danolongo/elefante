@@ -648,6 +648,26 @@ async fn a_cue_makes_the_daemon_ask_and_the_answer_reaches_the_next_prompt() {
     for request in h.extractions() {
         assert!(!all_text(&request).contains("<repo-memory"));
     }
+    let replay = client
+        .rpc(3, "session.attach", json!({"session_id":session,"since":0}))
+        .await;
+    let events = replay["result"]["events"].as_array().unwrap();
+    let context_index = events
+        .iter()
+        .position(|event| event["method"] == "memory.context")
+        .expect("the injected notes are audited on the turn");
+    assert_eq!(events[context_index - 1]["method"], "turn.started");
+    assert_eq!(
+        events[context_index]["turn_id"],
+        events[context_index - 1]["turn_id"]
+    );
+    assert_eq!(
+        events[context_index]["params"]["notes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

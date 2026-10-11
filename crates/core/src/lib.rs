@@ -30,6 +30,10 @@ pub use tokio_util::sync::CancellationToken;
 /// The stable standing instructions. Safety and filesystem policy live in code.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. The harness may save lasting preferences and conventions the person states: do not write them into repository files unless asked, and never read or edit `.elefante/`, which belongs to the harness.";
 
+/// Added to the system prompt of a session that has a repository index, and only such a session:
+/// it names a tool that sessions without an index do not have.
+pub const MEMORY_USE_HINT: &str = "If the repository memory shown with the task does not cover what you need, use memory_search (files, symbols and saved notes) before searching broadly.";
+
 /// Limits and provider settings for one loop invocation.
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -269,9 +273,17 @@ impl Session {
     }
 
     /// Attaches a source of per-turn context.
+    ///
+    /// A context source is how a session gets a repository index, so attaching one is also what
+    /// offers the model `memory_search` and tells it when to use it ([`MEMORY_USE_HINT`]). Both are
+    /// fixed for the session, so the cached request prefix stays stable.
     #[must_use]
     pub fn with_context(mut self, context: Arc<dyn ContextSource>) -> Self {
         self.context = Some(context);
+        if !self.config.system_prompt.contains(MEMORY_USE_HINT) {
+            self.config.system_prompt.push(' ');
+            self.config.system_prompt.push_str(MEMORY_USE_HINT);
+        }
         self
     }
 
@@ -380,7 +392,11 @@ impl Session {
     where
         F: FnMut(OutputEvent),
     {
-        let definitions = provider_tool_definitions();
+        let mut definitions = provider_tool_definitions();
+        if self.context.is_none() {
+            // No index: `memory_search` could only refuse, so the model is not offered it.
+            definitions.retain(|definition| definition.name != "memory_search");
+        }
         let mut full_text = String::new();
         for round_index in 0..self.config.max_rounds {
             let request = Request {

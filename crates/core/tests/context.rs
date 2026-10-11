@@ -442,7 +442,12 @@ async fn no_request_ever_carries_a_system_message_beyond_the_configured_prompt()
     let provider = Script::new(vec![tool_round("t1"), end("a1"), end("a2")]);
     let source = Source::new(&[Some("B1"), Some("B2")], &[Some("PRE")]);
     let config = RunConfig::new("test");
-    let expected_system = vec![config.system_prompt.clone()];
+    // The configured prompt plus the harness's own fixed hint; nothing derived from the repository.
+    let expected_system = vec![format!(
+        "{} {}",
+        config.system_prompt,
+        elefante_core::MEMORY_USE_HINT
+    )];
     let mut session = Session::new(config).with_context(source);
     ask(&mut session, &provider, &executor, "q1").await;
     ask(&mut session, &provider, &executor, "q2").await;
@@ -456,4 +461,44 @@ async fn no_request_ever_carries_a_system_message_beyond_the_configured_prompt()
             "repository-derived text must never carry system authority"
         );
     }
+}
+
+#[tokio::test]
+async fn the_index_tool_and_its_hint_exist_only_in_a_session_that_has_an_index() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+
+    let provider = Script::new(vec![end("a")]);
+    let mut plain = Session::new(RunConfig::new("test"));
+    ask(&mut plain, &provider, &executor, "q").await;
+    let request = &provider.requests()[0];
+    assert!(request.tools.iter().all(|t| t.name != "memory_search"));
+    assert!(request.tools.len() >= 6, "the other tools are unaffected");
+    assert_eq!(request.system, [elefante_core::DEFAULT_SYSTEM_PROMPT]);
+
+    let provider = Script::new(vec![end("a"), end("b")]);
+    let mut indexed =
+        Session::new(RunConfig::new("test")).with_context(Source::new(&[None, None], &[None]));
+    ask(&mut indexed, &provider, &executor, "q").await;
+    ask(&mut indexed, &provider, &executor, "r").await;
+    let requests = provider.requests();
+    assert!(requests[0].tools.iter().any(|t| t.name == "memory_search"));
+    assert_eq!(requests[0].system.len(), 1, "still one system string");
+    assert_eq!(
+        requests[0].system[0],
+        format!(
+            "{} {}",
+            elefante_core::DEFAULT_SYSTEM_PROMPT,
+            elefante_core::MEMORY_USE_HINT
+        )
+    );
+    assert_eq!(
+        requests[0].system, requests[1].system,
+        "frozen for the session"
+    );
+    assert_eq!(requests[0].tools, requests[1].tools);
+    let sorted: Vec<_> = requests[0].tools.iter().map(|t| t.name.clone()).collect();
+    let mut expected = sorted.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "tool order stays name-sorted");
 }

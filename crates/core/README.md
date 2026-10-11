@@ -91,6 +91,10 @@ answer to `elefante-mem`, which decides what is kept. The model's reply is a *pr
 - **The watermark** is what is still pending: it shrinks only after a batch has been committed.
   Anything a future compactor drops from the history has therefore already been read, provided it
   calls `flush` first.
+- **Offering the index.** `Session::with_context` is how a session gets an index; it also adds
+  `memory_search` to that session's tool list and appends `MEMORY_USE_HINT` to its system prompt
+  (one string, fixed for the session). A session without a context source lists neither, so the
+  model is never told to call a tool that can only refuse.
 - **The log.** `ELEFANTE_LEARN_LOG=<file>` makes the daemon append one JSON line per attempt: the
   outcome (`provider_error`, `unreadable_reply`, `no_notes`, `ingested`, `store_error`), the stop
   reason, whether the schema was sent, counts, the verifier's rejections (`QuoteNotFound` and so on),

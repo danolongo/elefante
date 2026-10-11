@@ -513,7 +513,8 @@ Three details that are easy to get wrong and expensive to fix later:
 ```
 ~/.elefante/
   config.toml                # roles, provider keys, thresholds
-  user.db                    # cross-project: preferences, corrections, workflows
+  memory.key                 # 32 random bytes, 0600: authenticates every memory store this user owns
+  user.db                    # cross-project: preferences, corrections, workflows (not yet built)
 
 <repo>/.elefante/
   memory.db                  # the graph: node, edge, import_ref, node_fts, meta
@@ -559,7 +560,7 @@ by an in-process mirror of `repo_generation`, so a hit never crosses a channel.
 
 ```sql
 node(id, kind, key, name, body, file_id, attrs, confidence, source, created_at_ns, updated_at_ns,
-     UNIQUE(kind, key))
+     status, last_reinforced_ns, mac, UNIQUE(kind, key))
 edge(src, dst, rel, weight, created_at_ns, PRIMARY KEY(src, dst, rel),
      CHECK(rel <> 'co_edited_with' OR src < dst))
 import_ref(file_id, kind, spec)                 -- raw imports; edges are derived from these
@@ -610,7 +611,30 @@ Git co-change is the highest-value-per-cost signal here: it captures "these file
 real coupling that imports alone miss — for the price of one `git log`. Git runs without a shell,
 under a timeout and a size cap, with the repository's own config unable to run a program.
 
-**Learned** — LLM-extracted decisions, conventions, corrections, written at session end and on explicit signal.
+**Learned** — decisions, conventions, preferences and facts distilled from conversations by a model
+call, **incrementally at turn end** (there is no reliable session end) and flushed on session close, after
+`ELEFANTE_LEARN_IDLE_SECS` of quiet and as the daemon exits. The model proposes; `elefante-mem` disposes:
+
+- *Input.* Only the text of what the user and the assistant said, scrubbed — never tool results,
+  tool calls or reasoning. A gate (an explicit cue, ~600 characters of user text, or 6 user messages)
+  decides *when*, never *whether*; skipped turns stay pending, and the pending text is the watermark,
+  which shrinks only after a commit.
+- *Verification.* A verbatim quote present in the excerpt; no command, URL, path or identifier in the
+  wording that the user did not write; unchanged by the `Scrubber` (a changed note is dropped, never
+  stored redacted); and the speaker of the evidence assigns the origin and starting confidence
+  (explicit 0.9, stated 0.6, assistant 0.4 and `pending` — never shown until the user confirms).
+- *Dedupe and supersede.* Near-identical wording (Jaccard ≥ 0.9 over stemmed words, negations kept,
+  same negations) is a duplicate whatever the model said. A model verdict (`same_as`, `replaces`) is
+  honoured only if it names a note it was shown, of the same kind, lexically related or sharing an
+  anchor; `replaces` needs the user's own words. A replaced note is `superseded` (kept for 90 days,
+  out of search), never merged.
+- *Integrity.* Both databases carry a keyed stamp and every learned row a keyed MAC; anything
+  unstamped, foreign or failing is discarded or treated as absent, and retrieval renders only
+  `source = 'index'` rows and verified learned rows.
+- *Decay.* `confidence × 0.5^(age ÷ half-life)` since last reinforcement (180 days preference and
+  convention, 90 decision, 30 fact), computed on read; below 0.1 a note is not retrieved and compaction
+  removes it.
+- *Controls.* `elefante memory list | forget | approve | clear`.
 
 ### Indexer scheduling
 
@@ -630,10 +654,10 @@ edges as well as content; the newest 8 are kept.
 
 This decides whether the whole subsystem works. LLM memory fails by accumulating contradictory sludge:
 
-- Dedupe against FTS before insert.
-- `supersedes` edges rather than deletion — history stays inspectable.
+- Dedupe before insert: lexical bands, authoritative at commit time inside the writer transaction.
+- `supersedes` edges rather than deletion — history stays inspectable for a retention window.
 - Confidence decays with age unless reinforced.
-- Periodic compaction pass collapses superseded chains.
+- Compaction removes decayed, expired, unverifiable and excess notes (300 kept).
 
 **Synergy worth protecting:** transcript compaction extracts facts into the graph first, so the summary can be terse without being lossy — the durable substrate holds what the summary drops.
 
@@ -782,15 +806,29 @@ The headless client splits streams: **`stdout` is the answer, `stderr` is reason
 
 ### M3 — Learned memory
 
-**Baseline.** User graph, session-end extraction, dedupe/supersede/decay/compaction. Scrubber on the write path. Compaction writes facts to the graph.
+**Baseline.** Learned notes (`preference`, `convention`, `decision`, `fact`) in the project graph;
+incremental extraction behind a gate with a watermark; verification, provenance by speaker, hybrid
+dedupe and supersession; keyed integrity for stores and rows; read-time decay and compaction; a
+separate `<repo-memory>` section in retrieval; and `elefante memory list | forget | approve | clear`.
+Deferred from the original baseline: the user-level graph (`user.db`), and transcript compaction —
+M3 ships the seam (`Learner::flush`, and a watermark that only shrinks after a commit), so whatever a
+future compactor drops has already been read.
 
 **Gate.**
-- `git status` is clean after a full session in a test repo — the self-ignoring `.gitignore` means nothing is untracked and nothing is stageable.
-- Insert a fact twice with different wording: one node, confidence reinforced, not two nodes.
-- A contradicting fact creates a `supersedes` edge; retrieval returns the survivor.
-- No memory row contains the `sk-ant-` fixture string after a session that touched it.
-- Compact a long transcript, then assert a fact from the dropped region is still retrievable from the graph.
+- `git status` is clean after a full session in a test repo.
+- The same fact stated twice, in reordered or paraphrased words, is one note with raised confidence;
+  a paraphrase merges only on a verified model verdict.
+- A contradicting fact, in the user's own words, supersedes the old note; retrieval returns the survivor.
+- No row and no byte under `.elefante/` contains the `sk-ant-` fixture after a session that touched it.
+- Extract incrementally, truncate the history, and a fact from the dropped region is still retrievable.
+- A store a repository shipped, a version-1 store, and a row with a bad or missing MAC render nothing.
+- The extractor's captured request contains no tool result, tool call or reasoning; an assistant-only
+  claim is `pending` and never shown; a quote not in the conversation is refused.
+- A note cannot close its envelope; the learned section is ≤ 400 and the block ≤ 1,500 estimated tokens;
+  with nothing learned the block is byte-identical to code-only retrieval.
+- `ELEFANTE_LEARN=0` and `ELEFANTE_MEMORY=0` each make zero extractor requests.
 - **M0–M2 gates still green.**
+- **Credentialed, once:** `live_learned_memory_is_extracted_stored_and_used`.
 
 ### M4 — Critics
 

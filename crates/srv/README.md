@@ -28,6 +28,15 @@ elefante_srv::run(DaemonConfig { /* ... */ }).await?;
 elefante_srv::socket_path()?;                      // $XDG_RUNTIME_DIR, else ~/.elefante/run/
 ```
 
+**Learning.** After each turn the daemon hands the session's new text to that session's `Learner`
+(`elefante-core`), which decides whether to ask a model what is worth remembering. What is still
+pending is extracted when the session closes, after `ELEFANTE_LEARN_IDLE_SECS` (default 300) of
+quiet, and as the daemon exits. `ELEFANTE_LEARN=0` turns this off alone; `ELEFANTE_MEMORY=0` turns
+it off with the whole index. The extractor's model comes from `ELEFANTE_EXTRACT_MODEL` /
+`ELEFANTE_EXTRACT_EFFORT`, falling back to the session's. The memory key lives beside the
+credentials (`~/.elefante/memory.key`), never in a working tree. No RPC method, notification or
+error code was added.
+
 `DaemonConfig::from_env()` builds the config the same way `run_from_env` does, which is what
 tests use to point a daemon at an isolated socket.
 

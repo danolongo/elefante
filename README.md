@@ -15,7 +15,9 @@ M0, M1 and M2 are complete, with their gates green — 350 hermetic Rust tests a
 tests, plus three credentialed checks run against a live provider: a real prompt-cache hit through
 OpenRouter, a live edit in a scratch repository, and a real model using the repository index it is
 sent. See [`docs/MILESTONES.md`](docs/MILESTONES.md). CI runs the hermetic gates on every push and the
-credentialed tests on dispatch. M3 — learned memory — has not begun.
+credentialed tests on dispatch. M3 — learned memory — is complete with its gate green (486 Rust tests, 67 TypeScript tests) and its
+credentialed check, `live_learned_memory_is_extracted_stored_and_used`, passing against a live provider
+on its second run.
 
 ## Quick start
 

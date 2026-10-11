@@ -20,7 +20,8 @@ Everything below describes the headless mode unless it says otherwise.
 | File | Lines | Contents |
 |---|---:|---|
 | `src/main.rs` | 435 | Argument and environment parsing, daemon discovery and spawn, socket client, session lifecycle. |
-| `src/lib.rs` | 125 | `StreamRenderer` — the only public type in the crate. |
+| `src/lib.rs` | 125 | `StreamRenderer`, and the `memory` module. |
+| `src/memory.rs` | 140 | `elefante memory list \| forget \| approve \| clear` — see below. |
 
 ## Entry points
 
@@ -33,6 +34,20 @@ let mut out = StreamRenderer::new(io::stdout(), styled);
 out.render(&notification)?;
 out.finish()?;
 ```
+
+### `elefante memory`
+
+```
+elefante memory list [--all]   what was learned about this repository (--all adds superseded)
+elefante memory forget <id>    delete one learned note
+elefante memory approve <id>   accept a note only the assistant had vouched for
+elefante memory clear --yes    delete every learned note for this repository
+```
+
+These open the repository's store directly and never need the daemon. Learned notes are free-form
+text that is injected into prompts, so a person can always see them and remove them: `list` also
+shows rows that fail their integrity check, flagged, so they can be forgotten. A running daemon
+notices a change within its cache lifetime (about thirty seconds). `clear` refuses without `--yes`.
 
 **Two renderers, one per stream** (`main.rs:337-338`): the answer goes to `stdout`, reasoning
 and tool activity to `stderr`. Each owns its own channel state, so neither can interleave into

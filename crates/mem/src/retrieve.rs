@@ -238,7 +238,8 @@ fn text_seeds(
     };
     let mut statement = conn.prepare_cached(
         "SELECT n.id FROM node_fts f JOIN node n ON n.id = f.rowid
-         WHERE node_fts MATCH ?1 AND (?2 = '' OR substr(n.key, 1, length(?2)) = ?2)
+         WHERE node_fts MATCH ?1 AND n.source = 'index'
+           AND (?2 = '' OR substr(n.key, 1, length(?2)) = ?2)
          ORDER BY bm25(node_fts, 10.0, 4.0, 1.0), n.key
          LIMIT ?3",
     )?;
@@ -267,7 +268,7 @@ fn path_seeds(
     for candidate in candidates {
         let exact: Option<(i64, String)> = conn
             .query_row(
-                "SELECT id, key FROM node WHERE kind = 'file' AND key = ?1",
+                "SELECT id, key FROM node WHERE kind = 'file' AND key = ?1 AND source = 'index'",
                 [&candidate],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -277,7 +278,7 @@ fn path_seeds(
         } else {
             // A bare file name counts only when it is unambiguous within scope.
             let mut statement = conn.prepare_cached(
-                "SELECT id, key FROM node WHERE kind = 'file' AND name = ?1
+                "SELECT id, key FROM node WHERE kind = 'file' AND name = ?1 AND source = 'index'
                  AND (?2 = '' OR substr(key, 1, length(?2)) = ?2) LIMIT 2",
             )?;
             let rows = statement
@@ -453,7 +454,7 @@ fn load_hits(
     let sql = format!(
         "SELECT n.id, n.kind, n.key, n.name, n.body, n.attrs, f.key
          FROM node n LEFT JOIN node f ON f.id = n.file_id
-         WHERE n.id IN ({list}) AND n.kind IN ('file', 'symbol')"
+         WHERE n.id IN ({list}) AND n.kind IN ('file', 'symbol') AND n.source = 'index'"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([], |r| {

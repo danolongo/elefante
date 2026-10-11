@@ -10,10 +10,13 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::{error::MemError, layout::touch_private};
+use crate::{error::MemError, layout::touch_private, trust::MemKey};
 
-pub const MEMORY_SCHEMA_VERSION: i64 = 1;
-pub const CACHE_SCHEMA_VERSION: i64 = 1;
+pub const MEMORY_SCHEMA_VERSION: i64 = 2;
+pub const CACHE_SCHEMA_VERSION: i64 = 2;
+
+/// `meta` / `cache_meta` key holding the keyed stamp that marks a database as ours.
+pub const STAMP_KEY: &str = "store_stamp";
 
 const MEMORY_DDL: &str = "
 CREATE TABLE meta (
@@ -33,6 +36,9 @@ CREATE TABLE node (
   source        TEXT    NOT NULL DEFAULT 'index',
   created_at_ns INTEGER NOT NULL,
   updated_at_ns INTEGER NOT NULL,
+  status        TEXT    NOT NULL DEFAULT 'active',
+  last_reinforced_ns INTEGER,
+  mac           BLOB,
   UNIQUE (kind, key)
 );
 CREATE INDEX node_file ON node(file_id);
@@ -156,17 +162,27 @@ fn new_epoch() -> String {
 
 /// Opens the graph database for writing, creating and initialising it when new.
 ///
+/// A database is kept only if it is at the current schema **and** carries a stamp made with `key`.
+/// Anything else — a version-1 store, a database a repository shipped, one made under another key —
+/// is discarded and rebuilt. That loses nothing irreplaceable at schema 1, and it is the only way to
+/// be sure rows the model will read were written by this harness.
+///
 /// # Errors
 /// Fails on I/O or SQLite errors, on a schema newer than this build understands, and on a
-/// database that has tables but no recognisable version (this file will hold learned memory
-/// and is never silently recreated).
-pub fn open_memory(path: &Path) -> Result<Connection, MemError> {
+/// database that has tables but no recognisable version.
+pub fn open_memory(path: &Path, key: &MemKey) -> Result<Connection, MemError> {
     touch_private(path)?;
     let conn = Connection::open(path)?;
     configure(&conn)?;
     enable_wal(&conn)?;
     match user_version(&conn)? {
-        MEMORY_SCHEMA_VERSION => Ok(conn),
+        MEMORY_SCHEMA_VERSION => {
+            if memory_stamp_valid(&conn, key) {
+                Ok(conn)
+            } else {
+                rebuild_memory(conn, path, key)
+            }
+        }
         0 => {
             if table_exists(&conn, "meta")? || table_exists(&conn, "node")? {
                 return Err(MemError::Corrupt {
@@ -174,15 +190,7 @@ pub fn open_memory(path: &Path) -> Result<Connection, MemError> {
                     reason: "has tables but no schema version".to_owned(),
                 });
             }
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(MEMORY_DDL)?;
-            tx.execute(
-                "INSERT INTO meta(key, value) VALUES
-                   ('graph_epoch', ?1), ('repo_generation', '0'), ('index_complete', '0')",
-                [new_epoch()],
-            )?;
-            tx.pragma_update(None, "user_version", MEMORY_SCHEMA_VERSION)?;
-            tx.commit()?;
+            create_memory(&conn, key)?;
             Ok(conn)
         }
         found if found > MEMORY_SCHEMA_VERSION => Err(MemError::UnsupportedSchema {
@@ -190,11 +198,40 @@ pub fn open_memory(path: &Path) -> Result<Connection, MemError> {
             found,
             supported: MEMORY_SCHEMA_VERSION,
         }),
-        found => Err(MemError::Corrupt {
-            path: path.to_owned(),
-            reason: format!("schema version {found} has no migration path"),
-        }),
+        _ => rebuild_memory(conn, path, key),
     }
+}
+
+fn create_memory(conn: &Connection, key: &MemKey) -> Result<(), MemError> {
+    let epoch = new_epoch();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(MEMORY_DDL)?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES
+           ('graph_epoch', ?1), ('repo_generation', '0'), ('index_complete', '0'),
+           (?2, ?3)",
+        rusqlite::params![epoch, STAMP_KEY, key.stamp("memory", &epoch)],
+    )?;
+    tx.pragma_update(None, "user_version", MEMORY_SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn rebuild_memory(conn: Connection, path: &Path, key: &MemKey) -> Result<Connection, MemError> {
+    drop(conn);
+    remove_db_files(path)?;
+    touch_private(path)?;
+    let conn = Connection::open(path)?;
+    configure(&conn)?;
+    enable_wal(&conn)?;
+    create_memory(&conn, key)?;
+    Ok(conn)
+}
+
+fn memory_stamp_valid(conn: &Connection, key: &MemKey) -> bool {
+    let epoch = get_meta(conn, "meta", "graph_epoch").ok().flatten();
+    let stamp = get_meta(conn, "meta", STAMP_KEY).ok().flatten();
+    matches!((epoch, stamp), (Some(epoch), Some(stamp)) if key.stamp_matches("memory", &epoch, &stamp))
 }
 
 /// Opens a read-only connection to the graph. The writer must have opened it first, so that the
@@ -227,16 +264,18 @@ fn remove_db_files(path: &Path) -> Result<(), MemError> {
     Ok(())
 }
 
-/// Opens the disposable cache database. A version mismatch deletes and recreates it.
+/// Opens the disposable cache database. A version mismatch, or a missing or foreign stamp,
+/// deletes and recreates it: extraction records are read back into the graph, so a cache a
+/// repository shipped is as untrusted as a graph it shipped.
 ///
 /// # Errors
 /// Fails on I/O or SQLite errors.
-pub fn open_cache(path: &Path) -> Result<Connection, MemError> {
+pub fn open_cache(path: &Path, key: &MemKey) -> Result<Connection, MemError> {
     touch_private(path)?;
     let conn = Connection::open(path)?;
     configure(&conn)?;
     enable_wal(&conn)?;
-    if user_version(&conn)? == CACHE_SCHEMA_VERSION {
+    if user_version(&conn)? == CACHE_SCHEMA_VERSION && cache_stamp_valid(&conn, key) {
         return Ok(conn);
     }
     // Disposable by design: anything not at the current version is rebuilt, never migrated.
@@ -248,9 +287,20 @@ pub fn open_cache(path: &Path) -> Result<Connection, MemError> {
     enable_wal(&conn)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(CACHE_DDL)?;
+    tx.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?1, ?2)",
+        [STAMP_KEY, &key.stamp("cache", "")],
+    )?;
     tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(conn)
+}
+
+fn cache_stamp_valid(conn: &Connection, key: &MemKey) -> bool {
+    get_meta(conn, "cache_meta", STAMP_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|stamp| key.stamp_matches("cache", "", &stamp))
 }
 
 pub(crate) fn get_meta(

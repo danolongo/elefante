@@ -19,7 +19,7 @@ use elefante_mem::{
 fn index_a_real_repository_and_print_it() {
     let root = PathBuf::from(std::env::var("ELEFANTE_DOGFOOD").expect("set ELEFANTE_DOGFOOD"));
     let repo = RepoId::resolve_with_home(&root, None).unwrap();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     let counters = Counters::default();
     let started = std::time::Instant::now();
     let report =

@@ -32,7 +32,9 @@ pub fn live(files: &[(&str, &str)]) -> Live {
     let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
     Live {
         root: repo.root().to_path_buf(),
-        store: Arc::new(Store::open(&repo).unwrap()),
+        store: Arc::new(
+            Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap(),
+        ),
         _tmp: tmp,
     }
 }

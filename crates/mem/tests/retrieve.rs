@@ -20,7 +20,11 @@ use elefante_mem::{
 fn store() -> (tempfile::TempDir, Arc<Store>) {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir(tmp.path().join(".git")).unwrap();
-    let store = Store::open(&RepoId::resolve_with_home(tmp.path(), None).unwrap()).unwrap();
+    let store = Store::open_with_key(
+        &RepoId::resolve_with_home(tmp.path(), None).unwrap(),
+        elefante_mem::MemKey::from_bytes([7; 32]),
+    )
+    .unwrap();
     (tmp, Arc::new(store))
 }
 

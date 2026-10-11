@@ -33,6 +33,7 @@ fn denies_traversal_and_secret_variants() {
         ".ssh/config",
         ".aws/credentials",
         ".elefante/credentials.toml",
+        ".elefante/memory.key",
     ] {
         assert!(
             matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),

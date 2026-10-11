@@ -49,7 +49,7 @@ fn fixture(files: &[(&str, &str)]) -> Fixture {
     }
     let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
     let root = repo.root().to_path_buf();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     Fixture {
         _tmp: tmp,
         root,
@@ -167,7 +167,7 @@ fn a_same_size_edit_inside_the_racy_window_is_still_caught() {
     let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
     let f = Fixture {
         root: repo.root().to_path_buf(),
-        store: Store::open(&repo).unwrap(),
+        store: Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap(),
         _tmp: tmp,
     };
     refresh(&f, &Counters::default());
@@ -247,7 +247,7 @@ fn a_binary_is_hashed_once_and_then_skipped_on_stat() {
     let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
     let f = Fixture {
         root: repo.root().to_path_buf(),
-        store: Store::open(&repo).unwrap(),
+        store: Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap(),
         _tmp: tmp,
     };
 

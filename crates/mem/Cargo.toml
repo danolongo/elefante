@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 elefante-guard = { path = "../guard" }
 blake3.workspace = true
+getrandom.workspace = true
 ignore.workspace = true
 moka.workspace = true
 rusqlite.workspace = true

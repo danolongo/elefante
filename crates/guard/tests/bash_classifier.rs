@@ -34,6 +34,8 @@ fn classifies_full_fixture_table() {
         ("(echo changed > file)", Verdict::Escalate),
         ("echo $(printf changed >> file)", Verdict::Escalate),
         ("cat < .env", Verdict::Deny),
+        ("cat ~/.elefante/memory.key", Verdict::Deny),
+        ("xxd .elefante/memory.key", Verdict::Deny),
         ("printf changed > .env", Verdict::Deny),
         ("cat <<< safe", Verdict::Allow),
         ("cat <<'EOF'\nsafe\nEOF", Verdict::Allow),

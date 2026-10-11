@@ -47,7 +47,11 @@ impl Tree {
         }
         Self {
             store: Some(
-                Store::open(&RepoId::resolve_with_home(&tree.root, None).unwrap()).unwrap(),
+                Store::open_with_key(
+                    &RepoId::resolve_with_home(&tree.root, None).unwrap(),
+                    elefante_mem::MemKey::from_bytes([7; 32]),
+                )
+                .unwrap(),
             ),
             ..tree
         }
@@ -131,8 +135,13 @@ impl Tree {
     }
 
     pub fn reopen(&mut self) {
-        self.store =
-            Some(Store::open(&RepoId::resolve_with_home(&self.root, None).unwrap()).unwrap());
+        self.store = Some(
+            Store::open_with_key(
+                &RepoId::resolve_with_home(&self.root, None).unwrap(),
+                elefante_mem::MemKey::from_bytes([7; 32]),
+            )
+            .unwrap(),
+        );
     }
 }
 

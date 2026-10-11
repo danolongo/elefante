@@ -381,7 +381,7 @@ fn open(git: &GitRepo) -> Indexed {
     let repo = RepoId::resolve_with_home(git.path(), None).unwrap();
     Indexed {
         root: repo.root().to_path_buf(),
-        store: Store::open(&repo).unwrap(),
+        store: Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap(),
     }
 }
 
@@ -550,7 +550,7 @@ fn a_directory_that_is_not_a_repository_simply_has_no_co_change() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
     let repo = RepoId::resolve_with_home(tmp.path(), None).unwrap();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     let counters = Counters::default();
     refresh_blocking(&store, repo.root(), &counters, &IndexOptions::default()).unwrap();
 

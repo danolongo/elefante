@@ -18,6 +18,7 @@ pub mod state;
 pub mod stats;
 pub mod store;
 pub mod terms;
+pub mod trust;
 mod util;
 pub mod walk;
 
@@ -28,3 +29,4 @@ pub use repo::RepoId;
 pub use schema::Pairing;
 pub use stats::{Counters, IndexStats};
 pub use store::Store;
+pub use trust::MemKey;

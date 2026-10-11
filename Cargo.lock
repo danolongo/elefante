@@ -262,10 +262,14 @@ name = "elefante-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "elefante-core",
  "elefante-mem",
+ "elefante-provider",
  "elefante-rpc",
+ "rusqlite",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -302,6 +306,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "elefante-guard",
+ "getrandom 0.4.3",
  "ignore",
  "moka",
  "rusqlite",

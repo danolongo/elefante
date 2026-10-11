@@ -10,7 +10,7 @@ use crate::{
     graph,
     layout::StoreDir,
     repo::RepoId,
-    schema::{self, Pairing},
+    schema::{self, MemoryResetReason, Pairing},
     trust::MemKey,
 };
 
@@ -77,6 +77,7 @@ pub struct Store {
     index_state: IndexState,
     generation: AtomicI64,
     key: MemKey,
+    reset_reason: Option<MemoryResetReason>,
 }
 
 impl Store {
@@ -104,7 +105,7 @@ impl Store {
     /// Fails on any I/O or SQLite error, or an unsupported or corrupt `memory.db`.
     pub fn open_with_key(repo: &RepoId, key: MemKey) -> Result<Self, MemError> {
         let dir = StoreDir::create(repo)?;
-        let memory = schema::open_memory(&dir.memory_db(), &key)?;
+        let (memory, reset_reason) = schema::open_memory_with_reason(&dir.memory_db(), &key)?;
         let mut cache = schema::open_cache(&dir.cache_db(), &key)?;
         let pairing = schema::pair(&memory, &mut cache)?;
         let reader = schema::open_memory_reader(&dir.memory_db())?;
@@ -119,6 +120,7 @@ impl Store {
             index_state,
             generation: AtomicI64::new(generation),
             key,
+            reset_reason,
             writer: Actor::spawn("elefante-mem-writer", WriterState { memory, cache }),
             reader: Actor::spawn("elefante-mem-reader", ReaderState { memory: reader }),
         })
@@ -139,6 +141,12 @@ impl Store {
     #[must_use]
     pub fn pairing(&self) -> Pairing {
         self.pairing
+    }
+
+    /// Why an existing graph was discarded while opening, if it was.
+    #[must_use]
+    pub fn reset_reason(&self) -> Option<MemoryResetReason> {
+        self.reset_reason
     }
 
     #[must_use]

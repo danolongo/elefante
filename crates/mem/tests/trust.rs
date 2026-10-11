@@ -8,7 +8,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use elefante_mem::{
     MemError, MemKey, RepoId, Store,
     retrieve::{self, Query},
-    schema::{CACHE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION},
+    schema::{CACHE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, MemoryResetReason},
     trust::RowFields,
 };
 use rusqlite::Connection;
@@ -208,6 +208,7 @@ fn field_boundaries_cannot_be_shifted_to_forge_a_mac() {
 fn a_new_store_is_stamped_and_reopens_without_being_rebuilt() {
     let (_tmp, repo) = fresh();
     let store = Store::open_with_key(&repo, key(1)).unwrap();
+    assert_eq!(store.reset_reason(), None);
     store
         .writer()
         .call_blocking(|s| {
@@ -227,6 +228,7 @@ fn a_new_store_is_stamped_and_reopens_without_being_rebuilt() {
     drop(store);
 
     let again = Store::open_with_key(&repo, key(1)).unwrap();
+    assert_eq!(again.reset_reason(), None);
     let (nodes, epoch_again) = again
         .writer()
         .call_blocking(|s| {
@@ -261,6 +263,7 @@ fn a_store_made_under_another_key_is_discarded() {
     drop(store);
 
     let ours = Store::open_with_key(&repo, key(2)).unwrap();
+    assert_eq!(ours.reset_reason(), Some(MemoryResetReason::Untrusted));
     let nodes = ours
         .writer()
         .call_blocking(|s| {
@@ -290,6 +293,7 @@ fn a_version_one_store_is_rebuilt_not_trusted() {
         .unwrap();
     }
     let store = Store::open_with_key(&repo, key(1)).unwrap();
+    assert_eq!(store.reset_reason(), Some(MemoryResetReason::SchemaVersion));
     drop(store);
     assert_eq!(
         count(&memory_path(&repo), "PRAGMA user_version"),
@@ -333,6 +337,7 @@ fn a_database_a_repository_shipped_is_discarded_with_its_cache() {
             .unwrap();
     }
     let store = Store::open_with_key(&repo, key(1)).unwrap();
+    assert_eq!(store.reset_reason(), Some(MemoryResetReason::Untrusted));
     drop(store);
     assert_eq!(count(&memory_path(&repo), "SELECT count(*) FROM node"), 0);
     assert_eq!(

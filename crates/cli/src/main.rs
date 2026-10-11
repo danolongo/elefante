@@ -417,6 +417,12 @@ fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Resul
     err.finish()?;
     result
 }
+/// Whether the daemon answered "method not found" (-32601): it is older than the request.
+fn is_method_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RpcFailure>()
+        .is_some_and(|failure| failure.code == -32601)
+}
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("memory") {
@@ -425,18 +431,30 @@ fn main() -> anyhow::Result<()> {
             let path = socket_path()?;
             if let Ok(stream) = UnixStream::connect(path) {
                 let mut client = Client::new(stream);
-                let result = client.request(
+                match client.request(
                     "memory.consent",
                     json!({"answer":request.answer,"extractor":request.extractor}),
-                )?;
-                let consent = result["consent"]
-                    .as_str()
-                    .context("memory.consent returned no consent state")?;
-                println!(
-                    "{}",
-                    elefante_cli::memory::learn_report(consent, &request.extractor)
-                );
-                return Ok(());
+                ) {
+                    Ok(result) => {
+                        let consent = result["consent"]
+                            .as_str()
+                            .context("memory.consent returned no consent state")?;
+                        println!(
+                            "{}",
+                            elefante_cli::memory::learn_report(consent, &request.extractor)
+                        );
+                        return Ok(());
+                    }
+                    // A daemon from before consent control: record the answer in the file, and say
+                    // plainly that the running daemon will not see it until it restarts.
+                    Err(error) if is_method_not_found(&error) => {
+                        eprintln!(
+                            "warning: the running daemon predates consent control; restart it \
+                             (pkill elefante-srv) for this to take effect"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         if let Some((method, params)) = elefante_cli::memory::daemon_request(&args[1..], &cwd)?
@@ -468,6 +486,8 @@ fn main() -> anyhow::Result<()> {
                     );
                     std::process::exit(1);
                 }
+                // A daemon from before memory control: read the store directly, as before.
+                Err(error) if is_method_not_found(&error) => {}
                 Err(error) => return Err(error),
             }
         }

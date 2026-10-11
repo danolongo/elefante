@@ -42,14 +42,17 @@ elefante memory list [--all]   what was learned about this repository (--all add
 elefante memory forget <id>    delete one learned note
 elefante memory approve <id>   accept a note only the assistant had vouched for
 elefante memory clear --yes    delete every learned note for this repository
-elefante memory learn on|off   allow or decline learning from conversations
+elefante memory learn on|off [--model SLUG]   allow or decline learning, for the extractor model it will use
 ```
 
 Every subcommand prefers an already-listening daemon (`memory.list`, `forget`, `approve`, `clear`,
 `consent`, keyed by the current directory), so a change takes effect on the next retrieval and a
 consent answer reaches live sessions at once. None starts a daemon; with none listening they open
 the repository's store directly (`list`, `forget`, `approve`, `clear`) or write the tamper-evident
-consent file (`learn`). Learned notes are free-form text that is injected into prompts, so a person
+consent file (`learn`). Consent is kept per extractor model, so `learn` names the model it is for
+(`--model`, else `ELEFANTE_EXTRACT_MODEL`, else `OPENROUTER_MODEL`, else the default) and prints it. A
+daemon that predates these methods answers "method not found": the read-and-change commands then use the
+store directly, and `learn` writes the file and warns that the running daemon must be restarted. Learned notes are free-form text that is injected into prompts, so a person
 can always see them and remove them: the direct `list` also shows rows that fail their integrity
 check, flagged, so they can be forgotten, and checks the store's stamp first (a foreign store prints
 one explanation and no rows). Every column is passed through `display_safe` before printing.

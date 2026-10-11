@@ -1410,17 +1410,38 @@ fn discard_revoked_learning(state: &Shared) {
         .values()
         .cloned()
         .collect();
-    let consent = state.consent.lock().expect("consent poisoned");
-    for entry in entries {
-        if !consent.granted(extractor(&entry)) {
-            let mut learning = entry.learning.lock().expect("learning poisoned");
-            learning.history.clear();
-            if let Some(learner) = learning.learner.take() {
-                learner.cancel();
+    let mut cleared = Vec::new();
+    {
+        // Lock order everywhere is consent, then learning; memory state is taken on its own
+        // (it takes consent itself while building a status), so it is reset after this block.
+        let consent = state.consent.lock().expect("consent poisoned");
+        for entry in entries {
+            if !consent.granted(extractor(&entry)) {
+                let mut learning = entry.learning.lock().expect("learning poisoned");
+                learning.history.clear();
+                if let Some(learner) = learning.learner.take() {
+                    learner.cancel();
+                }
+                learning.idle_generation = learning.idle_generation.wrapping_add(1);
+                drop(learning);
+                cleared.push(entry);
             }
-            learning.idle_generation = learning.idle_generation.wrapping_add(1);
         }
     }
+    for entry in cleared {
+        reset_learning_health(state, &entry);
+    }
+}
+
+/// A learner that is gone takes its failures with it: a new one starts healthy, and the status
+/// must say so rather than keep reporting the old learner's problem.
+fn reset_learning_health(state: &Shared, entry: &SessionEntry) {
+    entry
+        .memory_state
+        .lock()
+        .expect("memory state poisoned")
+        .health = LearnHealth::default();
+    refresh_memory_status(state, entry);
 }
 
 fn refresh_all_memory_status(state: &Shared) {
@@ -1602,19 +1623,24 @@ fn observe_learning(
     messages: &[Message],
     (granted_at_start, start_revision): (bool, u64),
 ) {
-    let still_granted = {
-        let consent = state.consent.lock().expect("consent poisoned");
-        granted_at_start && consent.revision == start_revision && consent.granted(extractor(entry))
-    };
+    // The consent guard is held until the learner has been handed the text. Checking, releasing and
+    // then locking learning left a gap in which a revoke could clear everything and this turn would
+    // then start a new learner under consent that no longer existed.
+    let consent = state.consent.lock().expect("consent poisoned");
+    let still_granted =
+        granted_at_start && consent.revision == start_revision && consent.granted(extractor(entry));
     let mut learning = entry.learning.lock().expect("learning poisoned");
     let from = learning.seen_messages.min(messages.len());
     learning.seen_messages = messages.len();
     if !still_granted {
         learning.history.clear();
-        if let Some(learner) = learning.learner.take() {
-            learner.cancel();
-        }
+        let had_learner = learning.learner.take().inspect(|learner| learner.cancel());
         learning.idle_generation = learning.idle_generation.wrapping_add(1);
+        drop(learning);
+        drop(consent);
+        if had_learner.is_some() {
+            reset_learning_health(state, entry);
+        }
         return;
     }
     if from == messages.len() {
@@ -1639,6 +1665,7 @@ fn observe_learning(
     learning.idle_generation = learning.idle_generation.wrapping_add(1);
     let generation = learning.idle_generation;
     drop(learning);
+    drop(consent);
     schedule_idle_flush(state, entry, learner, generation, start_revision);
 }
 

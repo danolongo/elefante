@@ -1038,3 +1038,92 @@ async fn withdrawing_consent_while_an_extraction_is_out_stores_and_reports_nothi
     assert!(h.notes().is_empty(), "the late reply was not stored");
     assert_eq!(h.extractions().len(), 1, "and nothing was asked again");
 }
+
+async fn memory_of(client: &mut Client, id: u64, session: &str) -> Value {
+    client
+        .rpc(id, "session.attach", json!({"session_id":session}))
+        .await["result"]["memory"]
+        .clone()
+}
+
+#[tokio::test]
+async fn a_failing_learner_is_forgotten_with_its_failures_when_consent_is_withdrawn_and_given_again()
+ {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        extract_errors: 3,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    client
+        .rpc(2, "memory.consent", json!({"answer":"learn"}))
+        .await;
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: name branches after the ticket number.",
+    )
+    .await;
+    let mut id = 10;
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        id += 1;
+        status = memory_of(&mut client, id, session).await;
+        if status["learning"] == "failing" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status["learning"], "failing", "{status}");
+    assert!(status["problem"].is_string());
+
+    client
+        .rpc(3, "memory.consent", json!({"answer":"off"}))
+        .await;
+    client
+        .rpc(4, "memory.consent", json!({"answer":"learn"}))
+        .await;
+    let after = memory_of(&mut client, 5, session).await;
+    assert_eq!(after["learning"], "working", "{after}");
+    assert_eq!(after["problem"], Value::Null, "{after}");
+}
+
+#[tokio::test]
+async fn no_extraction_starts_once_a_withdrawal_has_been_answered() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    for round in 0..15_u64 {
+        client
+            .rpc(100 + round * 3, "memory.consent", json!({"answer":"learn"}))
+            .await;
+        // The turn ends and the daemon's own follow-up (reading the turn into the learner) races the
+        // withdrawal that arrives straight after.
+        client
+            .rpc(
+                101 + round * 3,
+                "session.prompt",
+                json!({"session_id": session, "text": format!("Remember: rule number {round} applies.")}),
+            )
+            .await;
+        client
+            .rpc(102 + round * 3, "memory.consent", json!({"answer":"off"}))
+            .await;
+        let answered = h.extractions().len();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            h.extractions().len(),
+            answered,
+            "round {round}: a request started after the withdrawal was answered"
+        );
+        client.finish().await;
+    }
+}

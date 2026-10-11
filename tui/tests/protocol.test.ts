@@ -3,7 +3,7 @@ import { createServer, type Socket } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
+import { connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseConsentResult, parseCreate, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
 import { note, snapshot, stream } from "./fixtures";
 
 test("NDJSON handles every byte split including UTF-8, escaped newline and multiple frames", () => {
@@ -47,6 +47,19 @@ test("attach validates exclusive from, contiguous original events, session routi
   expect(parseAttach({ kind: "resumed", from: 2, events: [note(2, "turn.started")] }, "s", 1).kind).toBe("resumed");
   expect(parseAttach({ kind: "snapshot", seq: 0, snapshot: snapshot() }, "s", 500).kind).toBe("snapshot");
   for (const value of [{ kind: "resumed", from: 1, events: [] }, { kind: "resumed", from: 2, events: [note(3, "turn.started")] }, { kind: "snapshot", seq: 1, snapshot: snapshot() }]) expect(() => parseAttach(value, "s", 1)).toThrow(ProtocolError);
+});
+
+test("create and both attach shapes validate optional additive memory consent", () => {
+  const memory = { consent: "unset" as const, extractor: "provider/model", future_field: true };
+  expect(parseCreate({ session_id: "s", seq: 0 })).toEqual({ session_id: "s", seq: 0 });
+  expect(parseCreate({ session_id: "s", seq: 0, memory })).toEqual({ session_id: "s", seq: 0, memory: { consent: "unset", extractor: "provider/model" } });
+  expect(parseAttach({ kind: "snapshot", seq: 0, snapshot: snapshot(), memory }, "s").memory).toEqual({ consent: "unset", extractor: "provider/model" });
+  expect(parseAttach({ kind: "resumed", from: 2, events: [note(2, "turn.started")], memory: { consent: "off", extractor: null } }, "s", 1).memory).toEqual({ consent: "off", extractor: null });
+  expect(parseConsentResult({ consent: "granted" })).toEqual({ consent: "granted" });
+  for (const invalid of [null, { consent: "maybe", extractor: "m" }, { consent: "unset", extractor: 3 }]) {
+    expect(() => parseCreate({ session_id: "s", seq: 0, memory: invalid })).toThrow(ProtocolError);
+  }
+  expect(() => parseConsentResult({ consent: "maybe" })).toThrow(ProtocolError);
 });
 
 test("the seen resume window remains bounded for large coalesced ranges", () => {

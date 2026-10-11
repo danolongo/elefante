@@ -148,6 +148,39 @@ test("approval modal emits a decision and key modal masks typed and pasted secre
     await act(async () => key.mockInput.pressEnter()); expect(keys).toEqual(["sk-secret"]);
   } finally { await act(async () => key.renderer.destroy()); }
 });
+test("consent modal discloses the extractor and has only explicit Y, N, and Esc decisions", async () => {
+  const decisions: string[] = [];
+  const setup = await testRender(<Modal kind="consent" extractor="provider/private-extractor" sameModel={false} busy={false} onDecision={decision => decisions.push(decision)} />, { width: 100, height: 16 });
+  try {
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("Remember things between sessions?");
+    expect(frame).toContain("provider/private-extractor");
+    expect(frame).toContain("not tool results");
+    expect(frame).toContain("saves short notes on this machine");
+    await act(async () => setup.mockInput.pressEnter());
+    expect(decisions).toEqual([]);
+    await act(async () => setup.mockInput.pressKey("y"));
+    await act(async () => setup.mockInput.pressKey("n"));
+    await pressEscape(setup);
+    expect(decisions).toEqual(["learn", "off", "later"]);
+  } finally { await act(async () => setup.renderer.destroy()); }
+
+  const same = await testRender(<Modal kind="consent" extractor="provider/chat-model" sameModel busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
+  try { await same.renderOnce(); expect(same.captureCharFrame()).toContain("the same model you're chatting with"); }
+  finally { await act(async () => same.renderer.destroy()); }
+});
+test("consent modal owns typing and Esc so neither reaches the prompt or interrupt handler", async () => {
+  const prompts: string[] = []; const decisions: string[] = []; let interrupts = 0;
+  const modal = { kind: "consent" as const, extractor: "provider/model", sameModel: false, busy: false, onDecision: (decision: "learn" | "off" | "later") => decisions.push(decision) };
+  const setup = await testRender(<App state={initialSession("s")} now={0} connected message={null} modal={modal} onSubmit={text => prompts.push(text)} onInterrupt={() => interrupts++} onExit={() => {}} />, { width: 100, height: 20 });
+  try {
+    await act(async () => { await setup.mockInput.typeText("hello"); await setup.mockInput.pressEnter(); });
+    expect(prompts).toEqual([]); expect(decisions).toEqual([]);
+    await pressEscape(setup);
+    expect(decisions).toEqual(["later"]); expect(interrupts).toBe(0);
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
 test("input submits, Esc interrupts without exiting, and Ctrl+C exits without interrupting", async () => {
   const prompts: string[] = []; let interrupts = 0; let exits = 0;
   const setup = await testRender(<App state={initialSession("s")} now={0} connected message={null} modal={null} onSubmit={text => prompts.push(text)} onInterrupt={() => interrupts++} onExit={() => exits++} />, { width: 100, height: 20 });

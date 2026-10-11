@@ -39,6 +39,6 @@ export function App(props: AppProps) {
       </box>
       <PerchMascot view={mascot} animate={props.animateMascot} />
     </box>
-    {props.modal && <Modal key={props.modal.kind === "approval" ? props.modal.approval.approval_id : "key"} {...props.modal} />}
+    {props.modal && <Modal key={props.modal.kind === "approval" ? props.modal.approval.approval_id : props.modal.kind} {...props.modal} />}
   </box>;
 }

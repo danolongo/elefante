@@ -2,7 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RpcClient, RpcError, connectOrExplain } from "./protocol";
+import { RpcClient, RpcError, connectOrExplain, parseConsentResult, parseCreate, type CreateResult, type MemorySeed } from "./protocol";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
 import { Root } from "./ui/Root";
 import { publish } from "./store";
@@ -37,6 +37,7 @@ let submitting = false;
 let retryPrompt = "";
 let stopped = false;
 let reconnecting = false;
+let consentPrompt: MemorySeed | null = null;
 let timer: ReturnType<typeof setInterval>;
 const exit = () => { stopped = true; clearInterval(timer); rpc.close(); renderer.destroy(); };
 const fail = (error: unknown) => { message = error instanceof Error ? error.message : String(error); draw(); };
@@ -58,7 +59,16 @@ function draw() {
   if (stopped) return;
   const approval = state.active_turn?.pending_approvals[0];
   let modal: ModalProps | null = null;
-  if (keyNeeded) modal = { kind: "key", busy, onKey: async key => {
+  if (consentPrompt) modal = { kind: "consent", extractor: consentPrompt.extractor!, sameModel: consentPrompt.extractor === state.model, busy, onDecision: async decision => {
+    if (decision === "later") { consentPrompt = null; draw(); return; }
+    busy = true; draw();
+    try {
+      parseConsentResult(await rpc.request("memory.consent", { answer: decision }));
+      consentPrompt = null;
+    } catch (error) { fail(error); }
+    finally { busy = false; draw(); }
+  } };
+  else if (keyNeeded) modal = { kind: "key", busy, onKey: async key => {
     busy = true; draw();
     try { await rpc.request("key.set", { api_key: key }); keyNeeded = false; await prompt(retryPrompt); }
     catch (error) { fail(error); }
@@ -93,9 +103,11 @@ process.once("SIGTERM", exit);
 try {
   connected = true;
   const existing = option("--session");
-  const created = existing ? { session_id: existing, seq: 0 } : await rpc.request<{ session_id: string; seq: number }>("session.create", { cwd: state.cwd, ...(state.model ? { model: state.model } : {}), ...(state.effort ? { effort: state.effort } : {}), ...(setting("max-rounds") ? { max_rounds: Number(setting("max-rounds")) } : {}), ...(setting("max-tokens") ? { max_tokens: Number(setting("max-tokens")) } : {}) });
+  const created: CreateResult = existing ? { session_id: existing, seq: 0 } : parseCreate(await rpc.request("session.create", { cwd: state.cwd, ...(state.model ? { model: state.model } : {}), ...(state.effort ? { effort: state.effort } : {}), ...(setting("max-rounds") ? { max_rounds: Number(setting("max-rounds")) } : {}), ...(setting("max-tokens") ? { max_tokens: Number(setting("max-tokens")) } : {}) }));
   state = { ...state, session_id: created.session_id, seq: created.seq };
-  await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort); draw(); });
+  const attached = await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort); draw(); });
+  const memory = attached.memory ?? created.memory;
+  if (memory?.consent === "unset" && memory.extractor !== null) consentPrompt = memory;
   timer = setInterval(draw, 250);
   draw();                 // seeds the store before the first read
   root.render(<Root />);  // exactly once, for the life of the process

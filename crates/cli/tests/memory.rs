@@ -335,13 +335,19 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"memory learning is granted\n");
+    assert_eq!(
+        output.stdout,
+        b"memory learning is granted for vendor/extractor\n"
+    );
     assert!(output.stderr.is_empty());
 
     let key_path = home.join(".elefante/memory.key");
     let key = MemKey::load_or_create(&key_path).unwrap();
     let consent_path = home.join(".elefante/memory-consent");
-    let record = consent::read(&consent_path, &key).unwrap();
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
     assert_eq!(record.answer, ConsentAnswer::Learn);
     assert_eq!(record.extractor, "vendor/extractor");
 
@@ -355,8 +361,14 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"memory learning is declined\n");
-    let record = consent::read(&consent_path, &key).unwrap();
+    assert_eq!(
+        output.stdout,
+        b"memory learning is declined for vendor/chat\n"
+    );
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
     assert_eq!(record.answer, ConsentAnswer::Off);
     assert_eq!(record.extractor, "vendor/chat");
 
@@ -370,7 +382,10 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let record = consent::read(&consent_path, &key).unwrap();
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
     assert_eq!(record.answer, ConsentAnswer::Learn);
     assert_eq!(record.extractor, "anthropic/claude-sonnet-5");
 }
@@ -392,5 +407,51 @@ fn memory_learn_rejects_bad_settings_before_resolving_a_repo() {
             String::from_utf8_lossy(&output.stderr).contains("memory learn"),
             "{output:?}"
         );
+    }
+}
+
+#[test]
+fn memory_learn_names_the_model_and_an_answer_for_one_model_leaves_another_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_elefante"))
+            .current_dir(tmp.path())
+            .env("HOME", &home)
+            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+            .env_remove("ELEFANTE_EXTRACT_MODEL")
+            .env("OPENROUTER_MODEL", "vendor/chat")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let first = run(&["memory", "learn", "on", "--model", "vendor/one"]);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(first.stdout, b"memory learning is granted for vendor/one\n");
+    let second = run(&["memory", "learn", "--model", "vendor/two", "off"]);
+    assert_eq!(
+        second.stdout,
+        b"memory learning is declined for vendor/two\n"
+    );
+
+    let key = MemKey::load_or_create(&home.join(".elefante/memory.key")).unwrap();
+    let path = home.join(".elefante/memory-consent");
+    assert_eq!(
+        consent::read_for(&path, &key, "vendor/one").unwrap().answer,
+        ConsentAnswer::Learn,
+        "answering for another model did not withdraw this one"
+    );
+    assert_eq!(
+        consent::read_for(&path, &key, "vendor/two").unwrap().answer,
+        ConsentAnswer::Off
+    );
+    assert!(consent::read_for(&path, &key, "vendor/chat").is_none());
+
+    for bad in [
+        &["memory", "learn", "on", "--model"][..],
+        &["memory", "learn", "on", "--model", "a", "--model", "b"],
+        &["memory", "learn", "on", "off"],
+    ] {
+        assert!(!run(bad).status.success(), "{bad:?}");
     }
 }

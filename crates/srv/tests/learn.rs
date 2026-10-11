@@ -429,8 +429,9 @@ async fn answers_are_shared_persisted_extractor_bound_and_connection_local() {
     let mut client = Client::connect(&h.config.socket).await;
     let declined = h.create(&mut client, 6, Some("provider/two")).await;
     assert_eq!(declined["result"]["memory"]["consent"], "declined");
+    // Answering for provider/two did not touch the answer for provider/one.
     let old_extractor = h.create(&mut client, 7, Some("provider/one")).await;
-    assert_eq!(old_extractor["result"]["memory"]["consent"], "unset");
+    assert_eq!(old_extractor["result"]["memory"]["consent"], "granted");
 }
 
 #[tokio::test]
@@ -502,7 +503,7 @@ async fn operator_modes_override_files_and_tampering_returns_to_unset() {
         .unwrap()
         .join(CONSENT_FILE);
     let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    value["answer"] = "off".into();
+    value["records"][0]["answer"] = "off".into();
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     tampered.restart().await;
     let mut client = Client::connect(&tampered.config.socket).await;
@@ -1126,4 +1127,71 @@ async fn no_extraction_starts_once_a_withdrawal_has_been_answered() {
         );
         client.finish().await;
     }
+}
+
+#[tokio::test]
+async fn an_answer_is_for_the_extractor_named_and_leaves_the_others_alone() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let granted = client
+        .rpc(
+            2,
+            "memory.consent",
+            json!({"answer":"learn","extractor":"vendor/one"}),
+        )
+        .await;
+    assert_eq!(granted["result"]["consent"], "granted");
+    let other = client
+        .rpc(
+            3,
+            "memory.consent",
+            json!({"answer":"off","extractor":"vendor/two"}),
+        )
+        .await;
+    assert_eq!(other["result"]["consent"], "declined");
+
+    let one = h.create(&mut client, 4, Some("vendor/one")).await;
+    assert_eq!(one["result"]["memory"]["consent"], "granted");
+    let two = h.create(&mut client, 5, Some("vendor/two")).await;
+    assert_eq!(two["result"]["memory"]["consent"], "declined");
+    let three = h.create(&mut client, 6, Some("vendor/three")).await;
+    assert_eq!(three["result"]["memory"]["consent"], "unset");
+
+    let bad = client
+        .rpc(
+            7,
+            "memory.consent",
+            json!({"answer":"learn","extractor":"  "}),
+        )
+        .await;
+    assert!(bad["error"].is_object());
+}
+
+#[tokio::test]
+async fn a_change_written_to_the_consent_file_is_honoured_without_a_restart() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let before = h.create(&mut client, 1, Some("vendor/one")).await;
+    assert_eq!(before["result"]["memory"]["consent"], "unset");
+
+    // What `elefante memory learn on` does when it cannot reach this daemon's socket.
+    let parent = h.config.credentials.parent().unwrap();
+    let key = MemKey::load_or_create(&parent.join(KEY_FILE)).unwrap();
+    consent::write(
+        &parent.join(CONSENT_FILE),
+        &key,
+        &consent_record(ConsentAnswer::Learn, "vendor/one"),
+    )
+    .unwrap();
+
+    let after = h.create(&mut client, 2, Some("vendor/one")).await;
+    assert_eq!(after["result"]["memory"]["consent"], "granted");
 }

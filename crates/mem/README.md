@@ -183,10 +183,12 @@ coloured output does not cost a legitimate note; the quote check ignores non-alp
 stripped quote still matches), the prompt-path escapes use it, and the CLI and daemon apply it to every
 column they print or send. Notes stored before it existed are cleaned at display.
 
-**Consent** (`consent.rs`). The file `memory-consent` beside `memory.key` holds
-`{ answer: "learn" | "off", extractor, stamp }`, the stamp a keyed MAC over answer and extractor.
-`read` returns `None` for a missing, malformed, tampered or foreign-key file — indistinguishable from
-no answer, so it fails closed — and `write` is atomic and `0600`. This crate stores the answer; whether
+**Consent** (`consent.rs`). The file `memory-consent` beside `memory.key` holds a list of
+`{ answer: "learn" | "off", extractor, stamp }` records, one per extractor, each stamp a keyed MAC over
+its answer and extractor. `read_all` / `read_for` return only records that verify — a missing,
+malformed, tampered or foreign-key record is indistinguishable from no answer, so it fails closed —
+and `write` replaces the answer for one extractor, keeps the verified others, and is atomic and
+`0600`. This crate stores the answer; whether
 learning may run is the daemon's decision.
 
 **Rebuilds are reportable.** `Store::reset_reason()` is `Some(Untrusted | SchemaVersion)` when opening

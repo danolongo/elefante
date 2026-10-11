@@ -1,4 +1,7 @@
 //! Tamper-evident, extractor-bound consent for learned memory.
+//!
+//! One answer is kept per extractor model, so agreeing to learn through one model neither grants
+//! nor withdraws anything for another.
 
 use std::{
     fs::{self, OpenOptions},
@@ -47,24 +50,62 @@ struct StoredConsent {
     stamp: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredFile {
+    records: Vec<StoredConsent>,
+}
+
+/// The records in a consent file, whatever their stamps say. A file holding a single bare record
+/// (the first shape) is read as a list of one.
+fn stored(path: &Path) -> Vec<StoredConsent> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    if let Ok(file) = serde_json::from_slice::<StoredFile>(&bytes) {
+        return file.records;
+    }
+    serde_json::from_slice::<StoredConsent>(&bytes)
+        .map(|record| vec![record])
+        .unwrap_or_default()
+}
+
 fn binding(answer: ConsentAnswer, extractor: &str) -> String {
     format!("{}\0{extractor}", answer.as_str())
 }
 
-/// Reads and verifies a consent file. Missing, unreadable, malformed, or unstamped files are
-/// deliberately indistinguishable from no answer.
+/// Reads and verifies a consent file, returning the records whose stamps match. Missing,
+/// unreadable, malformed, or unstamped files, and any single record that fails its stamp, are
+/// deliberately indistinguishable from no answer for that extractor.
 #[must_use]
-pub fn read(path: &Path, key: &MemKey) -> Option<ConsentRecord> {
-    let stored: StoredConsent = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let bound = binding(stored.answer, &stored.extractor);
-    key.stamp_matches("consent", &bound, &stored.stamp)
-        .then_some(ConsentRecord {
-            answer: stored.answer,
-            extractor: stored.extractor,
+pub fn read_all(path: &Path, key: &MemKey) -> Vec<ConsentRecord> {
+    stored(path)
+        .into_iter()
+        .filter(|record| {
+            key.stamp_matches(
+                "consent",
+                &binding(record.answer, &record.extractor),
+                &record.stamp,
+            )
         })
+        .map(|record| ConsentRecord {
+            answer: record.answer,
+            extractor: record.extractor,
+        })
+        .collect()
 }
 
-/// Atomically persists a consent answer in a private file stamped by the memory key.
+/// The verified answer for one extractor, if any.
+#[must_use]
+pub fn read_for(path: &Path, key: &MemKey, extractor: &str) -> Option<ConsentRecord> {
+    read_all(path, key)
+        .into_iter()
+        .rev()
+        .find(|record| record.extractor == extractor)
+}
+
+/// Atomically persists a consent answer in a private file stamped by the memory key, replacing any
+/// earlier answer for the same extractor and keeping the verified answers for the others. A record
+/// that fails its stamp is dropped rather than carried forward.
 ///
 /// # Errors
 /// Returns an I/O or serialization error without replacing the previous answer.
@@ -74,12 +115,22 @@ pub fn write(path: &Path, key: &MemKey, record: &ConsentRecord) -> Result<(), Me
         reason: "there is no directory to keep memory consent in",
     })?;
     create_private_dir(parent)?;
-    let stored = StoredConsent {
-        answer: record.answer,
-        extractor: record.extractor.clone(),
-        stamp: key.stamp("consent", &binding(record.answer, &record.extractor)),
+    let mut records: Vec<ConsentRecord> = read_all(path, key)
+        .into_iter()
+        .filter(|kept| kept.extractor != record.extractor)
+        .collect();
+    records.push(record.clone());
+    let file = StoredFile {
+        records: records
+            .into_iter()
+            .map(|record| StoredConsent {
+                stamp: key.stamp("consent", &binding(record.answer, &record.extractor)),
+                answer: record.answer,
+                extractor: record.extractor,
+            })
+            .collect(),
     };
-    let bytes = serde_json::to_vec(&stored).map_err(|error| {
+    let bytes = serde_json::to_vec(&file).map_err(|error| {
         MemError::io(
             path,
             std::io::Error::new(std::io::ErrorKind::InvalidData, error),

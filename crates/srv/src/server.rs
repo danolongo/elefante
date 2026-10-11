@@ -257,12 +257,21 @@ impl RepoMemory {
     }
 }
 
+/// What was last read from the consent file, and when the file was last seen to change.
+#[derive(Default)]
+struct ConsentCache {
+    answers: HashMap<String, ConsentAnswer>,
+    seen: Option<(std::time::SystemTime, u64)>,
+}
+
+/// One answer per extractor model. The file can be rewritten by `elefante memory learn` while no
+/// daemon is listening on its socket, so it is looked at again whenever it has changed on disk.
 struct ConsentGate {
     mode: LearnMode,
     path: PathBuf,
     key: Option<MemKey>,
-    record: Option<ConsentRecord>,
-    revision: u64,
+    cache: std::cell::RefCell<ConsentCache>,
+    revision: std::cell::Cell<u64>,
 }
 
 impl ConsentGate {
@@ -278,17 +287,49 @@ impl ConsentGate {
                 eprintln!("elefante: cannot read memory consent: {error}");
                 None
             });
-        let record = key.as_ref().and_then(|key| consent::read(&path, key));
-        Self {
+        let gate = Self {
             mode: config.learn,
             path,
             key,
-            record,
-            revision: 0,
+            cache: std::cell::RefCell::new(ConsentCache::default()),
+            revision: std::cell::Cell::new(0),
+        };
+        gate.sync();
+        gate.revision.set(0);
+        gate
+    }
+
+    /// Bumped whenever an answer changes, by this daemon or by a write to the file.
+    fn revision(&self) -> u64 {
+        self.sync();
+        self.revision.get()
+    }
+
+    /// Re-reads the file if it changed since it was last read.
+    fn sync(&self) {
+        let Some(key) = &self.key else {
+            return;
+        };
+        let seen = fs::metadata(&self.path)
+            .ok()
+            .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
+        let mut cache = self.cache.borrow_mut();
+        if cache.seen == seen {
+            return;
         }
+        let answers: HashMap<String, ConsentAnswer> = consent::read_all(&self.path, key)
+            .into_iter()
+            .map(|record| (record.extractor, record.answer))
+            .collect();
+        if answers != cache.answers {
+            self.revision.set(self.revision.get().wrapping_add(1));
+        }
+        cache.answers = answers;
+        cache.seen = seen;
     }
 
     fn seed(&self, extractor: Option<&str>) -> MemorySeed {
+        self.sync();
         match (self.mode, extractor) {
             (LearnMode::Off, _) => MemorySeed {
                 consent: MemoryConsentState::Off,
@@ -299,12 +340,7 @@ impl ConsentGate {
                 extractor: Some(extractor.to_owned()),
             },
             (LearnMode::Ask, Some(extractor)) => {
-                let consent = match self
-                    .record
-                    .as_ref()
-                    .filter(|record| record.extractor == extractor)
-                    .map(|record| record.answer)
-                {
+                let consent = match self.cache.borrow().answers.get(extractor).copied() {
                     Some(ConsentAnswer::Learn) => MemoryConsentState::Granted,
                     Some(ConsentAnswer::Off) => MemoryConsentState::Declined,
                     None => MemoryConsentState::Unset,
@@ -348,8 +384,8 @@ impl ConsentGate {
             extractor: extractor.to_owned(),
         };
         consent::write(&self.path, key, &record)?;
-        self.record = Some(record);
-        self.revision = self.revision.wrapping_add(1);
+        // `sync` sees the file as changed and bumps the revision once, whatever else it read.
+        self.sync();
         Ok(self.seed(Some(extractor)).consent)
     }
 
@@ -1219,8 +1255,18 @@ fn handle_memory_consent(
         }
         LearnMode::Ask => {}
     }
-    let extractor = consent_target
-        .ok_or_else(|| invalid("memory.consent requires a learning-capable session target"))?;
+    // An answer is for one extractor model: the one named, else the one the connection's last session
+    // uses.
+    let extractor = match params.get("extractor") {
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| invalid("extractor must be a model name"))?,
+        None => consent_target.ok_or_else(|| {
+            invalid("memory.consent requires an extractor or a learning-capable session target")
+        })?,
+    };
     let consent = state
         .consent
         .lock()
@@ -1552,7 +1598,7 @@ fn prompt_session(
     let cancel = CancellationToken::new();
     let consent_at_start = {
         let consent = state.consent.lock().expect("consent poisoned");
-        (consent.granted(extractor(entry)), consent.revision)
+        (consent.granted(extractor(entry)), consent.revision())
     };
     view.active = Some(
         json!({"turn_id":turn_id,"prompt":text,"text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null,"memory_note_ids":[]}),
@@ -1627,8 +1673,9 @@ fn observe_learning(
     // then locking learning left a gap in which a revoke could clear everything and this turn would
     // then start a new learner under consent that no longer existed.
     let consent = state.consent.lock().expect("consent poisoned");
-    let still_granted =
-        granted_at_start && consent.revision == start_revision && consent.granted(extractor(entry));
+    let still_granted = granted_at_start
+        && consent.revision() == start_revision
+        && consent.granted(extractor(entry));
     let mut learning = entry.learning.lock().expect("learning poisoned");
     let from = learning.seen_messages.min(messages.len());
     learning.seen_messages = messages.len();
@@ -1684,7 +1731,7 @@ fn schedule_idle_flush(
         tokio::time::sleep(wait).await;
         let consent_valid = {
             let consent = state.consent.lock().expect("consent poisoned");
-            consent.revision == consent_revision && consent.granted(extractor(&entry))
+            consent.revision() == consent_revision && consent.granted(extractor(&entry))
         };
         let learner_current = {
             let learning = entry.learning.lock().expect("learning poisoned");
@@ -1818,8 +1865,8 @@ mod tests {
                 mode: LearnMode::Off,
                 path: dir.join(CONSENT_FILE),
                 key: None,
-                record: None,
-                revision: 0,
+                cache: std::cell::RefCell::new(ConsentCache::default()),
+                revision: std::cell::Cell::new(0),
             }),
             standalone_extractor: "anthropic/claude-sonnet-5".to_owned(),
             next_id: AtomicU64::new(1),

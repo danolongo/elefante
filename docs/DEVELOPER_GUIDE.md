@@ -694,7 +694,7 @@ demand, without starting an indexer refresh.
 | `memory.approve` `{cwd,id}` | `{}`. Promotes a pending note. `UNKNOWN_NOTE` if there is no such pending note. |
 | `memory.clear` `{cwd}` | `{ removed }`. Deletes every learned note and leaves the code graph alone. |
 | `memory.status` `{cwd}` | A `MemoryStatus`: the live session's if one in that repository exists, else a fresh one for the default extractor. |
-| `memory.consent` `{answer}` | `{ consent }`, the resulting state. User-level, not per repository: it persists, applies to every live session at once, and emits `memory.status` to each. It targets the extractor of the **last session this connection created or attached** (a fresh connection targets the configured default extractor), so a connection with none gets `-32602`. When the operator switch decides (`ELEFANTE_LEARN` is `1`/`on` or `0`/`off`), it changes nothing and returns `off` or `granted`. An answer that revokes consent discards any text the learner was holding. |
+| `memory.consent` `{answer, extractor?}` | `{ consent }`, the resulting state. User-level, not per repository: it persists, applies to every live session whose extractor it names at once, and emits `memory.status` to each. An answer is **for one extractor model**: `extractor` if given (a blank one is `-32602`), else the extractor of the **last session this connection created or attached**, else the configured default extractor (`ELEFANTE_EXTRACT_MODEL`, `OPENROUTER_MODEL`, the built-in default). Answering for one model neither grants nor withdraws anything for another. When the operator switch decides (`ELEFANTE_LEARN` is `1`/`on` or `0`/`off`), it changes nothing and returns `off` or `granted`. An answer that revokes consent discards any text the learner was holding. |
 
 All of these answer `MEMORY_OFF` (`-32007`) when the repository has no usable store, except
 `memory.consent`, which does not need one. A mutation advances the store's generation, so a
@@ -702,10 +702,14 @@ All of these answer `MEMORY_OFF` (`-32007`) when the repository has no usable st
 not recalled.
 
 **Consent.** `ELEFANTE_LEARN` unset means *ask*: consent comes from `~/.elefante/memory-consent`,
-beside the credentials and the memory key. It holds `{ answer, extractor, stamp }`, the stamp a
-keyed MAC over answer and extractor made with `memory.key`. A missing, malformed or unstamped file
-reads as `unset` (fail closed), and so does one whose `extractor` differs from the session's
-current one. `1` or `on` is the operator's consent (headless, CI): no file, no question. `0` or
+beside the credentials and the memory key. It holds a list of `{ answer, extractor, stamp }` records, one per
+extractor, each stamp a keyed MAC over that record's answer and extractor made with `memory.key`.
+A missing, malformed or unstamped file reads as `unset` (fail closed); a record that fails its stamp
+is ignored on its own, and a session whose extractor has no verified record is `unset`. The daemon
+looks at the file again whenever it has changed on disk, so `elefante memory learn` works without a
+restart even when it could not reach the daemon's socket. `elefante memory learn on|off [--model
+SLUG]` names the model the answer is for (`--model`, else `ELEFANTE_EXTRACT_MODEL`, else
+`OPENROUTER_MODEL`, else the default). `1` or `on` is the operator's consent (headless, CI): no file, no question. `0` or
 `off`, or `ELEFANTE_MEMORY=0`, turns learning off and nothing is read; any other value means ask.
 An operator setting always beats the file. Before
 this wire existed learning was on unless `ELEFANTE_LEARN=0`; `ELEFANTE_LEARN=1` restores that.

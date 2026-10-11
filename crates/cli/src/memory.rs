@@ -21,24 +21,60 @@ use elefante_mem::{
 };
 use serde_json::{Value, json};
 
-pub const USAGE: &str = "usage: elefante memory <command>\n\ncommands:\n  list [--all]     show what was learned about this repository (--all includes superseded)\n  forget <id>      delete one learned note\n  approve <id>     accept a note only the assistant had vouched for\n  clear --yes      delete every learned note for this repository\n  learn on|off     allow or decline learning from conversations";
+pub const USAGE: &str = "usage: elefante memory <command>\n\ncommands:\n  list [--all]     show what was learned about this repository (--all includes superseded)\n  forget <id>      delete one learned note\n  approve <id>     accept a note only the assistant had vouched for\n  clear --yes      delete every learned note for this repository\n  learn on|off [--model SLUG]  allow or decline learning, for the extractor model this will use";
 
-/// Returns the daemon answer for a `memory learn` command, or `None` for another subcommand.
+/// One `memory learn` command: the answer, and the extractor model it is an answer for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LearnRequest {
+    pub answer: ConsentAnswer,
+    pub extractor: String,
+}
+
+/// Parses `memory learn on|off [--model SLUG]`, or returns `None` for another subcommand.
+///
+/// Consent is kept per extractor model, so the model the answer is for is always named: `--model`,
+/// else `ELEFANTE_EXTRACT_MODEL`, else `OPENROUTER_MODEL`, else the default a bare `elefante` uses.
 ///
 /// # Errors
-/// A learn command must contain exactly `on` or `off`.
-pub fn learn_answer(args: &[String]) -> anyhow::Result<Option<ConsentAnswer>> {
-    match args {
-        [command, setting] if command == "learn" => match setting.as_str() {
-            "on" => Ok(Some(ConsentAnswer::Learn)),
-            "off" => Ok(Some(ConsentAnswer::Off)),
-            _ => bail!("`memory learn` expects on or off\n\n{USAGE}"),
-        },
-        [command, ..] if command == "learn" => {
-            bail!("`memory learn` takes exactly one setting\n\n{USAGE}")
-        }
-        _ => Ok(None),
+/// A learn command that is not exactly one setting and at most one `--model`.
+pub fn learn_request(args: &[String]) -> anyhow::Result<Option<LearnRequest>> {
+    let [command, rest @ ..] = args else {
+        return Ok(None);
+    };
+    if command != "learn" {
+        return Ok(None);
     }
+    let mut setting = None;
+    let mut model = None;
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--model" {
+            let slug = rest
+                .next()
+                .filter(|slug| !slug.trim().is_empty())
+                .with_context(|| format!("`memory learn --model` needs a model\n\n{USAGE}"))?;
+            if model.replace(slug.trim().to_owned()).is_some() {
+                bail!("`memory learn` takes one --model\n\n{USAGE}");
+            }
+        } else if setting.replace(arg.as_str()).is_some() {
+            bail!("`memory learn` takes exactly one setting\n\n{USAGE}");
+        }
+    }
+    let answer = match setting {
+        Some("on") => ConsentAnswer::Learn,
+        Some("off") => ConsentAnswer::Off,
+        _ => bail!("`memory learn` expects on or off\n\n{USAGE}"),
+    };
+    Ok(Some(LearnRequest {
+        answer,
+        extractor: model.unwrap_or_else(|| configured_extractor().trim().to_owned()),
+    }))
+}
+
+/// What `memory learn` tells the person, naming the model the answer is for.
+#[must_use]
+pub fn learn_report(consent: &str, extractor: &str) -> String {
+    format!("memory learning is {consent} for {extractor}")
 }
 
 fn configured_extractor() -> String {
@@ -53,8 +89,12 @@ fn configured_extractor() -> String {
         .unwrap_or_else(|| "anthropic/claude-sonnet-5".to_owned())
 }
 
-fn set_learning(
-    answer: ConsentAnswer,
+/// Writes the answer straight to the consent file, for when no daemon is listening.
+///
+/// # Errors
+/// The memory key or the file cannot be read or written.
+pub fn set_learning(
+    request: &LearnRequest,
     key_path: &Path,
     out: &mut dyn Write,
 ) -> anyhow::Result<i32> {
@@ -67,19 +107,22 @@ fn set_learning(
         &consent_path,
         &key,
         &ConsentRecord {
-            answer,
-            extractor: configured_extractor().trim().to_owned(),
+            answer: request.answer,
+            extractor: request.extractor.clone(),
         },
     )
     .context("cannot save memory consent")?;
     writeln!(
         out,
-        "memory learning is {}",
-        if answer == ConsentAnswer::Learn {
-            "granted"
-        } else {
-            "declined"
-        }
+        "{}",
+        learn_report(
+            if request.answer == ConsentAnswer::Learn {
+                "granted"
+            } else {
+                "declined"
+            },
+            &request.extractor
+        )
     )?;
     Ok(0)
 }
@@ -262,8 +305,8 @@ pub fn run(
         writeln!(out, "{USAGE}")?;
         return Ok(0);
     }
-    if let Some(answer) = learn_answer(args)? {
-        return set_learning(answer, key_path, out);
+    if let Some(request) = learn_request(args)? {
+        return set_learning(&request, key_path, out);
     }
     let repo = RepoId::resolve(cwd).context("cannot tell which repository this is")?;
     let dir = StoreDir::path_for(repo.root());

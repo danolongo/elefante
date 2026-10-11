@@ -65,18 +65,25 @@ fn memory_learn_prefers_a_listening_daemon_without_touching_the_local_file() {
         let (stream, _) = listener.accept().unwrap();
         let mut peer = BufReader::new(stream);
         let request = receive(&mut peer, "memory.consent");
-        assert_eq!(request["params"], json!({"answer":"learn"}));
+        assert_eq!(
+            request["params"],
+            json!({"answer":"learn","extractor":"vendor/extractor"})
+        );
         answer(&mut peer, &request, &json!({"consent":"granted"}));
     });
     let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
         .env("HOME", &home)
         .env("ELEFANTE_SOCKET", &socket)
+        .env("ELEFANTE_EXTRACT_MODEL", "vendor/extractor")
         .args(["memory", "learn", "on"])
         .output()
         .unwrap();
     server.join().unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"memory learning is granted\n");
+    assert_eq!(
+        output.stdout,
+        b"memory learning is granted for vendor/extractor\n"
+    );
     assert!(output.stderr.is_empty());
     assert!(!home.join(".elefante/memory-consent").exists());
     assert!(!home.join(".elefante/memory.key").exists());

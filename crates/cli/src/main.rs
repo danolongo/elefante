@@ -421,15 +421,21 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("memory") {
         let cwd = env::current_dir().context("failed to determine current directory")?;
-        if let Some(answer) = elefante_cli::memory::learn_answer(&args[1..])? {
+        if let Some(request) = elefante_cli::memory::learn_request(&args[1..])? {
             let path = socket_path()?;
             if let Ok(stream) = UnixStream::connect(path) {
                 let mut client = Client::new(stream);
-                let result = client.request("memory.consent", json!({"answer":answer}))?;
+                let result = client.request(
+                    "memory.consent",
+                    json!({"answer":request.answer,"extractor":request.extractor}),
+                )?;
                 let consent = result["consent"]
                     .as_str()
                     .context("memory.consent returned no consent state")?;
-                println!("memory learning is {consent}");
+                println!(
+                    "{}",
+                    elefante_cli::memory::learn_report(consent, &request.extractor)
+                );
                 return Ok(());
             }
         }

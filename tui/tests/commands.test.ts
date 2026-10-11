@@ -12,6 +12,14 @@ test("only exactly /memory and /forget <integer> are commands", () => {
     expect(parseCommand(text)).toEqual({ kind: "prompt", text });
   }
 });
+test("/forget takes any run of spaces or tabs before the id, but never a newline", () => {
+  for (const line of ["/forget  14", "/forget\t14", "/forget \t 14", "  /forget   14  "]) expect(parseCommand(line)).toEqual({ kind: "forget", id: 14 });
+  for (const text of ["/forget\n14", "/forget \n14", "/forget 14\n", "please\n/forget 14", "/forget\r\n14"]) {
+    // A trailing newline is trimmed away, so only the embedded ones must stay prompts.
+    if (text === "/forget 14\n") expect(parseCommand(text)).toEqual({ kind: "forget", id: 14 });
+    else expect(parseCommand(text)).toEqual({ kind: "prompt", text });
+  }
+});
 test("a doubled slash sends the rest as an ordinary prompt", () => {
   expect(parseCommand("//memory")).toEqual({ kind: "prompt", text: "/memory" });
   expect(parseCommand("//x")).toEqual({ kind: "prompt", text: "/x" });
@@ -34,4 +42,18 @@ test("provenance is said in words and learning state explains itself", () => {
   expect(learningLine(memoryStatus({ consent: "unset", learning: "paused" }))).toContain("paused");
   expect(learningLine(memoryStatus({ consent: "declined", learning: "paused" }))).toContain("learn on");
   expect(learningLine(memoryStatus({ learning: "failing", problem: "no reply from the provider" }))).toContain("no reply from the provider");
+});
+
+const wireRow = (origin: string, status = "active") => ({ id: 1, kind: "fact", status, statement: "s", origin, confidence: 1, verified: true, reinforcements: 0 });
+test("a memory.list result reads the same through parseMemoryList and provenance with or without the learned: prefix", () => {
+  const expected = { explicit: "you asked", stated: "you said", assistant: "assistant — you confirmed" };
+  for (const prefix of ["", "learned:"]) {
+    for (const [origin, words] of Object.entries(expected)) {
+      const [row] = parseMemoryList({ notes: [wireRow(prefix + origin)] });
+      expect(row!.origin).toBe(origin);
+      expect(provenance(row!)).toBe(words);
+      const [pending] = parseMemoryList({ notes: [wireRow(prefix + origin, "pending")] });
+      expect(provenance(pending!)).toBe("assistant — unconfirmed");
+    }
+  }
 });

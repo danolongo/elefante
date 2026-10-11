@@ -25,7 +25,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/protocol.ts` | 306 | Framing, sequence windows, attach and gap handling, `connectOrExplain`; accepts unknown notification methods; parses the optional `memory` object, `memory.list` and `memory.consent` results. |
 | `src/session.ts` | 59 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. Keeps each turn's output as ordered `segments` (reasoning, text, tool calls). |
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
-| `src/commands.ts` | 11 | Pure: `parseCommand` — only exactly `/memory` and `/forget <integer>` are commands; `//x` sends `/x`; anything else is a prompt. |
+| `src/commands.ts` | 11 | Pure: `parseCommand` — only exactly `/memory` and `/forget <integer>` (spaces or tabs between) are commands; `//x` sends `/x`; anything else is a prompt. |
 | `src/memoryView.ts` | 18 | Pure: provenance in words (`you asked`, `you said`, `assistant — unconfirmed`) and the one line saying why learning is paused or failing. |
 | `src/main.tsx` | 144 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop, the consent question, and the `/memory` and `/forget` actions. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
@@ -96,6 +96,11 @@ All of it is driven by the daemon's `memory` result field and `memory.*` events
   when it arrived: `◇ remembered: …  /forget 14`, or `◇ updated: “old” → “new”  /forget 15`. A turn
   that used saved notes gets `◇ used N saved notes`. A reinforced or pending note draws nothing.
   Lines live in client state; a fresh attach starts from the snapshot and does not replay them.
+  A snapshot restore (after a reconnect that cannot resume from the ring) does not bring back the
+  `◇ remembered` / `◇ used` markers that happened inside a turn: snapshots carry no ordering, so
+  there is nowhere to place them. `/memory` is the durable view of what was saved. The memory
+  status (status line and cost) is not affected: every attach, including a reconnect, carries the
+  daemon's current `memory`, and the client applies it.
 - **`/memory`** opens a panel for the working directory's notes (`memory.list`), only while the
   prompt is enabled. `↑↓` select, `f` asks `Forget #14? “…”  Y / N`, `Esc` closes. It is a modal, so
   no key reaches the prompt. Approving, history and clearing stay in `elefante memory`.

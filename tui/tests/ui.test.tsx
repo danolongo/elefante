@@ -444,3 +444,33 @@ test("saved-note markers stay where they happened in the turn instead of sinking
     expect(frame.split("◇ remembered").length - 1).toBe(1);
   } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
 });
+
+test("the extractor and cwd are drawn without control characters in the panel and the consent modal", async () => {
+  const hostile = (text: string) => text.replace("<", "\u001b[31m").replace(">", "\u0007\u202e");
+  const panel = await testRender(<MemoryPanel {...panelProps({ cwd: hostile("/work/<re>po"), extractor: hostile("provider/<ex>tractor") })} />, { width: 100, height: 20 });
+  try {
+    await panel.renderOnce();
+    const frame = panel.captureCharFrame();
+    expect(frame).toContain("Notes for /work/[31mrepo");
+    expect(frame).toContain("sent to provider/[31mextractor");
+    expect(frame).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/);
+  } finally { await act(async () => panel.renderer.destroy()); }
+  const consent = await testRender(<Modal kind="consent" extractor={hostile("provider/<ex>tractor")} sameModel={false} busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
+  try {
+    await consent.renderOnce();
+    const frame = consent.captureCharFrame();
+    expect(frame).toContain("provider/[31mextractor");
+    expect(frame).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/);
+  } finally { await act(async () => consent.renderer.destroy()); }
+});
+test("Esc in the open memory panel closes it and does not interrupt another client's running turn", async () => {
+  const running = reduceSession(initialSession("s"), note(1, "turn.started"), 0);
+  expect(running.active_turn).not.toBeNull();
+  let interrupts = 0; let closed = 0;
+  const setup = await testRender(<App state={running} now={0} connected message={null} modal={panelProps({ onClose: () => closed++ })} animateMascot={false} onSubmit={() => {}} onCommand={() => {}} onInterrupt={() => interrupts++} onExit={() => {}} />, { width: 100, height: 24 });
+  try {
+    await setup.renderOnce();
+    await escape(setup);
+    expect(interrupts).toBe(0); expect(closed).toBe(1);
+  } finally { await act(async () => setup.renderer.destroy()); }
+});

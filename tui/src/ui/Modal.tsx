@@ -1,6 +1,6 @@
 import { useKeyboard, usePaste } from "@opentui/react";
 import { useState } from "react";
-import type { Approval } from "../protocol";
+import { displaySafe, type Approval } from "../protocol";
 import type { MemoryPanelProps } from "./MemoryPanel";
 type DialogProps =
   | { kind: "approval"; approval: Approval; busy: boolean; onDecision: (decision: "allow" | "deny") => void }
@@ -32,7 +32,7 @@ export function Modal(props: DialogProps) {
     </> : props.kind === "key" ? <><text>OpenRouter API key</text><text>{"•".repeat(Array.from(secret).length)}</text><text>{props.busy ? "Saving…" : "Paste or type key, then Enter"}</text></> : <>
       <text>Remember things between sessions?</text>
       <text>Elefante can note lasting preferences from your chats (e.g. “use pnpm”).</text>
-      <text>To do that it sends the text of your messages and its replies — not tool results — to {props.extractor}{props.sameModel ? ", the same model you're chatting with" : ""}, and saves short notes on this machine.</text>
+      <text>To do that it sends the text of your messages and its replies — not tool results — to {displaySafe(props.extractor)}{props.sameModel ? ", the same model you're chatting with" : ""}, and saves short notes on this machine.</text>
       <text>You can see and delete them any time with /memory.</text>
       <text>{props.busy ? "Saving…" : "Y learn · N don't · Esc ask me later"}</text>
     </>}

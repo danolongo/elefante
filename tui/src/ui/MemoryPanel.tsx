@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useKeyboard } from "@opentui/react";
-import type { MemoryRow } from "../protocol";
+import { displaySafe, type MemoryRow } from "../protocol";
 import { provenance } from "../memoryView";
 import { BORDER } from "./theme";
 
@@ -44,7 +44,7 @@ export function MemoryPanel(props: MemoryPanelProps) {
   const shown = rows.slice(start, start + WINDOW);
   const footer = confirming ? `Forget #${confirming.id}? “${confirming.statement}”  Y / N` : props.busy ? "Working…" : "↑↓ select · f forget · Esc close";
   return <box position="absolute" top={1} left={2} right={2} border borderColor={BORDER} padding={1} backgroundColor="#222233" flexDirection="column">
-    <text>Notes for {props.cwd}{props.rows ? `   ${rows.length} saved` : ""}</text>
+    <text>Notes for {displaySafe(props.cwd)}{props.rows ? `   ${rows.length} saved` : ""}</text>
     {props.learning && <text fg="#bbbb77">{props.learning}</text>}
     {props.error && <text fg="#ffaaaa">{props.error}</text>}
     {props.rows === null ? !props.error && <text fg="#777777">Loading…</text>
@@ -52,7 +52,7 @@ export function MemoryPanel(props: MemoryPanelProps) {
       : shown.map(row => <text key={row.id} fg={row.id === selected?.id ? "#ffffff" : "#aaaaaa"}>{row.id === selected?.id ? "▸" : " "} #{row.id}  {row.statement}   {provenance(row)}</text>)}
     {rows.length > WINDOW && <text fg="#777777">{start + 1}–{start + shown.length} of {rows.length}</text>}
     <text>{footer}</text>
-    <text fg="#777777">Notes already sent to {props.extractor ?? "the extractor model"} are not recalled. Say it again and it may be saved again.</text>
+    <text fg="#777777">Notes already sent to {props.extractor === null ? "the extractor model" : displaySafe(props.extractor)} are not recalled. Say it again and it may be saved again.</text>
     <text fg="#777777">To approve unconfirmed notes, see history, or clear all:  elefante memory</text>
   </box>;
 }

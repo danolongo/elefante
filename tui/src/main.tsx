@@ -119,7 +119,16 @@ async function recover() {
   reconnecting = true;
   while (!stopped && !connected) {
     await delay(250);
-    try { await rpc.reconnect(socketPath); connected = true; message = null; }
+    try {
+      const attached = await rpc.reconnect(socketPath);
+      connected = true; message = null;
+      // The snapshot callback restored state with the old status; the attach result's is current.
+      // A consent question already asked (or put off) is not reopened, only closed if answered elsewhere.
+      if (isMemoryStatus(attached?.memory)) {
+        state = { ...state, memory: attached.memory };
+        if (attached.memory.consent !== "unset") consentPrompt = null;
+      }
+    }
     catch (error) {
       if (error instanceof RpcError && error.code === -32001) { message = "Session no longer exists. Restart elefante to create a new session."; break; }
     }

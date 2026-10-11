@@ -60,7 +60,9 @@ export function parseMemoryList(value: unknown): MemoryRow[] {
     if (!object(row) || !memoryNote(row)) throw new ProtocolError("Invalid memory note");
     const { confidence, verified, reinforcements } = row as Record<string, unknown>;
     if (typeof confidence !== "number" || typeof verified !== "boolean" || !integer(reinforcements)) throw new ProtocolError("Invalid memory note");
-    return { ...safeMemoryNote(row), confidence, verified, reinforcements };
+    const note = safeMemoryNote(row);
+    // The daemon's raw origin was `learned:stated`; the wire shape is the bare `stated`. Take both.
+    return { ...note, origin: note.origin.replace(/^learned:/, ""), confidence, verified, reinforcements };
   });
 }
 const memoryNote = (v: unknown): v is MemoryNote => object(v) && integer(v.id) && strings(v, "kind", "status", "statement", "origin");
@@ -234,9 +236,12 @@ export class RpcClient {
     if (!result) throw new ProtocolError("Attach already in progress");
     return result;
   }
-  async reconnect(path: string): Promise<void> {
+  /** Reconnects and re-synchronizes every attachment; returns the last attach result, whose `memory` is current. */
+  async reconnect(path: string): Promise<AttachResult | undefined> {
     await this.connect(path);
-    for (const [id, a] of this.attachments) await this.synchronize(id, a, a.window.cursor);
+    let last: AttachResult | undefined;
+    for (const [id, a] of this.attachments) last = (await this.synchronize(id, a, a.window.cursor)) ?? last;
+    return last;
   }
   close(): void {
     this.onDisconnect = () => {};

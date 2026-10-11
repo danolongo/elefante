@@ -3,7 +3,8 @@ import { createServer, type Socket } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseConsentResult, parseCreate, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
+import { isMemoryStatus, type MemoryStatus, connectOrExplain, MAX_LINE_BYTES, NdjsonDecoder, parseAttach, parseConsentResult, parseCreate, parseNotification, ProtocolError, RpcClient, RpcError, SequenceWindow } from "../src/protocol";
+import { emptyUsage } from "../src/session";
 import { memoryStatus, note, snapshot, stream } from "./fixtures";
 
 test("NDJSON handles every byte split including UTF-8, escaped newline and multiple frames", () => {
@@ -152,6 +153,48 @@ test("socket attach races, gap recovery, response errors, multi-session routing 
     await client.reconnect(path);
     expect(sinceValues).toEqual([undefined, 2, 10]);
     expect(applied).toHaveLength(10);
+  } finally {
+    client.close(); for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test("reconnect surfaces the attach result so a changed memory status is not lost", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "elefante-tui-"));
+  const path = join(directory, "daemon.sock");
+  const sockets = new Set<Socket>();
+  let attaches = 0;
+  let serverSocket: Socket;
+  const server = createServer(socket => {
+    serverSocket = socket; sockets.add(socket);
+    const decoder = new NdjsonDecoder();
+    socket.on("data", chunk => {
+      for (const raw of decoder.push(chunk as Buffer)) {
+        const req = raw as { id: number; method: string; params: { since?: number } };
+        if (req.method !== "session.attach") continue;
+        attaches++;
+        const memory = attaches === 1 ? memoryStatus({ notes: { active: 2, pending: 1 } }) : memoryStatus({ notes: { active: 5, pending: 0 }, spend: { ...emptyUsage(), cost: 0.42 } });
+        const result = { kind: "snapshot", seq: 0, snapshot: snapshot(), memory };
+        socket.write(JSON.stringify({ id: req.id, result }) + "\n");
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(path, resolve));
+  const client = new RpcClient();
+  const restored: number[] = [];
+  try {
+    await client.connect(path);
+    const first = await client.attach("s", () => {}, snap => restored.push(snap.seq));
+    expect((first.memory as { notes: { active: number } }).notes.active).toBe(2);
+    const disconnected = new Promise<void>(resolve => { client.onDisconnect = () => resolve(); });
+    serverSocket!.destroy(); await disconnected;
+    const again = await client.reconnect(path);
+    expect(again?.kind).toBe("snapshot");
+    expect(isMemoryStatus(again?.memory)).toBe(true);
+    const memory = again!.memory as MemoryStatus;
+    expect(memory.notes).toEqual({ active: 5, pending: 0 });
+    expect(memory.spend.cost).toBe(0.42);
+    expect(restored).toHaveLength(2);
   } finally {
     client.close(); for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));

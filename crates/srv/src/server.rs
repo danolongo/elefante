@@ -29,9 +29,9 @@ use elefante_mem::{
 };
 use elefante_provider::{Message, OpenRouterProvider, Provider};
 use elefante_rpc::{
-    MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState, MemoryNote,
-    MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent, Usage,
-    truncate_preview,
+    MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
+    MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
+    UNKNOWN_NOTE, Usage, truncate_preview,
 };
 use elefante_tools::ToolExecutor;
 use futures_util::future::BoxFuture;
@@ -768,7 +768,7 @@ async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()
             break;
         }
         match serde_json::from_slice::<Value>(&bytes) {
-            Ok(request) => handle(&state, &queue, &request, &mut consent_target),
+            Ok(request) => handle(&state, &queue, &request, &mut consent_target).await,
             Err(_) => queue.push(error(Value::Null, -32700, "invalid JSON")),
         }
     }
@@ -789,7 +789,7 @@ fn error(id: Value, code: i32, message: &str) -> Value {
         .expect("error serialization")
 }
 
-fn handle(
+async fn handle(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
     request: &Value,
@@ -811,7 +811,8 @@ fn handle(
         request["method"].as_str().unwrap_or_default(),
         &params,
         consent_target,
-    );
+    )
+    .await;
     if let Err((code, message)) = result {
         queue.push(error(id, code, &message));
     }
@@ -1078,6 +1079,123 @@ fn attach_memory(
     )
 }
 
+fn validated_cwd(params: &Value) -> Result<PathBuf, (i32, String)> {
+    let cwd = fs::canonicalize(string(params, "cwd")?).map_err(invalid)?;
+    if !cwd.is_dir() {
+        return Err(invalid("cwd must be a directory"));
+    }
+    Ok(cwd)
+}
+
+fn repository_memory(state: &Shared, cwd: &Path) -> Result<Arc<RepoMemory>, (i32, String)> {
+    if !state.config.memory {
+        return Err((MEMORY_OFF, "memory is off".to_owned()));
+    }
+    let repo =
+        RepoId::resolve(cwd).map_err(|_| (MEMORY_OFF, "memory is unavailable".to_owned()))?;
+    let mut memories = state.memories.lock().expect("memory registry poisoned");
+    if let Some(memory) = memories.get(repo.root()) {
+        return Ok(Arc::clone(memory));
+    }
+    let opened = memory_key(&state.config)
+        .and_then(|key| RepoMemory::open(&repo, key))
+        .map_err(|_| (MEMORY_OFF, "memory is unavailable".to_owned()))?;
+    let opened = Arc::new(opened);
+    memories.insert(repo.root().to_path_buf(), Arc::clone(&opened));
+    Ok(opened)
+}
+
+fn repository_status(state: &Shared, memory: &Arc<RepoMemory>) -> MemoryStatus {
+    let entry = {
+        let sessions = state.sessions.lock().expect("registry poisoned");
+        sessions
+            .values()
+            .find(|entry| {
+                entry
+                    .memory
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, memory))
+            })
+            .cloned()
+    };
+    if let Some(entry) = entry {
+        return memory_status(state, &entry);
+    }
+    let config = LearnConfig::new(state.standalone_extractor.clone());
+    let local = SessionMemoryState {
+        reset_pending: memory.store.reset_reason().is_some(),
+        ..SessionMemoryState::default()
+    };
+    build_memory_status(state, Some(memory), Some(&config), &local)
+}
+
+async fn handle_repository_memory(
+    state: &Arc<Shared>,
+    queue: &Arc<ClientQueue>,
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> RpcResult {
+    let cwd = validated_cwd(params)?;
+    let memory = repository_memory(state, &cwd)?;
+    match method {
+        "memory.list" => {
+            let all = match params.get("all") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| invalid("all must be a boolean"))?,
+            };
+            let rows = learn::list_async(&memory.store, all)
+                .await
+                .map_err(invalid)?;
+            let notes: Vec<_> = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id":row.id,"kind":row.kind,"status":row.status,
+                        "statement":row.statement,"origin":row.origin,
+                        "confidence":row.effective_confidence,"verified":row.verified,
+                        "reinforcements":row.reinforcements
+                    })
+                })
+                .collect();
+            queue.push(response(id.clone(), json!({"notes":notes})));
+        }
+        "memory.forget" | "memory.approve" => {
+            let note_id = params["id"]
+                .as_i64()
+                .ok_or_else(|| invalid("id must be an integer"))?;
+            let changed = if method == "memory.forget" {
+                learn::forget_async(&memory.store, note_id)
+                    .await
+                    .map_err(invalid)?
+            } else {
+                learn::approve_async(&memory.store, note_id)
+                    .await
+                    .map_err(invalid)?
+            };
+            if !changed {
+                return Err((UNKNOWN_NOTE, "unknown learned note".to_owned()));
+            }
+            queue.push(response(id.clone(), json!({})));
+        }
+        "memory.clear" => {
+            let removed = learn::clear_async(&memory.store).await.map_err(invalid)?;
+            queue.push(response(id.clone(), json!({"removed":removed})));
+        }
+        "memory.status" => {
+            queue.push(response(
+                id.clone(),
+                serde_json::to_value(repository_status(state, &memory))
+                    .expect("memory status serialization"),
+            ));
+        }
+        _ => return Err((-32601, "unknown method".to_owned())),
+    }
+    Ok(())
+}
+
 fn handle_memory_consent(
     state: &Shared,
     queue: &ClientQueue,
@@ -1115,7 +1233,7 @@ fn handle_memory_consent(
     Ok(())
 }
 
-fn handle_method(
+async fn handle_method(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
     id: &Value,
@@ -1139,6 +1257,12 @@ fn handle_method(
     }
     if method == "memory.consent" {
         return handle_memory_consent(state, queue, id, params, consent_target.as_deref());
+    }
+    if matches!(
+        method,
+        "memory.list" | "memory.forget" | "memory.approve" | "memory.clear" | "memory.status"
+    ) {
+        return handle_repository_memory(state, queue, id, method, params).await;
     }
     if !matches!(
         method,

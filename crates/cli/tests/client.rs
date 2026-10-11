@@ -83,6 +83,42 @@ fn memory_learn_prefers_a_listening_daemon_without_touching_the_local_file() {
 }
 
 #[test]
+fn memory_list_prefers_a_listening_daemon_and_renders_safe_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("socket");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let cwd = std::fs::canonicalize(directory.path()).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut peer = BufReader::new(stream);
+        let request = receive(&mut peer, "memory.list");
+        assert_eq!(request["params"]["cwd"], cwd.to_string_lossy().as_ref());
+        assert_eq!(request["params"]["all"], false);
+        answer(
+            &mut peer,
+            &request,
+            &json!({"notes":[{
+                "id":14,"kind":"convention","status":"active","statement":"Use pnpm.",
+                "origin":"learned:explicit","confidence":0.9,"verified":true,"reinforcements":1
+            }]}),
+        );
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(directory.path())
+        .env("ELEFANTE_SOCKET", &socket)
+        .env_remove("HOME")
+        .args(["memory", "list"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Use pnpm."), "{stdout}");
+    assert!(stdout.contains("explicit"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn budgets_reach_daemon_and_coalesced_duplicates_render_once() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");

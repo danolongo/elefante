@@ -420,7 +420,6 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("memory") {
         let cwd = env::current_dir().context("failed to determine current directory")?;
-        let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
         if let Some(answer) = elefante_cli::memory::learn_answer(&args[1..])? {
             let path = socket_path()?;
             if let Ok(stream) = UnixStream::connect(path) {
@@ -433,6 +432,39 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+        if let Some((method, params)) = elefante_cli::memory::daemon_request(&args[1..], &cwd)?
+            && let Ok(stream) = UnixStream::connect(socket_path()?)
+        {
+            let mut client = Client::new(stream);
+            match client.request(method, params) {
+                Ok(result) => {
+                    let code = elefante_cli::memory::render_daemon_result(
+                        &args[1..],
+                        &result,
+                        &mut io::stdout(),
+                    )?;
+                    std::process::exit(code);
+                }
+                Err(error)
+                    if error.downcast_ref::<RpcFailure>().is_some_and(|failure| {
+                        failure.code == i64::from(elefante_rpc::UNKNOWN_NOTE)
+                    }) =>
+                {
+                    let id = args.get(2).map_or("?", String::as_str);
+                    println!(
+                        "no {} note {id}",
+                        if args.get(1).is_some_and(|command| command == "approve") {
+                            "pending"
+                        } else {
+                            "learned"
+                        }
+                    );
+                    std::process::exit(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
         let code = elefante_cli::memory::run(&args[1..], &cwd, &key_path, &mut io::stdout())?;
         std::process::exit(code);
     }

@@ -441,6 +441,10 @@ async fn switching_memory_off_writes_nothing_and_adds_nothing() {
         refusal,
         "[tool_result memory_search is unavailable: this session has no repository index]"
     );
+    let result = client
+        .rpc(3, "memory.list", json!({"cwd":h.repo.path()}))
+        .await;
+    assert_eq!(result["error"]["code"], -32007);
 }
 
 #[tokio::test]

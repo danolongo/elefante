@@ -18,6 +18,7 @@ use elefante_mem::{
     learn::{self, LearnedRow},
     schema::{open_memory, open_memory_reader},
 };
+use serde_json::{Value, json};
 
 pub const USAGE: &str = "usage: elefante memory <command>\n\ncommands:\n  list [--all]     show what was learned about this repository (--all includes superseded)\n  forget <id>      delete one learned note\n  approve <id>     accept a note only the assistant had vouched for\n  clear --yes      delete every learned note for this repository\n  learn on|off     allow or decline learning from conversations";
 
@@ -124,6 +125,120 @@ fn render(rows: &[LearnedRow], out: &mut dyn Write) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Validates a repository memory command and produces its daemon request. Consent and help are
+/// handled separately and return `None`.
+///
+/// # Errors
+/// Malformed arguments or an unknown command.
+pub fn daemon_request(
+    args: &[String],
+    cwd: &Path,
+) -> anyhow::Result<Option<(&'static str, Value)>> {
+    let Some((command, rest)) = args.split_first() else {
+        return Ok(None);
+    };
+    let cwd = cwd.to_string_lossy();
+    match command.as_str() {
+        "list" => {
+            let all = match rest {
+                [] => false,
+                [flag] if flag == "--all" => true,
+                _ => bail!("`memory list` takes only --all\n\n{USAGE}"),
+            };
+            Ok(Some(("memory.list", json!({"cwd":cwd,"all":all}))))
+        }
+        "forget" | "approve" => {
+            let id = id_arg(rest, command)?;
+            let method = if command == "forget" {
+                "memory.forget"
+            } else {
+                "memory.approve"
+            };
+            Ok(Some((method, json!({"cwd":cwd,"id":id}))))
+        }
+        "clear" => {
+            if rest != ["--yes"] {
+                bail!(
+                    "this deletes every learned note for this repository; run `elefante memory clear --yes` to do it"
+                );
+            }
+            Ok(Some(("memory.clear", json!({"cwd":cwd}))))
+        }
+        "learn" | "-h" | "--help" | "help" => Ok(None),
+        other => bail!("unknown memory command {other:?}\n\n{USAGE}"),
+    }
+}
+
+/// Renders one successful daemon administration result using the direct-mode vocabulary.
+///
+/// # Errors
+/// A malformed daemon result or output writer failure.
+pub fn render_daemon_result(
+    args: &[String],
+    result: &Value,
+    out: &mut dyn Write,
+) -> anyhow::Result<i32> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            let rows = result["notes"]
+                .as_array()
+                .context("memory.list returned no notes")?;
+            if rows.is_empty() {
+                writeln!(out, "no learned notes for this repository")?;
+                return Ok(0);
+            }
+            writeln!(
+                out,
+                "{:>5}  {:<10}  {:<10}  {:>4}  {:<9}  note",
+                "id", "status", "kind", "conf", "origin"
+            )?;
+            for row in rows {
+                let safe =
+                    |field: &str| learn::display_safe(row[field].as_str().unwrap_or_default());
+                let raw_origin = safe("origin");
+                let origin = raw_origin
+                    .strip_prefix("learned:")
+                    .unwrap_or(&raw_origin)
+                    .to_owned();
+                let confidence = row["confidence"].as_f64().unwrap_or(0.0);
+                let flag = if row["verified"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    "  [fails verification; never shown]"
+                };
+                writeln!(
+                    out,
+                    "{:>5}  {:<10}  {:<10}  {:>4.2}  {:<9}  {}{flag}",
+                    row["id"].as_i64().unwrap_or_default(),
+                    safe("status"),
+                    safe("kind"),
+                    confidence,
+                    origin,
+                    safe("statement")
+                )?;
+            }
+            Ok(0)
+        }
+        Some("forget") => {
+            writeln!(out, "forgot note {}", id_arg(&args[1..], "forget")?)?;
+            Ok(0)
+        }
+        Some("approve") => {
+            writeln!(out, "approved note {}", id_arg(&args[1..], "approve")?)?;
+            Ok(0)
+        }
+        Some("clear") => {
+            writeln!(
+                out,
+                "cleared {} learned note(s)",
+                result["removed"].as_u64().unwrap_or_default()
+            )?;
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
 }
 
 /// Runs a `memory` subcommand against the repository containing `cwd`.

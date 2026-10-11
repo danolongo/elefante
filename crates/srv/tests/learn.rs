@@ -609,6 +609,65 @@ async fn memory_status_and_events_restore_counts_health_and_background_spend() {
 }
 
 #[tokio::test]
+async fn repository_memory_methods_list_forget_and_report_named_errors_by_cwd() {
+    let h = Harness::start(Options {
+        learn: LearnMode::On,
+        extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: name branches after the ticket number.",
+    )
+    .await;
+    h.notes_appear(1).await;
+
+    let listed = client
+        .rpc(3, "memory.list", json!({"cwd":h.repo.path()}))
+        .await;
+    let notes = listed["result"]["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["statement"], BRANCHES);
+    let note_id = notes[0]["id"].as_i64().unwrap();
+    assert!(notes[0]["confidence"].as_f64().is_some());
+    assert_eq!(notes[0]["verified"], true);
+
+    assert_eq!(
+        client
+            .rpc(
+                4,
+                "memory.forget",
+                json!({"cwd":h.repo.path(),"id":note_id}),
+            )
+            .await["result"],
+        json!({})
+    );
+    let status = client
+        .rpc(5, "memory.status", json!({"cwd":h.repo.path()}))
+        .await;
+    assert_eq!(status["result"]["notes"], json!({"active":0,"pending":0}));
+    let missing = client
+        .rpc(
+            6,
+            "memory.forget",
+            json!({"cwd":h.repo.path(),"id":note_id}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32006);
+    assert_eq!(
+        client
+            .rpc(7, "memory.clear", json!({"cwd":h.repo.path()}))
+            .await["result"]["removed"],
+        0
+    );
+}
+
+#[tokio::test]
 async fn a_cue_makes_the_daemon_ask_and_the_answer_reaches_the_next_prompt() {
     let h = Harness::start(Options {
         extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),

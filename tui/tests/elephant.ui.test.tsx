@@ -18,7 +18,7 @@ afterAll(() => { globals.IS_REACT_ACT_ENVIRONMENT = before; });
 
 const view = (over: Partial<AppProps> = {}): AppProps => ({
   state: initialSession("s"), now: 0, connected: true, message: null, modal: null, animateMascot: false,
-  onSubmit: () => {}, onInterrupt: () => {}, onExit: () => {}, ...over,
+  onSubmit: () => {}, onCommand: () => {}, onInterrupt: () => {}, onExit: () => {}, ...over,
 });
 /// Publishes a new view; the store notifies the mounted root, whose update React wants inside `act`.
 const send = (props: Partial<AppProps>) => act(async () => { publish(view(props)); });

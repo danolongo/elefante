@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { addUsage, emptyUsage, initialSession, reduceSession, restoreSnapshot, type Segment } from "../src/session";
-import { note, snapshot, stream } from "./fixtures";
+import { memoryStatus, note, snapshot, stream } from "./fixtures";
 
 test("two clients deterministically preserve reasoning and answer, tools, approval and usage", () => {
   const run = () => stream().reduce((state, event) => reduceSession(state, event, event.seq!), { ...initialSession("s"), pending_prompt: "hello" });
@@ -87,4 +87,79 @@ test("usage distinguishes no report and reported zero and accumulates across tur
   state = stream().map(n => note(n.seq! + 10, n.method, n.params, "t2")).reduce((s, n) => reduceSession(s, n), state);
   expect(state.usage.output_tokens).toBe(10);
   expect(state.turns).toHaveLength(2);
+});
+
+test("turn-less memory status is state, advances sequence, and survives snapshot restore", () => {
+  const status = memoryStatus({ learning: "failing", problem: "no reply from the provider" });
+  const running = reduceSession(initialSession("s"), note(1, "turn.started"), 10);
+  const updated = reduceSession(running, note(2, "memory.status", status, null));
+  expect(updated.seq).toBe(2);
+  expect(updated.memory).toEqual(status);
+  expect(updated.active_turn?.turn_id).toBe("t");
+  expect(restoreSnapshot(snapshot(), 0, "high", status).memory).toEqual(status);
+});
+
+test("memory context belongs to its turn and snapshot note ids restore the audit count", () => {
+  let state = reduceSession(initialSession("s"), note(1, "turn.started"));
+  state = reduceSession(state, note(2, "memory.context", { notes: [
+    { id: 14, kind: "convention", status: "active", statement: "Use pnpm.", origin: "explicit" },
+    { id: 15, kind: "fact", status: "active", statement: "CI uses Bun.", origin: "stated" },
+  ] }));
+  expect(state.active_turn?.memory_note_ids).toEqual([14, 15]);
+  state = reduceSession(state, note(3, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }));
+  expect(state.turns[0].memory_note_ids).toEqual([14, 15]);
+  const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "next", text_so_far: "", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [21] } });
+  expect(restored.active_turn?.memory_note_ids).toEqual([21]);
+});
+
+const learned = (seq: number, change: string, id: number, statement: string, status = "active", replaced?: { id: number; statement: string }) => note(seq, "memory.learned", {
+  change,
+  note: { id, kind: "convention", status, statement, origin: "stated" },
+  ...(replaced ? { replaced: { id: replaced.id, kind: "convention", status: "superseded", statement: replaced.statement, origin: "stated" } } : {}),
+}, null);
+
+test("a learned note becomes one persistent line placed after the turn on screen, without a turn id", () => {
+  const finished = stream().reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  const state = reduceSession(finished, learned(11, "added", 14, "This repo uses pnpm."));
+  expect(state.seq).toBe(11);
+  expect(state.memory_lines).toEqual([{ after_turn: "t", change: "added", note: { id: 14, kind: "convention", status: "active", statement: "This repo uses pnpm.", origin: "stated" } }]);
+  expect(reduceSession(initialSession("s"), learned(1, "added", 1, "Before any turn.")).memory_lines[0]?.after_turn).toBeNull();
+});
+
+test("an update carries what it replaced, a pending note makes no line, and text is sanitised", () => {
+  const updated = reduceSession(initialSession("s"), learned(1, "superseded", 15, "Uses pnpm.", "active", { id: 12, statement: "Uses npm." }));
+  expect(updated.memory_lines[0]?.replaced?.statement).toBe("Uses npm.");
+  const pending = reduceSession(initialSession("s"), learned(1, "added", 16, "Assistant claim.", "pending"));
+  expect(pending.memory_lines).toEqual([]);
+  expect(pending.seq).toBe(1);
+  const hostile = reduceSession(initialSession("s"), learned(1, "added", 17, "Use\u001b[31m red‮ and​ zero\nwidth."));
+  expect(hostile.memory_lines[0]?.note.statement).toBe("Use[31m red and zero width.");
+});
+
+test("memory lines survive a snapshot restore and are not replayed from it", () => {
+  const line = reduceSession(initialSession("s"), learned(1, "added", 14, "Kept.")).memory_lines;
+  expect(restoreSnapshot(snapshot(), 0, "high", null, line).memory_lines).toBe(line);
+  expect(restoreSnapshot(snapshot()).memory_lines).toEqual([]);
+});
+
+test("memory notices are markers fixed at the point they happened, and output after them starts a new block", () => {
+  const events = [
+    note(1, "turn.started"),
+    note(2, "memory.context", { notes: [{ id: 14, kind: "convention", status: "active", statement: "s", origin: "stated" }, { id: 15, kind: "fact", status: "active", statement: "t", origin: "stated" }] }),
+    note(3, "text.delta", { text: "First. " }),
+    learned(4, "added", 16, "Mid-turn note."),
+    note(5, "text.delta", { text: "Second." }),
+  ];
+  const state = events.reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  expect(state.active_turn?.segments.map(s => s.kind)).toEqual(["memory_used", "text", "memory_learned", "text"]);
+  expect(state.active_turn?.segments[0]).toEqual({ kind: "memory_used", count: 2 });
+  expect(state.memory_lines).toEqual([]);
+  const finished = reduceSession(state, note(6, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }));
+  expect(finished.turns[0]?.segments?.map(s => s.kind)).toEqual(["memory_used", "text", "memory_learned", "text"]);
+  expect(reduceSession(initialSession("s"), note(1, "turn.started")).active_turn?.segments).toEqual([]);
+});
+
+test("a turn restored from a snapshot leads with its saved-notes marker", () => {
+  const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "t", text_so_far: "hi", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [1, 2, 3] } });
+  expect(restored.active_turn?.segments).toEqual([{ kind: "memory_used", count: 3 }, { kind: "text", text: "hi" }]);
 });

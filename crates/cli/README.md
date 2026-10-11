@@ -19,9 +19,9 @@ Everything below describes the headless mode unless it says otherwise.
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/main.rs` | 435 | Argument and environment parsing, daemon discovery and spawn, socket client, session lifecycle. |
-| `src/lib.rs` | 125 | `StreamRenderer`, and the `memory` module. |
-| `src/memory.rs` | 140 | `elefante memory list \| forget \| approve \| clear` — see below. |
+| `src/main.rs` | 515 | Argument and environment parsing, daemon discovery and spawn, socket client, session lifecycle. |
+| `src/lib.rs` | 177 | `StreamRenderer`, and the `memory` module. |
+| `src/memory.rs` | 335 | `elefante memory` administration — direct mode, daemon requests and their rendering, and learned-memory consent; see below. |
 
 ## Entry points
 
@@ -42,16 +42,33 @@ elefante memory list [--all]   what was learned about this repository (--all add
 elefante memory forget <id>    delete one learned note
 elefante memory approve <id>   accept a note only the assistant had vouched for
 elefante memory clear --yes    delete every learned note for this repository
+elefante memory learn on|off [--model SLUG]   allow or decline learning, for the extractor model it will use
 ```
 
-These open the repository's store directly and never need the daemon. Learned notes are free-form
-text that is injected into prompts, so a person can always see them and remove them: `list` also
-shows rows that fail their integrity check, flagged, so they can be forgotten. A running daemon
-notices a change within its cache lifetime (about thirty seconds). `clear` refuses without `--yes`.
+Every subcommand prefers an already-listening daemon (`memory.list`, `forget`, `approve`, `clear`,
+`consent`, keyed by the current directory), so a change takes effect on the next retrieval and a
+consent answer reaches live sessions at once. None starts a daemon; with none listening they open
+the repository's store directly (`list`, `forget`, `approve`, `clear`) or write the tamper-evident
+consent file (`learn`). Consent is kept per extractor model, so `learn` names the model it is for
+(`--model`, else `ELEFANTE_EXTRACT_MODEL`, else `OPENROUTER_MODEL`, else the default) and prints it. A
+daemon that predates these methods answers "method not found": the read-and-change commands then use the
+store directly, and `learn` writes the file and warns that the running daemon must be restarted. Learned notes are free-form text that is injected into prompts, so a person
+can always see them and remove them: the direct `list` also shows rows that fail their integrity
+check, flagged, so they can be forgotten, and checks the store's stamp first (a foreign store prints
+one explanation and no rows). Every column is passed through `display_safe` before printing.
+`clear` refuses without `--yes`; an unknown id prints `no learned note <id>` (`no pending note` for
+`approve`) and exits 1 either way.
 
 **Two renderers, one per stream** (`main.rs:337-338`): the answer goes to `stdout`, reasoning
 and tool activity to `stderr`. Each owns its own channel state, so neither can interleave into
 the other's output.
+
+**Memory lines.** The stderr renderer, built with `with_memory_notices(io::stderr().is_terminal())`,
+counts `memory.learned` events that are not `pending` and prints `memory: saved N note(s)` at the
+next `turn.finished`, and prints each distinct `memory.status` `problem` once as `memory: <problem>`.
+Never to stdout and never note text. In a one-shot the session usually closes before extraction
+finishes, so in practice only a problem line appears; the count appears when a later turn on the same
+session finishes.
 
 ## Invariants
 
@@ -76,6 +93,11 @@ reader thread so a daemon that dies during startup reports *why* rather than tim
 (`main.rs:303`). A prompt written to a pipe is a hang, not a prompt. With a TTY it reads the key
 from stdin and sends `key.set`.
 
+**Headless learning setup is a notice, never a prompt.** If the daemon reports consent as unset, a
+one-shot invocation prints one instruction to terminal stderr before the turn
+(`memory: learning is paused (not set up) — run “elefante memory learn on” or set ELEFANTE_LEARN=1`). Redirected stderr and
+older daemons that omit the additive memory result remain silent; stdout is always only the answer.
+
 **Headless mode denies every escalated command.** On `approval.requested` it immediately sends
 `session.resolve_approval` with `deny` (`main.rs:382-396`), so a one-shot run can never execute a
 command the classifier escalated — it has no way to ask you. Use the TUI when a task needs
@@ -91,12 +113,13 @@ travel in `session.create`.
 ## Testing
 
 ```sh
-cargo test -p elefante-cli                          # 13 hermetic
+cargo test -p elefante-cli                          # hermetic
 cargo test -p elefante-cli -- --ignored --nocapture   # 2 credentialed, billable
 ```
 
-`tests/renderer.rs` (6) covers channel transitions and newline discipline against an in-memory
-writer. `tests/client.rs` (3) covers the socket client. `tests/cli.rs` (6, two of them `#[ignore]`d) drives
+`tests/renderer.rs` (13) covers channel transitions, newline discipline and the `memory:` lines against
+an in-memory writer. `tests/memory.rs` (12) covers `elefante memory` directly. `tests/client.rs` (5) covers the
+socket client, including `memory` commands preferring a listening daemon. `tests/cli.rs` (7, two of them `#[ignore]`d) drives
 the real binary under `ELEFANTE_SOCKET` isolation.
 
 Two tests are `#[ignore]`d; both need credentials and make billable requests. They run in a

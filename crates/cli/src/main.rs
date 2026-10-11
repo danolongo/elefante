@@ -16,7 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear|learn>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const PAUSED_NOTICE: &str = "memory: learning is paused (not set up) — run “elefante memory learn on” or set ELEFANTE_LEARN=1";
+
+fn learning_is_paused(create_result: &Value) -> bool {
+    create_result["memory"]["consent"].as_str() == Some("unset")
+}
 
 struct Options {
     prompt: Option<String>,
@@ -335,7 +340,8 @@ fn resume(client: &mut Client, path: &Path, session: &str, since: u64) -> anyhow
 fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Result<()> {
     let color = env::var_os("NO_COLOR").is_none();
     let mut out = StreamRenderer::new(io::stdout(), color && io::stdout().is_terminal());
-    let mut err = StreamRenderer::new(io::stderr(), color && io::stderr().is_terminal());
+    let mut err = StreamRenderer::new(io::stderr(), color && io::stderr().is_terminal())
+        .with_memory_notices(io::stderr().is_terminal());
     let mut seen = BTreeSet::new();
     let mut cursor = 0;
     let mut failures = 0;
@@ -411,10 +417,80 @@ fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Resul
     err.finish()?;
     result
 }
+/// Whether the daemon answered "method not found" (-32601): it is older than the request.
+fn is_method_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RpcFailure>()
+        .is_some_and(|failure| failure.code == -32601)
+}
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("memory") {
         let cwd = env::current_dir().context("failed to determine current directory")?;
+        if let Some(request) = elefante_cli::memory::learn_request(&args[1..])? {
+            let path = socket_path()?;
+            if let Ok(stream) = UnixStream::connect(path) {
+                let mut client = Client::new(stream);
+                match client.request(
+                    "memory.consent",
+                    json!({"answer":request.answer,"extractor":request.extractor}),
+                ) {
+                    Ok(result) => {
+                        let consent = result["consent"]
+                            .as_str()
+                            .context("memory.consent returned no consent state")?;
+                        println!(
+                            "{}",
+                            elefante_cli::memory::learn_report(consent, &request.extractor)
+                        );
+                        return Ok(());
+                    }
+                    // A daemon from before consent control: record the answer in the file, and say
+                    // plainly that the running daemon will not see it until it restarts.
+                    Err(error) if is_method_not_found(&error) => {
+                        eprintln!(
+                            "warning: the running daemon predates consent control; restart it \
+                             (pkill elefante-srv) for this to take effect"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if let Some((method, params)) = elefante_cli::memory::daemon_request(&args[1..], &cwd)?
+            && let Ok(stream) = UnixStream::connect(socket_path()?)
+        {
+            let mut client = Client::new(stream);
+            match client.request(method, params) {
+                Ok(result) => {
+                    let code = elefante_cli::memory::render_daemon_result(
+                        &args[1..],
+                        &result,
+                        &mut io::stdout(),
+                    )?;
+                    std::process::exit(code);
+                }
+                Err(error)
+                    if error.downcast_ref::<RpcFailure>().is_some_and(|failure| {
+                        failure.code == i64::from(elefante_rpc::UNKNOWN_NOTE)
+                    }) =>
+                {
+                    let id = args.get(2).map_or("?", String::as_str);
+                    println!(
+                        "no {} note {id}",
+                        if args.get(1).is_some_and(|command| command == "approve") {
+                            "pending"
+                        } else {
+                            "learned"
+                        }
+                    );
+                    std::process::exit(1);
+                }
+                // A daemon from before memory control: read the store directly, as before.
+                Err(error) if is_method_not_found(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
         let code = elefante_cli::memory::run(&args[1..], &cwd, &key_path, &mut io::stdout())?;
         std::process::exit(code);
@@ -427,6 +503,9 @@ fn main() -> anyhow::Result<()> {
     };
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let created = client.request("session.create", json!({"cwd":cwd,"model":options.model,"effort":options.effort,"max_rounds":options.max_rounds,"max_tokens":options.max_tokens}))?;
+    if learning_is_paused(&created) && io::stderr().is_terminal() {
+        eprintln!("{PAUSED_NOTICE}");
+    }
     let session = created["session_id"]
         .as_str()
         .context("session.create returned no session_id")?;
@@ -439,4 +518,24 @@ fn main() -> anyhow::Result<()> {
     result?;
     close?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_explicit_unset_seed_requests_the_headless_notice() {
+        assert!(learning_is_paused(
+            &json!({"memory":{"consent":"unset","extractor":"model"}})
+        ));
+        for result in [
+            json!({}),
+            json!({"memory":{"consent":"granted","extractor":"model"}}),
+            json!({"memory":{"consent":"declined","extractor":"model"}}),
+            json!({"memory":{"consent":"off","extractor":null}}),
+        ] {
+            assert!(!learning_is_paused(&result));
+        }
+    }
 }

@@ -18,6 +18,12 @@ pub const CACHE_SCHEMA_VERSION: i64 = 2;
 /// `meta` / `cache_meta` key holding the keyed stamp that marks a database as ours.
 pub const STAMP_KEY: &str = "store_stamp";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryResetReason {
+    Untrusted,
+    SchemaVersion,
+}
+
 const MEMORY_DDL: &str = "
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
@@ -171,6 +177,17 @@ fn new_epoch() -> String {
 /// Fails on I/O or SQLite errors, on a schema newer than this build understands, and on a
 /// database that has tables but no recognisable version.
 pub fn open_memory(path: &Path, key: &MemKey) -> Result<Connection, MemError> {
+    Ok(open_memory_with_reason(path, key)?.0)
+}
+
+/// Opens the graph and reports when an existing database had to be discarded.
+///
+/// # Errors
+/// The same errors as [`open_memory`].
+pub fn open_memory_with_reason(
+    path: &Path,
+    key: &MemKey,
+) -> Result<(Connection, Option<MemoryResetReason>), MemError> {
     touch_private(path)?;
     let conn = Connection::open(path)?;
     configure(&conn)?;
@@ -178,9 +195,12 @@ pub fn open_memory(path: &Path, key: &MemKey) -> Result<Connection, MemError> {
     match user_version(&conn)? {
         MEMORY_SCHEMA_VERSION => {
             if memory_stamp_valid(&conn, key) {
-                Ok(conn)
+                Ok((conn, None))
             } else {
-                rebuild_memory(conn, path, key)
+                Ok((
+                    rebuild_memory(conn, path, key)?,
+                    Some(MemoryResetReason::Untrusted),
+                ))
             }
         }
         0 => {
@@ -191,14 +211,17 @@ pub fn open_memory(path: &Path, key: &MemKey) -> Result<Connection, MemError> {
                 });
             }
             create_memory(&conn, key)?;
-            Ok(conn)
+            Ok((conn, None))
         }
         found if found > MEMORY_SCHEMA_VERSION => Err(MemError::UnsupportedSchema {
             path: path.to_owned(),
             found,
             supported: MEMORY_SCHEMA_VERSION,
         }),
-        _ => rebuild_memory(conn, path, key),
+        _ => Ok((
+            rebuild_memory(conn, path, key)?,
+            Some(MemoryResetReason::SchemaVersion),
+        )),
     }
 }
 

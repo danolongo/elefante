@@ -69,7 +69,7 @@ fn each_faint_span_is_reset_before_an_error() {
 fn finish_is_idempotent_and_does_not_create_output_on_idle_stream() {
     let mut idle = StreamRenderer::new(Vec::new(), false);
     idle.finish().unwrap();
-    assert!(idle.into_inner().is_empty());
+    assert_eq!(idle.into_inner().len(), 0);
     let mut renderer = StreamRenderer::new(Vec::new(), false);
     renderer
         .render(&note("text.delta", json!({"text":"answer"})))
@@ -108,4 +108,139 @@ fn a_tool_with_no_output_preview_ends_without_a_dangling_colon() {
         ))
         .unwrap();
     assert_eq!(renderer.into_inner(), b"[c1] done (2 ms)\n");
+}
+
+fn learned(status: &str, change: &str) -> Notification {
+    note(
+        "memory.learned",
+        json!({"note":{"id":1,"kind":"convention","status":status,"statement":"Use pnpm.","origin":"explicit"},"change":change}),
+    )
+}
+
+fn status(problem: Option<&str>) -> Notification {
+    note(
+        "memory.status",
+        json!({"enabled":true,"consent":"granted","learning":"failing","extractor":null,"notes":{"active":0,"pending":0},"index":"ready","spend":{"input_tokens":0,"output_tokens":0,"reasoning_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"cost":null},"problem":problem}),
+    )
+}
+
+fn finished() -> Notification {
+    note(
+        "turn.finished",
+        json!({"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0,"reasoning_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"cost":null}}),
+    )
+}
+
+fn memory_output(notices: bool, events: &[Notification]) -> String {
+    let mut renderer = StreamRenderer::new(Vec::new(), false).with_memory_notices(notices);
+    for event in events {
+        renderer.render(event).unwrap();
+    }
+    String::from_utf8(renderer.into_inner()).unwrap()
+}
+
+#[test]
+fn saved_notes_are_counted_once_per_turn_with_plurals_and_no_note_text() {
+    let one = memory_output(true, &[learned("active", "added"), finished()]);
+    assert_eq!(one, "memory: saved 1 note\n");
+    let two = memory_output(
+        true,
+        &[
+            learned("active", "added"),
+            learned("active", "superseded"),
+            finished(),
+        ],
+    );
+    assert_eq!(two, "memory: saved 2 notes\n");
+    assert!(!two.contains("pnpm"));
+}
+
+#[test]
+fn pending_notes_are_not_counted_and_turns_without_saves_print_nothing() {
+    assert_eq!(
+        memory_output(true, &[learned("pending", "added"), finished()]),
+        ""
+    );
+    assert_eq!(
+        memory_output(
+            true,
+            &[
+                learned("pending", "added"),
+                learned("active", "added"),
+                finished()
+            ]
+        ),
+        "memory: saved 1 note\n"
+    );
+    assert_eq!(memory_output(true, &[finished()]), "");
+}
+
+#[test]
+fn the_saved_count_resets_after_each_turn() {
+    let out = memory_output(
+        true,
+        &[
+            learned("active", "added"),
+            finished(),
+            learned("active", "added"),
+            learned("active", "added"),
+            finished(),
+        ],
+    );
+    assert_eq!(out, "memory: saved 1 note\nmemory: saved 2 notes\n");
+}
+
+#[test]
+fn a_repeated_problem_prints_once_and_recovery_prints_nothing() {
+    let out = memory_output(
+        true,
+        &[
+            status(Some("extractor unreachable")),
+            status(Some("extractor unreachable")),
+            status(None),
+            status(Some("index is rebuilding")),
+        ],
+    );
+    assert_eq!(
+        out,
+        "memory: extractor unreachable\nmemory: index is rebuilding\n"
+    );
+}
+
+#[test]
+fn memory_lines_are_silent_unless_enabled() {
+    let events = [
+        learned("active", "added"),
+        status(Some("extractor unreachable")),
+        finished(),
+    ];
+    assert_eq!(memory_output(false, &events), "");
+}
+
+#[test]
+fn memory_events_leave_the_answer_stream_untouched() {
+    let mut answer = StreamRenderer::new(Vec::new(), false);
+    let mut diagnostics = StreamRenderer::new(Vec::new(), false).with_memory_notices(true);
+    for event in [
+        note("text.delta", json!({"text":"answer"})),
+        learned("active", "added"),
+        status(Some("extractor unreachable")),
+        finished(),
+    ] {
+        if matches!(
+            event.event,
+            elefante_rpc::NotificationEvent::TextDelta { .. }
+        ) {
+            answer.render(&event).unwrap();
+        } else {
+            diagnostics.render(&event).unwrap();
+        }
+    }
+    answer.finish().unwrap();
+    assert_eq!(answer.into_inner(), b"answer\n");
+    let diagnostics = String::from_utf8(diagnostics.into_inner()).unwrap();
+    assert_eq!(
+        diagnostics,
+        "memory: extractor unreachable\nmemory: saved 1 note\n"
+    );
 }

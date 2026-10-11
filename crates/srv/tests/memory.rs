@@ -3,7 +3,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, run};
+use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -92,7 +92,7 @@ impl Harness {
             stub_provider: Some(script),
             idle_timeout: Duration::from_secs(60),
             memory,
-            learn: false,
+            learn: LearnMode::Off,
             learn_idle: Duration::from_secs(300),
             learn_timeout: Duration::from_secs(60),
         };
@@ -441,6 +441,10 @@ async fn switching_memory_off_writes_nothing_and_adds_nothing() {
         refusal,
         "[tool_result memory_search is unavailable: this session has no repository index]"
     );
+    let result = client
+        .rpc(3, "memory.list", json!({"cwd":h.repo.path()}))
+        .await;
+    assert_eq!(result["error"]["code"], -32007);
 }
 
 #[tokio::test]

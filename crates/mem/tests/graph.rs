@@ -240,7 +240,7 @@ fn reapplying_identical_content_changes_nothing_at_all() {
 
     let again = apply(&store, vec![update()], &[], 99);
     assert!(!again.changed && !again.path_set_changed);
-    assert!(again.import_changed_files.is_empty());
+    assert_eq!(again.import_changed_files.len(), 0);
     assert_eq!(again.generation, before.0);
     assert_eq!(
         generation(&store),
@@ -378,7 +378,7 @@ fn deleting_a_file_removes_its_symbols_imports_edges_and_search_rows() {
         snap.edges.is_empty(),
         "an edge cascades with either endpoint"
     );
-    assert!(snap.imports.is_empty());
+    assert_eq!(snap.imports.len(), 0);
     assert_fts_matches_nodes(&store);
 
     let missing = apply(&store, vec![], &["never-existed.rs"], 30);

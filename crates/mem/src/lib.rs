@@ -3,6 +3,7 @@
 pub mod actor;
 pub mod brief;
 pub mod cochange;
+pub mod consent;
 pub mod diff;
 pub mod error;
 pub mod extract;

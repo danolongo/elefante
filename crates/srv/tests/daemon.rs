@@ -1,6 +1,6 @@
 use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, run};
+use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -88,7 +88,7 @@ impl Daemon {
             base_url: Some("http://127.0.0.1:9".into()),
             stub_provider: stub,
             memory: true,
-            learn: false,
+            learn: LearnMode::Off,
             learn_idle: Duration::from_secs(300),
             learn_timeout: Duration::from_secs(60),
             idle_timeout: idle,
@@ -112,6 +112,8 @@ impl Daemon {
             .rpc(1, "session.create", json!({"cwd":self.dir.path()}))
             .await;
         assert_eq!(result["result"]["seq"], 0);
+        assert_eq!(result["result"]["memory"]["consent"], "off");
+        assert_eq!(result["result"]["memory"]["extractor"], Value::Null);
         result["result"]["session_id"].as_str().unwrap().to_owned()
     }
 }
@@ -151,7 +153,7 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
         assert_eq!(note["session_id"], session);
         serde_json::from_value::<elefante_rpc::Notification>(note.clone()).unwrap();
     }
-    let seq = one.last().unwrap()["seq"].as_u64().unwrap();
+    let mut seq = one.last().unwrap()["seq"].as_u64().unwrap();
     drop(first);
     let mut first = daemon.client().await;
     let attached = first
@@ -162,8 +164,13 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
         )
         .await;
     assert_eq!(attached["result"]["kind"], "resumed");
+    assert_eq!(attached["result"]["memory"]["consent"], "off");
+    assert_eq!(attached["result"]["memory"]["extractor"], Value::Null);
     assert_eq!(attached["result"]["from"], seq - 1);
-    assert_eq!(attached["result"]["events"], json!(one[one.len() - 2..]));
+    let replayed = attached["result"]["events"].as_array().unwrap();
+    assert_eq!(&replayed[..2], &one[one.len() - 2..]);
+    assert_eq!(replayed[2]["method"], "memory.status");
+    seq = replayed.last().unwrap()["seq"].as_u64().unwrap();
     first
         .rpc(
             5,
@@ -177,6 +184,7 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
     let snapshot = first
         .rpc(6, "session.attach", json!({"session_id":session}))
         .await;
+    assert_eq!(snapshot["result"]["memory"]["consent"], "off");
     assert_eq!(
         snapshot["result"]["snapshot"]["turns"]
             .as_array()
@@ -397,7 +405,7 @@ async fn stale_socket_recovers_and_concurrent_start_converges() {
         base_url: None,
         stub_provider: None,
         memory: true,
-        learn: false,
+        learn: LearnMode::Off,
         learn_idle: Duration::from_secs(300),
         learn_timeout: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(1),
@@ -438,7 +446,7 @@ async fn directory_ownership_serializes_stale_reclamation_and_shutdown() {
         base_url: None,
         stub_provider: None,
         memory: true,
-        learn: false,
+        learn: LearnMode::Off,
         learn_idle: Duration::from_secs(300),
         learn_timeout: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(20),
@@ -507,7 +515,7 @@ async fn invalid_cold_start_finishes_validation_before_socket_publication() {
             base_url: Some("not-a-url".into()),
             stub_provider: None,
             memory: true,
-            learn: false,
+            learn: LearnMode::Off,
             learn_idle: Duration::from_secs(300),
             learn_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(20),
@@ -809,7 +817,7 @@ async fn key_set_rebuilds_provider_and_environment_key_wins() {
             base_url: Some(format!("http://{address}")),
             stub_provider: None,
             memory: true,
-            learn: false,
+            learn: LearnMode::Off,
             learn_idle: Duration::from_secs(300),
             learn_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(20),

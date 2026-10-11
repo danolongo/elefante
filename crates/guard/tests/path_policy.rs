@@ -34,6 +34,11 @@ fn denies_traversal_and_secret_variants() {
         ".aws/credentials",
         ".elefante/credentials.toml",
         ".elefante/memory.key",
+        ".elefante/memory.db",
+        ".elefante/cache.db-wal",
+        "sub/.elefante/anything",
+        ".elefante",
+        "sub/.elefante",
     ] {
         assert!(
             matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
@@ -184,6 +189,9 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         ".ssh/config",
         "home/.aws/credentials",
         ".elefante/credentials.toml",
+        ".elefante/memory.db",
+        ".elefante",
+        "sub/.elefante",
         "id_rsa",
         "id_rsa.pub",
         ".netrc",
@@ -199,11 +207,104 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         "docs/keys.md",
         "monkey.rs",
         ".github/workflows/ci.yml",
-        ".elefante/memory.db",
+        ".elefanteish/x",
         ".aws/config",
     ] {
         // `.envrc.md.bak` is a directory name that merely begins with `.env`; it does not match
         // `.env` exactly nor `.env.` prefix, so it must stay indexable.
         assert!(!PathPolicy::is_secret_path(Path::new(path)), "{path}");
     }
+}
+
+#[test]
+fn workspace_under_an_elefante_directory_still_resolves() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(".elefante/proj");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "fn main() {}").unwrap();
+    let policy = PathPolicy::new(&root).unwrap();
+    let canonical_root = root.canonicalize().unwrap();
+    assert_eq!(
+        policy.resolve("src/a.rs").unwrap(),
+        canonical_root.join("src/a.rs")
+    );
+    assert_eq!(
+        policy.resolve("src/new.rs").unwrap(),
+        canonical_root.join("src/new.rs")
+    );
+    // Harness state inside that workspace, and secrets by name, are still denied.
+    for path in [".elefante/memory.db", ".elefante", ".env", "../x"] {
+        assert!(policy.resolve(path).is_err(), "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn denies_symlink_into_elefante_inside_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".elefante")).unwrap();
+    fs::write(root.path().join(".elefante/memory.db"), "notes").unwrap();
+    std::os::unix::fs::symlink(".elefante/memory.db", root.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink(".elefante", root.path().join("dir")).unwrap();
+    let policy = PathPolicy::new(root.path()).unwrap();
+    for path in ["alias", "dir", "dir/memory.db", "x/../.elefante/memory.db"] {
+        assert!(
+            matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
+            "{path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn denies_user_level_harness_directory_by_prefix() {
+    const CHILD: &str = "ELEFANTE_HOME_HARNESS_POLICY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        // A workspace inside the user-level harness directory is denied, and so are absolute
+        // paths into it from a workspace elsewhere, whether or not the file exists.
+        let policy = PathPolicy::new(&home).unwrap();
+        for path in [".elefante/memory.db", ".elefante/memory.key", ".elefante"] {
+            assert!(
+                matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
+                "{path}"
+            );
+        }
+        let inside = PathPolicy::new(home.join(".elefante/proj")).unwrap();
+        assert!(matches!(
+            inside.resolve("src/a.rs"),
+            Err(PolicyError::Denied { .. })
+        ));
+        let other = PathPolicy::new(home.join("work")).unwrap();
+        assert!(other.resolve("src/a.rs").is_ok());
+        let classifier = elefante_guard::BashClassifier::new();
+        let work = home.join("work");
+        for command in [
+            "cat ~/.elefante/memory.db",
+            "cat $HOME/.elefante/memory.key",
+            "ls ~/.elefante",
+            "cat ../.elefante/memory.db",
+        ] {
+            assert_eq!(
+                classifier.classify_in(command, &work).verdict,
+                elefante_guard::Verdict::Deny,
+                "{command}"
+            );
+        }
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".elefante/proj")).unwrap();
+    fs::create_dir_all(home.path().join("work/src")).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "denies_user_level_harness_directory_by_prefix"])
+        .env("HOME", home.path())
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

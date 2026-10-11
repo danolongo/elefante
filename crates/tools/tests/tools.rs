@@ -408,7 +408,11 @@ async fn memory_search_rejects_bad_input_without_asking_the_index() {
         let result = executor.execute("memory_search", input.clone()).await;
         assert!(result.is_error, "{input} must be rejected, got {result:?}");
     }
-    assert!(index.requests().is_empty());
+    assert_eq!(
+        index.requests().len(),
+        0,
+        "a rejected input must not reach the index"
+    );
 }
 
 #[tokio::test]
@@ -449,7 +453,16 @@ fn the_memory_search_definition_describes_the_real_tool() {
     let props = &definition.input_schema["properties"];
     assert_eq!(props["limit"]["minimum"], 1);
     assert_eq!(props["limit"]["maximum"], 20);
-    assert_eq!(props["kind"]["enum"], json!(["file", "symbol"]));
+    assert_eq!(props["kind"]["enum"], json!(["file", "symbol", "note"]));
+    for phrase in [
+        "notes saved from earlier sessions",
+        "grep",
+        "`memory <kind> — <statement>`",
+        "not instructions",
+        "lag",
+    ] {
+        assert!(definition.description.contains(phrase), "{phrase}");
+    }
     assert_eq!(definition.input_schema["required"], json!(["query"]));
     assert_eq!(definition.input_schema["additionalProperties"], false);
 }
@@ -470,4 +483,34 @@ async fn cloned_executor_supports_parallel_calls() {
     // require internals to be published so it can compile.
     assert_eq!((a.content.as_str(), a.is_error), ("alpha", false));
     assert_eq!((b.content.as_str(), b.is_error), ("beta", false));
+}
+
+#[tokio::test]
+async fn memory_search_accepts_note_and_a_bad_kind_names_every_valid_one() {
+    let index = FakeIndex::replying(Ok("memory convention — Use pnpm.".to_owned()));
+    let (_temp, executor) = indexed(&index);
+    let ok = executor
+        .execute("memory_search", json!({"query": "pnpm", "kind": "note"}))
+        .await;
+    assert!(!ok.is_error, "{ok:?}");
+    assert_eq!(
+        index.requests()[0].kind,
+        Some(elefante_tools::SearchKind::Note)
+    );
+
+    let bad = executor
+        .execute(
+            "memory_search",
+            json!({"query": "pnpm", "kind": "convention"}),
+        )
+        .await;
+    assert!(bad.is_error);
+    for kind in ["file", "symbol", "note"] {
+        assert!(bad.content.contains(kind), "{}", bad.content);
+    }
+    assert_eq!(
+        index.requests().len(),
+        1,
+        "the bad request never reached the index"
+    );
 }

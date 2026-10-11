@@ -19,6 +19,9 @@ pub struct StreamRenderer<W: Write> {
     styled: bool,
     last: Option<Channel>,
     at_line_start: bool,
+    memory_notices: bool,
+    saved: usize,
+    problem: Option<String>,
 }
 
 impl<W: Write> StreamRenderer<W> {
@@ -28,7 +31,17 @@ impl<W: Write> StreamRenderer<W> {
             styled,
             last: None,
             at_line_start: true,
+            memory_notices: false,
+            saved: 0,
+            problem: None,
         }
+    }
+
+    /// Memory lines are for a person at a terminal; scripts never see them.
+    #[must_use]
+    pub fn with_memory_notices(mut self, enabled: bool) -> Self {
+        self.memory_notices = enabled;
+        self
     }
 
     /// The caller routes answer notifications to stdout and others to stderr.
@@ -80,17 +93,49 @@ impl<W: Write> StreamRenderer<W> {
             E::SessionError { message } => {
                 self.write(Channel::Error, &format!("{message}\n"), false)
             }
-            E::TurnFinished { stop_reason, .. } => match stop_reason {
-                elefante_rpc::StopReason::Refusal => {
-                    self.write(Channel::Status, "provider refused the request\n", false)
+            E::TurnFinished { stop_reason, .. } => {
+                match stop_reason {
+                    elefante_rpc::StopReason::Refusal => {
+                        self.write(Channel::Status, "provider refused the request\n", false)
+                    }
+                    elefante_rpc::StopReason::Interrupted => {
+                        self.write(Channel::Status, "interrupted\n", false)
+                    }
+                    _ => Ok(()),
+                }?;
+                self.write_saved()
+            }
+            E::MemoryStatus(status) => {
+                if self.memory_notices
+                    && let Some(problem) = &status.problem
+                    && self.problem.as_ref() != Some(problem)
+                {
+                    self.problem = Some(problem.clone());
+                    return self.write(Channel::Status, &format!("memory: {problem}\n"), false);
                 }
-                elefante_rpc::StopReason::Interrupted => {
-                    self.write(Channel::Status, "interrupted\n", false)
+                Ok(())
+            }
+            E::MemoryLearned { note, .. } => {
+                if note.status != "pending" {
+                    self.saved += 1;
                 }
-                _ => Ok(()),
-            },
-            E::TurnStarted {} => Ok(()),
+                Ok(())
+            }
+            E::TurnStarted {} | E::MemoryContext { .. } | E::Unknown { .. } => Ok(()),
         }
+    }
+
+    fn write_saved(&mut self) -> io::Result<()> {
+        let saved = std::mem::take(&mut self.saved);
+        if !self.memory_notices || saved == 0 {
+            return Ok(());
+        }
+        let plural = if saved == 1 { "" } else { "s" };
+        self.write(
+            Channel::Status,
+            &format!("memory: saved {saved} note{plural}\n"),
+            false,
+        )
     }
 
     fn write(&mut self, channel: Channel, text: &str, faint: bool) -> io::Result<()> {

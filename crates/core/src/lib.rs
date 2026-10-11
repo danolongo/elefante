@@ -28,7 +28,15 @@ use tokio::{
 pub use tokio_util::sync::CancellationToken;
 
 /// The stable standing instructions. Safety and filesystem policy live in code.
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. Never read or edit `.elefante/`, which belongs to the harness.";
+
+/// Added to the system prompt of a session in which learning can run (memory on, learning not
+/// switched off): without it the claim that the harness may save preferences would be false.
+pub const LEARNING_HINT: &str = "The harness may save lasting preferences and conventions the person states; do not write them into repository files unless asked.";
+
+/// Added to the system prompt of a session that has a repository index, and only such a session:
+/// it names a tool that sessions without an index do not have.
+pub const MEMORY_USE_HINT: &str = "If the repository memory shown with the task does not cover what you need, use memory_search (files, symbols and saved notes) before searching broadly.";
 
 /// Limits and provider settings for one loop invocation.
 #[derive(Clone, Debug)]
@@ -63,6 +71,11 @@ impl RunConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
     TurnStarted,
+    /// Learned notes that were injected into this turn. The rendered context text is deliberately
+    /// absent: clients receive only the safe structured audit surface.
+    Context {
+        notes: Vec<Note>,
+    },
     /// A display fragment of the model's reasoning. Safe to render.
     ReasoningDelta(String),
     TextDelta(String),
@@ -206,9 +219,28 @@ impl ToolGate {
 ///
 /// What it returns is **repository-derived data**. It is placed in a request as an ephemeral
 /// `user` message and never in `system`, and never stored in history: see [`Session::prompt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub statement: String,
+    pub origin: String,
+}
+
+/// Context injected into one turn and the learned notes that contributed to it.
+///
+/// Only [`Self::text`] is sent to the provider. The structured note metadata is retained alongside
+/// it for audit and presentation layers, and neither is added to conversation history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectedContext {
+    pub text: String,
+    pub notes: Vec<Note>,
+}
+
 pub trait ContextSource: Send + Sync {
     /// A block relevant to `prompt`, or `None` when nothing is. Called once per turn.
-    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>>;
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<InjectedContext>>;
 
     /// A standing summary, or `None` while there is not yet one to give. Once a session has
     /// adopted one it keeps it.
@@ -229,7 +261,7 @@ pub struct Session {
 struct TurnContext {
     /// Index in `Session::messages` of this turn's user message.
     user_index: usize,
-    block: Option<String>,
+    injected: Option<InjectedContext>,
 }
 
 impl Session {
@@ -245,9 +277,28 @@ impl Session {
     }
 
     /// Attaches a source of per-turn context.
+    ///
+    /// A context source is how a session gets a repository index, so attaching one is also what
+    /// offers the model `memory_search` and tells it when to use it ([`MEMORY_USE_HINT`]). Both are
+    /// fixed for the session, so the cached request prefix stays stable.
     #[must_use]
     pub fn with_context(mut self, context: Arc<dyn ContextSource>) -> Self {
         self.context = Some(context);
+        if !self.config.system_prompt.contains(MEMORY_USE_HINT) {
+            self.config.system_prompt.push(' ');
+            self.config.system_prompt.push_str(MEMORY_USE_HINT);
+        }
+        self
+    }
+
+    /// Appends a fixed sentence to this session's system prompt (still one string, fixed for the
+    /// session so the cached prefix holds). For text the harness knows to be true of this session.
+    #[must_use]
+    pub fn with_system_note(mut self, note: &str) -> Self {
+        if !self.config.system_prompt.contains(note) {
+            self.config.system_prompt.push(' ');
+            self.config.system_prompt.push_str(note);
+        }
         self
     }
 
@@ -283,9 +334,16 @@ impl Session {
             .push(Message::text(Role::User, prompt.clone()));
         let turn = TurnContext {
             user_index: self.messages.len() - 1,
-            block: self.gather_context(&prompt).await,
+            injected: self.gather_context(&prompt).await,
         };
         emit(OutputEvent::TurnStarted);
+        if let Some(injected) = &turn.injected
+            && !injected.notes.is_empty()
+        {
+            emit(OutputEvent::Context {
+                notes: injected.notes.clone(),
+            });
+        }
         let mut usage = Usage::default();
         let result = self
             .run_turn(provider, tools, gate, &cancel, &turn, &mut usage, &mut emit)
@@ -308,7 +366,7 @@ impl Session {
     ///
     /// Done once per turn rather than per round: every round re-sends the same block at the same
     /// position, so the cache holds across tool rounds.
-    async fn gather_context(&mut self, prompt: &str) -> Option<String> {
+    async fn gather_context(&mut self, prompt: &str) -> Option<InjectedContext> {
         let context = self.context.clone()?;
         if self.preamble.is_none() {
             self.preamble = context.preamble().await;
@@ -328,8 +386,8 @@ impl Session {
         }
         let split = (turn.user_index + 1).min(self.messages.len());
         messages.extend_from_slice(&self.messages[..split]);
-        if let Some(block) = &turn.block {
-            messages.push(Message::text(Role::User, block.clone()));
+        if let Some(injected) = &turn.injected {
+            messages.push(Message::text(Role::User, injected.text.clone()));
         }
         messages.extend_from_slice(&self.messages[split..]);
         messages
@@ -349,7 +407,11 @@ impl Session {
     where
         F: FnMut(OutputEvent),
     {
-        let definitions = provider_tool_definitions();
+        let mut definitions = provider_tool_definitions();
+        if !tools.has_memory() {
+            // No index: `memory_search` could only refuse, so the model is not offered it.
+            definitions.retain(|definition| definition.name != "memory_search");
+        }
         let mut full_text = String::new();
         for round_index in 0..self.config.max_rounds {
             let request = Request {

@@ -1,7 +1,18 @@
-import type { Notification, Snapshot } from "../src/protocol";
+import type { MemoryStatus, Notification, Snapshot } from "../src/protocol";
 import { emptyUsage } from "../src/session";
 export const snapshot = (): Snapshot => ({ session_id: "s", seq: 0, cwd: "/tmp", model: "test-model", turns: [], active_turn: null });
-export function note(seq: number, method: Notification["method"], params: unknown = {}, turn_id = "t"): Notification {
+export const memoryStatus = (overrides: Partial<MemoryStatus> = {}): MemoryStatus => ({
+  enabled: true,
+  consent: "granted",
+  learning: "working",
+  extractor: "provider/model",
+  notes: { active: 2, pending: 1 },
+  index: "ready",
+  spend: { ...emptyUsage(), input_tokens: 20, output_tokens: 5, cost: 0.01 },
+  problem: null,
+  ...overrides,
+});
+export function note(seq: number, method: Notification["method"], params: unknown = {}, turn_id: string | null = "t"): Notification {
   return { session_id: "s", seq, turn_id, method, params } as Notification;
 }
 export const stream = (): Notification[] => [

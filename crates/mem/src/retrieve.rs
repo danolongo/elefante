@@ -129,6 +129,8 @@ impl Hit {
 pub struct LearnedHit {
     pub id: i64,
     pub kind: LearnKind,
+    pub status: learn::Status,
+    pub origin: learn::Origin,
     pub label: String,
     pub statement: String,
     /// Retrieval score already multiplied by the note's effective confidence.
@@ -640,6 +642,8 @@ fn load_learned(
         out.push(LearnedHit {
             id: node.id,
             kind: node.kind,
+            status: node.status,
+            origin: node.origin,
             label: node.label,
             statement: node.statement,
             score: scores[&node.id] * effective,
@@ -711,14 +715,10 @@ pub fn rank_ctx(conn: &Connection, query: &Query, ctx: &RenderCtx<'_>) -> Result
 // ----- packing and rendering -----
 
 fn escape_capped(raw: &str, max_chars: usize) -> String {
+    let safe = learn::display_safe(raw);
     let mut out = String::new();
     let mut count = 0;
-    let mut pending_space = false;
-    for c in raw.chars() {
-        if c.is_control() || c.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
+    for c in safe.chars() {
         let piece: &str = match c {
             '&' => "&amp;",
             '<' => "&lt;",
@@ -730,15 +730,9 @@ fn escape_capped(raw: &str, max_chars: usize) -> String {
         } else {
             piece.chars().count()
         };
-        let space = usize::from(pending_space);
-        if count + space + width > max_chars.saturating_sub(1) {
+        if count + width > max_chars.saturating_sub(1) {
             out.push('…');
             return out;
-        }
-        if pending_space {
-            out.push(' ');
-            count += 1;
-            pending_space = false;
         }
         if piece.is_empty() {
             out.push(c);
@@ -988,6 +982,8 @@ pub fn run_ctx(
 pub enum SearchKind {
     File,
     Symbol,
+    /// Saved notes only.
+    Note,
 }
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 8;
@@ -998,11 +994,7 @@ pub const MAX_SEARCH_LIMIT: usize = 20;
 /// Unlike [`escape_capped`] this does no entity escaping: a tool result is not wrapped in an
 /// envelope, so there is nothing for repository text to close.
 fn flatten_capped(raw: &str, max_chars: usize) -> String {
-    let text = raw
-        .split(|c: char| c.is_control() || c.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = learn::display_safe(raw);
     truncate_chars(&text, max_chars)
 }
 
@@ -1034,9 +1026,11 @@ fn search_line(hit: &Hit) -> String {
 }
 
 fn learned_search_line(hit: &LearnedHit) -> String {
+    // A note may be as long as the injected block allows, so the cut is the block's, not a code
+    // line's.
     flatten_capped(
         &format!("memory {} — {}", hit.kind, hit.statement),
-        MAX_LINE_CHARS,
+        MEMORY_LINE_CHARS,
     )
 }
 
@@ -1055,7 +1049,8 @@ pub fn search(
 }
 
 /// As [`search`], also returning learned notes (as `memory kind — statement`) when no kind
-/// filter is given, interleaved with code by score.
+/// filter is given, interleaved with code by score, or alone for [`SearchKind::Note`]. Output that
+/// includes a note starts with the same notice the injected block carries.
 ///
 /// # Errors
 /// SQLite errors.
@@ -1078,36 +1073,48 @@ pub fn search_ctx(
                 | (Some(SearchKind::Symbol), HitKind::Symbol)
         )
     };
-    let mut scored: Vec<(f64, String)> = ranked
+    let mut scored: Vec<(f64, bool, String)> = ranked
         .code
         .iter()
         .filter(|hit| wanted(hit))
-        .map(|hit| (hit.score, search_line(hit)))
+        .map(|hit| (hit.score, false, search_line(hit)))
         .collect();
-    if kind.is_none() {
+    if matches!(kind, None | Some(SearchKind::Note)) {
         scored.extend(
             ranked
                 .learned
                 .iter()
-                .map(|hit| (hit.score, learned_search_line(hit))),
+                .map(|hit| (hit.score, true, learned_search_line(hit))),
         );
         // Stable: equal scores keep code before notes, then input order.
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     }
-    let lines: Vec<String> = scored
+    let taken: Vec<(f64, bool, String)> = scored
         .into_iter()
         .take(limit.clamp(1, MAX_SEARCH_LIMIT))
-        .map(|(_, line)| line)
         .collect();
-    let note = if partial {
+    let has_note = taken.iter().any(|(_, is_note, _)| *is_note);
+    let lines: Vec<String> = taken.into_iter().map(|(_, _, line)| line).collect();
+    // Notes are not built by the indexer, so its progress says nothing about them.
+    let note = if partial && kind != Some(SearchKind::Note) {
         "\n(the index is still being built; results may be incomplete)"
     } else {
         ""
     };
     if lines.is_empty() {
-        return Ok(format!("no matches{note}"));
+        let empty = if kind == Some(SearchKind::Note) {
+            "no saved notes match"
+        } else {
+            "no matches"
+        };
+        return Ok(format!("{empty}{note}"));
     }
-    Ok(format!("{}{note}", lines.join("\n")))
+    let notice = if has_note {
+        format!("{MEMORY_NOTICE}\n")
+    } else {
+        String::new()
+    };
+    Ok(format!("{notice}{}{note}", lines.join("\n")))
 }
 
 // ----- the cached entry point -----

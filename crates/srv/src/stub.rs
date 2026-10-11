@@ -59,6 +59,11 @@ pub(crate) struct StubProvider {
     /// repeating. They never consume `rounds`, so memory learning cannot disturb a scripted turn.
     extract: Vec<String>,
     next_extract: AtomicUsize,
+    extract_usage: Usage,
+    /// Held before each extraction reply, so a test can withdraw consent while a call is out.
+    extract_delay: Duration,
+    /// The first this-many extraction requests fail instead of replying.
+    extract_errors: usize,
 }
 
 impl StubProvider {
@@ -79,6 +84,17 @@ impl StubProvider {
                     .collect()
             })
             .unwrap_or_default();
+        let extract_usage = value
+            .get("extract_usage")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        let extract_delay = Duration::from_millis(value["extract_delay_ms"].as_u64().unwrap_or(0));
+        let extract_errors = value["extract_errors"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
         let rounds = if let Some(rounds) = value.get("rounds").and_then(Value::as_array) {
             rounds.clone()
         } else {
@@ -110,6 +126,9 @@ impl StubProvider {
             record,
             extract,
             next_extract: AtomicUsize::new(0),
+            extract_usage,
+            extract_delay,
+            extract_errors,
         })
     }
 }
@@ -159,15 +178,29 @@ impl Provider for StubProvider {
         }
         if request.response_schema.is_some() {
             let index = self.next_extract.fetch_add(1, Ordering::Relaxed);
+            let failing = index < self.extract_errors;
             let text = self
                 .extract
                 .get(index.min(self.extract.len().saturating_sub(1)))
                 .cloned()
                 .unwrap_or_else(|| r#"{"memories":[]}"#.to_owned());
-            return Box::pin(futures_util::stream::iter(vec![
-                Ok(Event::TextDelta(text)),
-                Ok(Event::Stop(StopReason::EndTurn)),
-            ]));
+            let mut events = vec![Ok(Event::TextDelta(text))];
+            if !self.extract_usage.is_empty() {
+                events.push(Ok(Event::Usage(self.extract_usage)));
+            }
+            events.push(Ok(Event::Stop(StopReason::EndTurn)));
+            if failing {
+                events = vec![Err(ProviderError::Protocol("scripted failure".into()))];
+            }
+            let pause = self.extract_delay;
+            return Box::pin(async_stream::stream! {
+                if !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+                for event in events {
+                    yield event;
+                }
+            });
         }
         let validation = validate_pairing(&request);
         let index = self.next_round.fetch_add(1, Ordering::Relaxed);

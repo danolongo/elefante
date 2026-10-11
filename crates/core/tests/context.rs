@@ -8,7 +8,10 @@ use std::{
     },
 };
 
-use elefante_core::{CancellationToken, ContextSource, RunConfig, Session, ToolGate};
+use elefante_core::{
+    CancellationToken, ContextSource, InjectedContext, Note, OutputEvent, RunConfig, Session,
+    ToolGate,
+};
 use elefante_provider::{
     Capabilities, ContentBlock, Event, Message, ModelId, Provider, ProviderError, Request, Role,
     StopReason, Usage,
@@ -84,7 +87,7 @@ fn end(text: &str) -> Vec<Event> {
 /// Hands out scripted blocks and preambles, and counts how often it is asked.
 #[derive(Default)]
 struct Source {
-    blocks: Mutex<VecDeque<Option<String>>>,
+    blocks: Mutex<VecDeque<Option<InjectedContext>>>,
     preambles: Mutex<VecDeque<Option<String>>>,
     block_calls: AtomicUsize,
     preamble_calls: AtomicUsize,
@@ -93,17 +96,31 @@ struct Source {
 
 impl Source {
     fn new(blocks: &[Option<&str>], preambles: &[Option<&str>]) -> Arc<Self> {
-        let owned = |list: &[Option<&str>]| list.iter().map(|b| b.map(str::to_owned)).collect();
         Arc::new(Self {
-            blocks: Mutex::new(owned(blocks)),
-            preambles: Mutex::new(owned(preambles)),
+            blocks: Mutex::new(
+                blocks
+                    .iter()
+                    .map(|block| {
+                        block.map(|text| InjectedContext {
+                            text: text.to_owned(),
+                            notes: Vec::new(),
+                        })
+                    })
+                    .collect(),
+            ),
+            preambles: Mutex::new(
+                preambles
+                    .iter()
+                    .map(|preamble| preamble.map(str::to_owned))
+                    .collect(),
+            ),
             ..Self::default()
         })
     }
 }
 
 impl ContextSource for Source {
-    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<InjectedContext>> {
         self.block_calls.fetch_add(1, Ordering::SeqCst);
         self.prompts.lock().unwrap().push(prompt.to_owned());
         let next = self.blocks.lock().unwrap().pop_front().flatten();
@@ -115,6 +132,90 @@ impl ContextSource for Source {
         let next = self.preambles.lock().unwrap().pop_front().flatten();
         Box::pin(async move { next })
     }
+}
+
+#[tokio::test]
+async fn only_context_text_reaches_the_provider_and_note_metadata_is_not_history() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let provider = Script::new(vec![end("done")]);
+    let source = Arc::new(Source {
+        blocks: Mutex::new(
+            [Some(InjectedContext {
+                text: "RENDERED-CONTEXT".to_owned(),
+                notes: vec![Note {
+                    id: 42,
+                    kind: "convention".to_owned(),
+                    status: "active".to_owned(),
+                    statement: "NOTE-METADATA-ONLY".to_owned(),
+                    origin: "explicit".to_owned(),
+                }],
+            })]
+            .into(),
+        ),
+        ..Source::default()
+    });
+    let mut session = Session::new(RunConfig::new("test")).with_context(source);
+
+    ask(&mut session, &provider, &executor, "hello").await;
+
+    assert_eq!(
+        texts(&provider.requests()[0].messages),
+        ["hello", "RENDERED-CONTEXT"]
+    );
+    let history = texts(session.messages());
+    assert!(!history.iter().any(|text| text.contains("RENDERED-CONTEXT")));
+    assert!(
+        !history
+            .iter()
+            .any(|text| text.contains("NOTE-METADATA-ONLY"))
+    );
+}
+
+#[tokio::test]
+async fn learned_context_is_emitted_after_turn_start_without_its_rendered_text() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let provider = Script::new(vec![end("done")]);
+    let expected = Note {
+        id: 42,
+        kind: "convention".to_owned(),
+        status: "active".to_owned(),
+        statement: "Use pnpm.".to_owned(),
+        origin: "explicit".to_owned(),
+    };
+    let source = Arc::new(Source {
+        blocks: Mutex::new(
+            [Some(InjectedContext {
+                text: "SECRET-RENDERED-BLOCK".to_owned(),
+                notes: vec![expected.clone()],
+            })]
+            .into(),
+        ),
+        ..Source::default()
+    });
+    let mut session = Session::new(RunConfig::new("test")).with_context(source);
+    let mut events = Vec::new();
+    session
+        .prompt(
+            &provider,
+            &executor,
+            &ToolGate::default(),
+            "hello",
+            CancellationToken::new(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(events[0], OutputEvent::TurnStarted));
+    assert_eq!(
+        events[1],
+        OutputEvent::Context {
+            notes: vec![expected]
+        }
+    );
+    assert!(!format!("{events:?}").contains("SECRET-RENDERED-BLOCK"));
 }
 
 async fn ask(session: &mut Session, provider: &Script, executor: &ToolExecutor, text: &str) {
@@ -341,7 +442,12 @@ async fn no_request_ever_carries_a_system_message_beyond_the_configured_prompt()
     let provider = Script::new(vec![tool_round("t1"), end("a1"), end("a2")]);
     let source = Source::new(&[Some("B1"), Some("B2")], &[Some("PRE")]);
     let config = RunConfig::new("test");
-    let expected_system = vec![config.system_prompt.clone()];
+    // The configured prompt plus the harness's own fixed hint; nothing derived from the repository.
+    let expected_system = vec![format!(
+        "{} {}",
+        config.system_prompt,
+        elefante_core::MEMORY_USE_HINT
+    )];
     let mut session = Session::new(config).with_context(source);
     ask(&mut session, &provider, &executor, "q1").await;
     ask(&mut session, &provider, &executor, "q2").await;
@@ -355,4 +461,100 @@ async fn no_request_ever_carries_a_system_message_beyond_the_configured_prompt()
             "repository-derived text must never carry system authority"
         );
     }
+}
+
+#[derive(Debug)]
+struct NoIndex;
+
+impl elefante_tools::MemorySearch for NoIndex {
+    fn search(
+        &self,
+        _: elefante_tools::MemorySearchRequest,
+    ) -> BoxFuture<'_, Result<String, String>> {
+        Box::pin(async { Ok("nothing".to_owned()) })
+    }
+}
+
+fn offers_memory_search(request: &Request) -> bool {
+    request.tools.iter().any(|t| t.name == "memory_search")
+}
+
+#[tokio::test]
+async fn the_index_tool_follows_the_executor_and_the_hint_follows_the_context_source() {
+    let repo = tempfile::tempdir().unwrap();
+    let bare = ToolExecutor::new(repo.path()).unwrap();
+    let indexed_tools = ToolExecutor::new(repo.path())
+        .unwrap()
+        .with_memory(Arc::new(NoIndex));
+
+    // Neither: no tool, no hint, the plain prompt.
+    let provider = Script::new(vec![end("a")]);
+    let mut plain = Session::new(RunConfig::new("test"));
+    ask(&mut plain, &provider, &bare, "q").await;
+    let request = &provider.requests()[0];
+    assert!(!offers_memory_search(request));
+    assert!(request.tools.len() >= 6, "the other tools are unaffected");
+    assert_eq!(request.system, [elefante_core::DEFAULT_SYSTEM_PROMPT]);
+
+    // Both: the tool, and one system string with the hint, fixed for the whole session.
+    let provider = Script::new(vec![end("a"), end("b")]);
+    let mut indexed =
+        Session::new(RunConfig::new("test")).with_context(Source::new(&[None, None], &[None]));
+    ask(&mut indexed, &provider, &indexed_tools, "q").await;
+    ask(&mut indexed, &provider, &indexed_tools, "r").await;
+    let requests = provider.requests();
+    assert!(offers_memory_search(&requests[0]));
+    assert_eq!(requests[0].system.len(), 1, "still one system string");
+    assert_eq!(
+        requests[0].system[0],
+        format!(
+            "{} {}",
+            elefante_core::DEFAULT_SYSTEM_PROMPT,
+            elefante_core::MEMORY_USE_HINT
+        )
+    );
+    assert_eq!(
+        requests[0].system, requests[1].system,
+        "frozen for the session"
+    );
+    assert_eq!(requests[0].tools, requests[1].tools);
+    let sorted: Vec<_> = requests[0].tools.iter().map(|t| t.name.clone()).collect();
+    let mut expected = sorted.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "tool order stays name-sorted");
+
+    // A context source without an index behind the tool: the tool is not listed (it could only
+    // refuse), and the other way round, an index with no context source lists it without the hint.
+    let provider = Script::new(vec![end("a")]);
+    let mut context_only =
+        Session::new(RunConfig::new("test")).with_context(Source::new(&[None], &[None]));
+    ask(&mut context_only, &provider, &bare, "q").await;
+    assert!(!offers_memory_search(&provider.requests()[0]));
+    let provider = Script::new(vec![end("a")]);
+    let mut tools_only = Session::new(RunConfig::new("test"));
+    ask(&mut tools_only, &provider, &indexed_tools, "q").await;
+    assert!(offers_memory_search(&provider.requests()[0]));
+    assert_eq!(
+        provider.requests()[0].system,
+        [elefante_core::DEFAULT_SYSTEM_PROMPT]
+    );
+}
+
+#[tokio::test]
+async fn a_system_note_is_appended_once_and_stays_one_string() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let provider = Script::new(vec![end("a")]);
+    let mut session = Session::new(RunConfig::new("test"))
+        .with_system_note(elefante_core::LEARNING_HINT)
+        .with_system_note(elefante_core::LEARNING_HINT);
+    ask(&mut session, &provider, &executor, "q").await;
+    assert_eq!(
+        provider.requests()[0].system,
+        [format!(
+            "{} {}",
+            elefante_core::DEFAULT_SYSTEM_PROMPT,
+            elefante_core::LEARNING_HINT
+        )]
+    );
 }

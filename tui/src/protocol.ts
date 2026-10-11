@@ -5,9 +5,23 @@ export type Usage = { input_tokens: number; output_tokens: number; reasoning_tok
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "stop_sequence" | "interrupted" | { other: string };
 export type Approval = { approval_id: string; command: string; rule: string };
 export type Tool = { tool_call_id: string; name: string; state: "running" | "ok" | "error" | "cancelled"; is_error: boolean; input_preview?: string; output_preview?: string; duration_ms?: number };
-export type CompletedTurn = { turn_id: string; prompt: string; text: string; reasoning?: string; tools: Tool[]; stop_reason: StopReason; usage: Usage };
-export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_far: string; tools: Tool[]; pending_approval: Approval | null };
+export type CompletedTurn = { turn_id: string; prompt: string; text: string; reasoning?: string; tools: Tool[]; stop_reason: StopReason; usage: Usage; memory_note_ids?: number[] };
+export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_far: string; tools: Tool[]; pending_approval: Approval | null; memory_note_ids?: number[] };
 export type Snapshot = { session_id: string; seq: number; cwd: string; model: string; turns: CompletedTurn[]; active_turn: ActiveTurn | null };
+export type Consent = "unset" | "granted" | "declined" | "off";
+export type MemorySeed = { consent: Consent; extractor: string | null };
+export type MemoryStatus = MemorySeed & {
+  enabled: boolean;
+  learning: "working" | "paused" | "failing";
+  notes: { active: number; pending: number };
+  index: "off" | "building" | "ready";
+  spend: Usage;
+  problem: string | null;
+};
+export type MemoryInfo = MemorySeed | MemoryStatus;
+export type MemoryNote = { id: number; kind: string; status: string; statement: string; origin: string };
+export type MemoryChange = "added" | "promoted" | "superseded" | "revived";
+export type CreateResult = { session_id: string; seq: number; memory?: MemoryInfo };
 type EventParams = {
   "turn.started": Record<string, never>;
   "reasoning.delta": { text: string };
@@ -18,9 +32,12 @@ type EventParams = {
   "approval.resolved": { approval_id: string; approved: boolean };
   "turn.finished": { stop_reason: StopReason; usage: Usage };
   "session.error": { message: string };
+  "memory.status": MemoryStatus;
+  "memory.learned": { note: MemoryNote; change: MemoryChange; replaced?: MemoryNote };
+  "memory.context": { notes: MemoryNote[] };
 };
 export type Notification = { [K in keyof EventParams]: { session_id: string; turn_id: string | null; method: K; params: EventParams[K] } & ({ seq: number; seq_from?: never; seq_to?: never } | { seq?: never; seq_from: number; seq_to: number }) }[keyof EventParams];
-export type AttachResult = { kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot };
+export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemoryInfo };
 export class ProtocolError extends Error {}
 export class RpcError extends Error { constructor(public code: number, message: string) { super(message); } }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -28,12 +45,57 @@ const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as nu
 const strings = (v: Record<string, unknown>, ...keys: string[]) => keys.every(k => typeof v[k] === "string");
 const usage = (v: unknown): v is Usage => object(v) && ["input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "cache_write_tokens"].every(k => integer(v[k])) && (v.cost === null || typeof v.cost === "number" && Number.isFinite(v.cost) && v.cost >= 0);
 const stopReason = (v: unknown): v is StopReason => typeof v === "string" ? ["end_turn", "tool_use", "max_tokens", "refusal", "stop_sequence", "interrupted"].includes(v) : object(v) && typeof v.other === "string";
+const consents: Consent[] = ["unset", "granted", "declined", "off"];
+export function displaySafe(text: string): string {
+  return text.replace(/[\t\n]/g, " ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "").split(/\s+/u).filter(Boolean).join(" ");
+}
+export function safeMemoryNote(note: MemoryNote): MemoryNote {
+  return { ...note, kind: displaySafe(note.kind), status: displaySafe(note.status), statement: displaySafe(note.statement), origin: displaySafe(note.origin) };
+}
+export type MemoryRow = MemoryNote & { confidence: number; verified: boolean; reinforcements: number };
+/** The `memory.list` result, with every text column made safe to draw. */
+export function parseMemoryList(value: unknown): MemoryRow[] {
+  if (!object(value) || !Array.isArray(value.notes)) throw new ProtocolError("Invalid memory list");
+  return value.notes.map(row => {
+    if (!object(row) || !memoryNote(row)) throw new ProtocolError("Invalid memory note");
+    const { confidence, verified, reinforcements } = row as Record<string, unknown>;
+    if (typeof confidence !== "number" || typeof verified !== "boolean" || !integer(reinforcements)) throw new ProtocolError("Invalid memory note");
+    const note = safeMemoryNote(row);
+    // The daemon's raw origin was `learned:stated`; the wire shape is the bare `stated`. Take both.
+    return { ...note, origin: note.origin.replace(/^learned:/, ""), confidence, verified, reinforcements };
+  });
+}
+const memoryNote = (v: unknown): v is MemoryNote => object(v) && integer(v.id) && strings(v, "kind", "status", "statement", "origin");
+function parseMemory(value: unknown): MemoryInfo | undefined {
+  if (value === undefined) return undefined;
+  if (!object(value) || !consents.includes(value.consent as Consent) || !(value.extractor === null || typeof value.extractor === "string")) throw new ProtocolError("Invalid memory state");
+  const seed: MemorySeed = { consent: value.consent as Consent, extractor: value.extractor as string | null };
+  if (value.enabled === undefined) return seed; // M3.1 daemon: consent only.
+  if (typeof value.enabled !== "boolean" || !["working", "paused", "failing"].includes(value.learning as string)
+    || !object(value.notes) || !integer(value.notes.active) || !integer(value.notes.pending)
+    || !["off", "building", "ready"].includes(value.index as string) || !usage(value.spend)
+    || !(value.problem === null || typeof value.problem === "string")) throw new ProtocolError("Invalid memory status");
+  return { ...seed, enabled: value.enabled, learning: value.learning as MemoryStatus["learning"], notes: { active: value.notes.active, pending: value.notes.pending }, index: value.index as MemoryStatus["index"], spend: value.spend, problem: value.problem as string | null };
+}
+export const isMemoryStatus = (memory: MemoryInfo | undefined): memory is MemoryStatus => memory !== undefined && "enabled" in memory;
+export function parseCreate(value: unknown): CreateResult {
+  if (!object(value) || !strings(value, "session_id") || !integer(value.seq)) throw new ProtocolError("Invalid create response");
+  const memory = parseMemory(value.memory);
+  return { session_id: value.session_id as string, seq: value.seq, ...(memory ? { memory } : {}) };
+}
+export function parseConsentResult(value: unknown): { consent: Consent } {
+  if (!object(value) || !consents.includes(value.consent as Consent)) throw new ProtocolError("Invalid consent response");
+  return { consent: value.consent as Consent };
+}
 export function parseNotification(value: unknown): Notification {
   if (!object(value) || !strings(value, "session_id", "method") || !(value.turn_id === null || typeof value.turn_id === "string") || !object(value.params)) throw new ProtocolError("Invalid notification envelope");
   const p = value.params;
   const ranged = value.seq === undefined;
   if (ranged ? !integer(value.seq_from) || value.seq_from < 1 || !integer(value.seq_to) || value.seq_to < value.seq_from || !["text.delta", "reasoning.delta"].includes(value.method as string) : !integer(value.seq) || value.seq < 1 || value.seq_from !== undefined || value.seq_to !== undefined) throw new ProtocolError("Invalid event sequence");
-  let valid = false;
+  // Unknown methods still occupy the shared sequence space. Accept their
+  // envelopes so newer daemons remain usable; reducers ignore methods they do
+  // not understand. Known methods retain strict parameter validation below.
+  let valid = true;
   switch (value.method) {
     case "turn.started": valid = true; break;
     case "reasoning.delta": case "text.delta": valid = strings(p, "text"); break;
@@ -43,6 +105,9 @@ export function parseNotification(value: unknown): Notification {
     case "approval.resolved": valid = strings(p, "approval_id") && typeof p.approved === "boolean"; break;
     case "turn.finished": valid = stopReason(p.stop_reason) && usage(p.usage); break;
     case "session.error": valid = strings(p, "message"); break;
+    case "memory.status": valid = isMemoryStatus(parseMemory(p)); break;
+    case "memory.learned": valid = memoryNote(p.note) && ["added", "promoted", "superseded", "revived"].includes(p.change as string) && (p.replaced === undefined || memoryNote(p.replaced)); break;
+    case "memory.context": valid = Array.isArray(p.notes) && p.notes.every(memoryNote); break;
   }
   if (!valid) throw new ProtocolError("Invalid notification params");
   return value as Notification;
@@ -50,17 +115,19 @@ export function parseNotification(value: unknown): Notification {
 function parseSnapshot(value: unknown): Snapshot {
   if (!object(value) || !strings(value, "session_id", "cwd", "model") || !integer(value.seq) || !Array.isArray(value.turns)) throw new ProtocolError("Invalid snapshot");
   const tools = (v: unknown) => Array.isArray(v) && v.every(t => object(t) && strings(t, "tool_call_id", "name") && ["running", "ok", "error", "cancelled"].includes(t.state as string) && typeof t.is_error === "boolean");
-  for (const turn of value.turns) if (!object(turn) || !strings(turn, "turn_id", "prompt", "text") || !tools(turn.tools) || !stopReason(turn.stop_reason) || !usage(turn.usage)) throw new ProtocolError("Invalid completed turn");
+  const ids = (v: unknown) => v === undefined || Array.isArray(v) && v.every(integer);
+  for (const turn of value.turns) if (!object(turn) || !strings(turn, "turn_id", "prompt", "text") || !tools(turn.tools) || !stopReason(turn.stop_reason) || !usage(turn.usage) || !ids(turn.memory_note_ids)) throw new ProtocolError("Invalid completed turn");
   const a = value.active_turn;
-  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !(a.pending_approval === null || object(a.pending_approval) && strings(a.pending_approval, "approval_id", "command", "rule")))) throw new ProtocolError("Invalid active turn");
+  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !ids(a.memory_note_ids) || !(a.pending_approval === null || object(a.pending_approval) && strings(a.pending_approval, "approval_id", "command", "rule")))) throw new ProtocolError("Invalid active turn");
   return value as Snapshot;
 }
 export function parseAttach(value: unknown, sessionId: string, since?: number): AttachResult {
   if (!object(value)) throw new ProtocolError("Invalid attach response");
+  const memory = parseMemory(value.memory);
   if (value.kind === "snapshot") {
     const snapshot = parseSnapshot(value.snapshot);
     if (snapshot.session_id !== sessionId || snapshot.seq !== value.seq) throw new ProtocolError("Snapshot cursor mismatch");
-    return { kind: "snapshot", seq: snapshot.seq, snapshot };
+    return { kind: "snapshot", seq: snapshot.seq, snapshot, ...(memory ? { memory } : {}) };
   }
   if (value.kind !== "resumed" || since === undefined || value.from !== since + 1 || !Array.isArray(value.events)) throw new ProtocolError("Invalid resume response");
   const events = value.events.map(parseNotification);
@@ -68,7 +135,7 @@ export function parseAttach(value: unknown, sessionId: string, since?: number): 
   for (const note of events) {
     if (note.session_id !== sessionId || note.seq !== next++) throw new ProtocolError("Resume events are not contiguous ring entries");
   }
-  return { kind: "resumed", from: value.from as number, events };
+  return { kind: "resumed", from: value.from as number, events, ...(memory ? { memory } : {}) };
 }
 
 /** Byte framing preserves UTF-8 when socket chunks split inside a codepoint. */
@@ -159,23 +226,28 @@ export class RpcClient {
       this.socket!.write(frame + "\n");
     });
   }
-  async attach(sessionId: string, emit: Attachment["emit"], snapshot: Attachment["snapshot"], since?: number): Promise<void> {
+  async attach(sessionId: string, emit: Attachment["emit"], snapshot: Attachment["snapshot"], since?: number): Promise<AttachResult> {
     let attachment = this.attachments.get(sessionId);
     if (!attachment) {
       attachment = { window: new SequenceWindow(since), held: null, emit, snapshot };
       this.attachments.set(sessionId, attachment);
     }
-    await this.synchronize(sessionId, attachment, since);
+    const result = await this.synchronize(sessionId, attachment, since);
+    if (!result) throw new ProtocolError("Attach already in progress");
+    return result;
   }
-  async reconnect(path: string): Promise<void> {
+  /** Reconnects and re-synchronizes every attachment; returns the last attach result, whose `memory` is current. */
+  async reconnect(path: string): Promise<AttachResult | undefined> {
     await this.connect(path);
-    for (const [id, a] of this.attachments) await this.synchronize(id, a, a.window.cursor);
+    let last: AttachResult | undefined;
+    for (const [id, a] of this.attachments) last = (await this.synchronize(id, a, a.window.cursor)) ?? last;
+    return last;
   }
   close(): void {
     this.onDisconnect = () => {};
     this.socket?.destroy();
   }
-  private async synchronize(id: string, a: Attachment, since?: number): Promise<void> {
+  private async synchronize(id: string, a: Attachment, since?: number): Promise<AttachResult | undefined> {
     if (a.held !== null) return;
     a.held = [];
     try {
@@ -185,6 +257,7 @@ export class RpcClient {
       const held = a.held;
       a.held = null;
       for (const note of held) this.dispatch(note);
+      return result;
     } catch (error) { a.held = null; throw error; }
   }
   private apply(a: Attachment, note: Notification): void {

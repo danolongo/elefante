@@ -110,7 +110,7 @@ Some prose.
         .unwrap()
         .extract(source, &Counters::default());
     assert_eq!(e.file_doc, "Title · Setup · Usage");
-    assert!(e.symbols.is_empty());
+    assert_eq!(e.symbols.len(), 0);
     assert!(!e.truncated);
 }
 

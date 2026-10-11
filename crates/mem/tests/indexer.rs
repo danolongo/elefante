@@ -134,7 +134,7 @@ fn touching_a_file_reads_it_but_writes_nothing() {
     assert_eq!(stats.hashed, 1);
     assert_eq!(stats.parsed, 0);
     assert_eq!(stats.batches, 0, "no graph change, no commit counted");
-    assert!(report.updated.is_empty());
+    assert_eq!(report.updated.len(), 0);
     assert_eq!(tree.generation(), 1);
 }
 

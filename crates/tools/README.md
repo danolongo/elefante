@@ -46,7 +46,7 @@ policy root, `kill_on_drop`, its own process group on Unix so an interrupt takes
 with it. Do not reintroduce a classifier here.
 
 **`memory_search` is a trait, not a dependency.** The tool is validated here (a non-empty query,
-`limit` 1–20, `kind` of `file` or `symbol`, no other fields) and then handed to a `MemorySearch`
+`limit` 1–20, `kind` of `file`, `symbol` or `note` (saved notes only), no other fields) and then handed to a `MemorySearch`
 implementation attached with `ToolExecutor::with_memory`. The implementation lives in
 `elefante-core`, over `elefante-mem`; this crate depends on neither, so the dependency direction
 `tools → guard` stays intact. With nothing attached the tool returns one fixed refusal, so a

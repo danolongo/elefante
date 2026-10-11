@@ -22,15 +22,18 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/protocol.ts` | 238 | Framing, sequence windows, attach and gap handling, `connectOrExplain`. |
-| `src/session.ts` | 51 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. Keeps each turn's output as ordered `segments` (reasoning, text, tool calls). |
+| `src/protocol.ts` | 306 | Framing, sequence windows, attach and gap handling, `connectOrExplain`; accepts unknown notification methods; parses the optional `memory` object, `memory.list` and `memory.consent` results. |
+| `src/session.ts` | 59 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. Keeps each turn's output as ordered `segments` (reasoning, text, tool calls). |
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
-| `src/main.tsx` | 102 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop. |
+| `src/commands.ts` | 11 | Pure: `parseCommand` — only exactly `/memory` and `/forget <integer>` (spaces or tabs between) are commands; `//x` sends `/x`; anything else is a prompt. |
+| `src/memoryView.ts` | 18 | Pure: provenance in words (`you asked`, `you said`, `assistant — unconfirmed`) and the one line saying why learning is paused or failing. |
+| `src/main.tsx` | 144 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop, the consent question, and the `/memory` and `/forget` actions. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
-| `src/ui/Transcript.tsx` | 49 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
+| `src/ui/Transcript.tsx` | 66 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/toolView.ts` | 72 | Pure: a tool call as a header subject (`✓ bash \`ls\` (12 ms)`) and at most three body lines indented four spaces. A `read` is just its path, never the file. |
-| `src/ui/Modal.tsx` | 25 | Approval prompts and the first-run key prompt. |
-| `src/ui/App.tsx` | 44 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
+| `src/ui/Modal.tsx` | 40 | Approval, first-run key, memory-consent and `/memory` modals. |
+| `src/ui/MemoryPanel.tsx` | 58 | The `/memory` panel: list, scroll, forget with a Y/N confirmation, close. |
+| `src/ui/App.tsx` | 48 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
 | `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
 | `src/ui/copy.ts` | 22 | Where selected text goes: OSC52, plus `pbcopy` on macOS. |
 | `src/ui/Mascot.tsx` | 57 | `useMascot` decides which stage the elephant is on; `TopMascot` (with the wordmark) and `PerchMascot` place it. |
@@ -40,8 +43,8 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/elephant/wordmark.ts`, `Logo.tsx` | 16, 19 | The "elefante" wordmark as pixel rows, and the component that paints it once. |
 | `src/ui/elephant/paint.ts` | 47 | Composes a frame into pixels and paints it as half-block cells. |
 | `src/ui/elephant/phase.ts` | 21 | The `intro → perch` transition, as pure functions. |
-| `src/ui/Status.tsx` | 10 | Thinking indicator, elapsed time, usage. |
-| `src/ui/Input.tsx` | 6 | Prompt entry. |
+| `src/ui/Status.tsx` | 12 | Thinking indicator, elapsed time, usage, and the memory suffix when memory is not healthy. |
+| `src/ui/Input.tsx` | 13 | Prompt entry; routes `/memory` and `/forget <id>` through `parseCommand`. |
 | `src/ui/theme.ts` | 6 | The blue behind the prompt border and its two neighbouring tints. |
 
 `session.ts` is short but dense — single-line functions, not a stub.
@@ -73,7 +76,36 @@ three counts and the cost are **session totals**, the sum of every completed tur
 they stay at `0 in / 0 out / 0 reasoning | cost: ?` until the first `turn.finished` arrives —
 the daemon reports usage per turn, not per token. `cost: ?` means the provider has reported no
 cost yet (`null`); once any turn reports one it reads `cost: $0.0123`, and a reported zero reads
-`cost: $0.0000`, which is distinct from unknown.
+`cost: $0.0000`, which is distinct from unknown. The cost is one total: turn usage plus the
+cumulative memory-extractor spend from `MemoryStatus`, so a snapshot restores it exactly. While
+memory is healthy nothing else is added; otherwise a suffix says so in words: `memory: paused  /memory`
+(no answer to the consent question yet), `memory: not saving  /memory` (three extraction failures in a
+row), `memory: unavailable` (the store or its key). Declined or switched off adds nothing.
+
+## Memory
+
+All of it is driven by the daemon's `memory` result field and `memory.*` events
+(`../docs/DEVELOPER_GUIDE.md` §5, **Memory wire**); a daemon that sends none gets none of it.
+
+- **Consent.** When the create or attach result says `consent: "unset"` with a non-null extractor,
+  a modal names the extractor (and says so when it is the session's own model) and takes only `Y`
+  (learn), `N` (don't) or `Esc` (ask again next launch). It owns typing and Esc, so nothing reaches
+  the prompt and Esc does not interrupt a turn. The answer is `memory.consent` and applies to every
+  session.
+- **Transcript lines.** A learned note is a persistent dim line after the turn that was on screen
+  when it arrived: `◇ remembered: …  /forget 14`, or `◇ updated: “old” → “new”  /forget 15`. A turn
+  that used saved notes gets `◇ used N saved notes`. A reinforced or pending note draws nothing.
+  Lines live in client state; a fresh attach starts from the snapshot and does not replay them.
+  A snapshot restore (after a reconnect that cannot resume from the ring) does not bring back the
+  `◇ remembered` / `◇ used` markers that happened inside a turn: snapshots carry no ordering, so
+  there is nowhere to place them. `/memory` is the durable view of what was saved. The memory
+  status (status line and cost) is not affected: every attach, including a reconnect, carries the
+  daemon's current `memory`, and the client applies it.
+- **`/memory`** opens a panel for the working directory's notes (`memory.list`), only while the
+  prompt is enabled. `↑↓` select, `f` asks `Forget #14? “…”  Y / N`, `Esc` closes. It is a modal, so
+  no key reaches the prompt. Approving, history and clearing stay in `elefante memory`.
+  **`/forget <id>`** does the same without the panel.
+- Every note string is sanitised again at the boundary (`display_safe` also runs on the daemon).
 
 ## The elephant
 
@@ -137,15 +169,15 @@ streamed live keep the interleaved order. The daemon's retained history is unbou
 ## Testing
 
 ```sh
-bun test              # 67 tests
+bun test              # 89 tests
 bun run typecheck     # tsc --noEmit across all three layers
 ```
 
-`tests/protocol.test.ts` (10) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (8) covers the reducer. `tests/ui.test.tsx` (17)
+`tests/protocol.test.ts` (12) covers framing at every byte split, sequence windows, and the
+no-daemon failure path. `tests/session.test.ts` (13) covers the reducer, including turn-less memory events. `tests/ui.test.tsx` (28)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
 asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, wordmark, clips, flap pause and phase transitions
-as pure functions; `tests/copy.test.ts` (2) covers where copied text goes; `tests/toolView.test.ts` (8) covers how each tool call is laid out; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling
+as pure functions; `tests/commands.test.ts` (4) covers slash-command routing and note sanitising; `tests/copy.test.ts` (2) covers where copied text goes; `tests/toolView.test.ts` (8) covers how each tool call is laid out; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling
 `engine.update(ms)`, so no test waits on a real clock. `App`'s `animateMascot={false}` makes the elephant
 paint its resting pose.
 

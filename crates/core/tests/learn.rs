@@ -13,8 +13,8 @@ use std::{
 };
 
 use elefante_core::learn::{
-    EXTRACTOR_SYSTEM_PROMPT, LearnConfig, Learner, build_request, response_schema,
-    turns_from_messages,
+    ChangedNote, EXTRACTOR_SYSTEM_PROMPT, LearnChange, LearnConfig, LearnFailure, LearnHealth,
+    LearnSink, Learner, build_request, response_schema, turns_from_messages,
 };
 use elefante_guard::Scrubber;
 use elefante_mem::{
@@ -122,7 +122,10 @@ impl Provider for Handle {
                     Ok(Event::Usage(Usage {
                         input_tokens: 100,
                         output_tokens: 20,
-                        ..Usage::default()
+                        reasoning_tokens: 3,
+                        cached_input_tokens: 4,
+                        cache_write_tokens: 5,
+                        cost: Some(0.25),
                     })),
                     Ok(Event::Stop(StopReason::EndTurn)),
                 ],
@@ -195,6 +198,41 @@ fn learner(store: &Arc<Store>, script: &Arc<Script>, config: LearnConfig) -> Arc
         Arc::clone(store),
         Arc::new(Handle(Arc::clone(script))),
         config,
+    )
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    usage: Mutex<Vec<Usage>>,
+    health: Mutex<Vec<LearnHealth>>,
+    changes: Mutex<Vec<ChangedNote>>,
+}
+
+impl LearnSink for RecordingSink {
+    fn learned(&self, changes: &[ChangedNote]) {
+        self.changes.lock().unwrap().extend_from_slice(changes);
+    }
+
+    fn usage(&self, usage: Usage) {
+        self.usage.lock().unwrap().push(usage);
+    }
+
+    fn health(&self, health: LearnHealth) {
+        self.health.lock().unwrap().push(health);
+    }
+}
+
+fn learner_with_sink(
+    store: &Arc<Store>,
+    script: &Arc<Script>,
+    config: LearnConfig,
+    sink: Arc<RecordingSink>,
+) -> Arc<Learner> {
+    Learner::with_sink(
+        Arc::clone(store),
+        Arc::new(Handle(Arc::clone(script))),
+        config,
+        sink,
     )
 }
 
@@ -272,7 +310,7 @@ fn the_request_is_a_fixed_prompt_over_escaped_data_with_no_tools() {
     ];
     let request = build_request(&config, &[], &turns);
     assert_eq!(request.system, vec![EXTRACTOR_SYSTEM_PROMPT.to_owned()]);
-    assert!(request.tools.is_empty());
+    assert_eq!(request.tools.len(), 0);
     assert_eq!(request.model.as_str(), "test/extractor");
     assert_eq!(request.effort, Some(Effort::Low));
     assert_eq!(request.max_tokens, 2_048);
@@ -355,6 +393,12 @@ fn the_extractor_role_comes_from_the_environment_or_falls_back_to_the_author() {
         Some(Effort::Low),
         "an unknown effort is ignored"
     );
+    assert_eq!(unset.log, None, "no log unless one is asked for");
+    assert_eq!(junk.log, None);
+    let logged = LearnConfig::from_env(&author, &env(&[("ELEFANTE_LEARN_LOG", "/tmp/learn.log")]));
+    assert_eq!(logged.log, Some("/tmp/learn.log".into()));
+    let blank = LearnConfig::from_env(&author, &env(&[("ELEFANTE_LEARN_LOG", "  ")]));
+    assert_eq!(blank.log, None, "a blank path is the same as none");
 }
 
 // ----- the gate -----
@@ -542,6 +586,96 @@ async fn an_empty_reply_is_counted_and_still_advances() {
     assert_eq!(learner.pending_turns(), 0);
 }
 
+fn log_lines(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_asked_for_log_says_how_each_attempt_ended_and_a_missing_one_changes_nothing() {
+    let (_tmp2, store2) = store();
+    let (_tmp, store) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("learn.log");
+    let mut logging = config();
+    logging.log = Some(path.clone());
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Text("I would record that tests use should_.".to_owned()),
+        reply(&json!([])),
+        reply(&json!([note(
+            "Test functions use the prefix should_.",
+            "every test is named should_"
+        )])),
+    ]);
+    let learner = learner(&store, &script, logging);
+    let mut history = Vec::new();
+    for said in [
+        "Remember: nothing in particular.",
+        "Remember: every test is named should_",
+    ] {
+        history.push(user(said));
+        learner.observe(&history);
+        settle(&learner).await;
+    }
+    let lines = log_lines(&path);
+    let outcomes: Vec<&str> = lines
+        .iter()
+        .map(|l| l["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes[0], "provider_error", "{lines:?}");
+    assert!(
+        lines[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("scripted failure")
+    );
+    assert!(outcomes.contains(&"unreadable_reply"), "{outcomes:?}");
+    let unreadable = lines
+        .iter()
+        .find(|l| l["outcome"] == "unreadable_reply")
+        .unwrap();
+    assert!(
+        unreadable["reply_head"]
+            .as_str()
+            .unwrap()
+            .starts_with("I would record")
+    );
+    assert!(outcomes.contains(&"no_notes"), "{outcomes:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["model"] == "test/extractor" && l["at_ms"].is_number())
+    );
+    let last = lines.last().unwrap();
+    assert_eq!(last["outcome"], "ingested", "{lines:?}");
+    assert_eq!(last["added"], 1);
+    assert!(last["reply_head"].as_str().unwrap().contains("should_"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // An unwritable path is ignored: learning proceeds exactly as with no log.
+    let mut broken = config();
+    broken.log = Some(dir.path().join("no/such/dir/learn.log"));
+    let script2 = Script::new(vec![reply(&json!([note(
+        "Test functions use the prefix should_.",
+        "every test is named should_"
+    )]))]);
+    let learner2 = self::learner(&store2, &script2, broken);
+    learner2.observe(&[user("Remember: every test is named should_")]);
+    settle(&learner2).await;
+    assert_eq!(learned(&store2).await.len(), 1);
+}
+
 #[tokio::test]
 async fn a_failure_keeps_the_text_and_a_retry_that_succeeds_clears_it() {
     let (_tmp, store) = store();
@@ -568,6 +702,69 @@ async fn a_failure_keeps_the_text_and_a_retry_that_succeeds_clears_it() {
 }
 
 #[tokio::test]
+async fn sink_reports_usage_health_recovery_and_one_normalized_note_change() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Text("not json".to_owned()),
+        reply(&json!([note(
+            "Branches are named after their ticket number.",
+            "name branches after the ticket number",
+        )])),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let learner = learner_with_sink(&store, &script, config(), Arc::clone(&sink));
+
+    learner.observe(&[user("Remember: name branches after the ticket number.")]);
+    settle(&learner).await;
+
+    assert_eq!(
+        *sink.usage.lock().unwrap(),
+        vec![
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: 3,
+                cached_input_tokens: 4,
+                cache_write_tokens: 5,
+                cost: Some(0.25),
+            },
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: 3,
+                cached_input_tokens: 4,
+                cache_write_tokens: 5,
+                cost: Some(0.25),
+            },
+        ]
+    );
+    assert_eq!(
+        *sink.health.lock().unwrap(),
+        vec![
+            LearnHealth {
+                consecutive_failures: 1,
+                failure: Some(LearnFailure::NoReply),
+            },
+            LearnHealth {
+                consecutive_failures: 2,
+                failure: Some(LearnFailure::UnreadableReply),
+            },
+            LearnHealth::default(),
+        ]
+    );
+    let changes = sink.changes.lock().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change, LearnChange::Added);
+    assert_eq!(
+        changes[0].note.statement,
+        "Branches are named after their ticket number."
+    );
+    assert!(changes[0].replaced.is_none());
+    assert_eq!(learner.health(), LearnHealth::default());
+}
+
+#[tokio::test]
 async fn three_failures_in_a_row_give_the_batch_up() {
     let (_tmp, store) = store();
     let script = Script::new(vec![Reply::Fail, Reply::Fail, Reply::Fail, Reply::Fail]);
@@ -583,7 +780,14 @@ async fn three_failures_in_a_row_give_the_batch_up() {
         0,
         "a poisoned slice is not retried for ever"
     );
-    assert!(learned(&store).await.is_empty());
+    assert_eq!(learned(&store).await.len(), 0);
+    assert_eq!(
+        learner.health(),
+        LearnHealth {
+            consecutive_failures: 3,
+            failure: Some(LearnFailure::NoReply),
+        }
+    );
 }
 
 #[tokio::test]
@@ -675,7 +879,7 @@ async fn a_note_whose_quote_is_invented_is_refused_by_the_store() {
     let learner = learner(&store, &script, config());
     learner.observe(&[user("Remember to be careful with deploys.")]);
     settle(&learner).await;
-    assert!(learned(&store).await.is_empty());
+    assert_eq!(learned(&store).await.len(), 0);
     let stats = learner.stats();
     assert_eq!((stats.added, stats.rejected), (0, 1));
     assert_eq!(
@@ -836,10 +1040,155 @@ async fn the_learner_says_why_a_call_failed_a_reply_was_unreadable_or_a_note_was
     );
 }
 
+#[tokio::test]
+async fn a_successful_extraction_clears_prior_failure_diagnostics() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Fail,
+        Reply::Fail,
+        reply(&json!([])),
+    ]);
+    let learner_a = learner(&store, &script, config());
+
+    learner_a.observe(&[user("Remember something that will fail.")]);
+    settle(&learner_a).await;
+    assert!(learner_a.diagnostics().last_error.is_some());
+
+    learner_a.observe(&[
+        user("Remember something that will fail."),
+        user("Remember something that will succeed."),
+    ]);
+    settle(&learner_a).await;
+    let diagnostics = learner_a.diagnostics();
+    assert_eq!(diagnostics.last_error, None, "{diagnostics:?}");
+    assert_eq!(diagnostics.last_unreadable_reply, None, "{diagnostics:?}");
+
+    let unreadable = "not a memories document".to_owned();
+    let script = Script::new(vec![
+        Reply::Text(unreadable.clone()),
+        Reply::Text(unreadable.clone()),
+        Reply::Text(unreadable),
+        reply(&json!([])),
+    ]);
+    let learner_b = learner(&store, &script, config());
+    learner_b.observe(&[user("Remember another thing that will fail.")]);
+    settle(&learner_b).await;
+    assert!(learner_b.diagnostics().last_unreadable_reply.is_some());
+
+    learner_b.observe(&[
+        user("Remember another thing that will fail."),
+        user("Remember another thing that will succeed."),
+    ]);
+    settle(&learner_b).await;
+    assert_eq!(learner_b.diagnostics().last_unreadable_reply, None);
+}
+
 #[test]
 fn the_schema_asks_for_nothing_a_strict_provider_commonly_rejects() {
     let text = response_schema().schema.to_string();
     assert!(!text.contains("\"null\""), "no nullable unions: {text}");
     assert!(!text.contains("anyOf") && !text.contains("oneOf"), "{text}");
     assert!(text.contains("\"additionalProperties\":false"));
+}
+
+// ----- withdrawing consent -----
+
+async fn wait_for_calls(script: &Script, calls: usize) {
+    for _ in 0..500 {
+        if script.count() >= calls {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("the extractor was never called {calls} times");
+}
+
+#[tokio::test]
+async fn cancelling_drops_a_call_in_flight_and_reports_nothing() {
+    let (_tmp, store) = store();
+    let gate = Arc::new(Semaphore::new(0));
+    let script = Script::gated(
+        vec![reply(&json!([note(
+            "Branches are named after their ticket number.",
+            "name branches after the ticket number",
+        )]))],
+        Arc::clone(&gate),
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let learner = learner_with_sink(&store, &script, config(), Arc::clone(&sink));
+    learner.observe(&[user("Remember: name branches after the ticket number.")]);
+    wait_for_calls(&script, 1).await;
+
+    learner.cancel();
+    // The call was never released, yet the learner goes idle: the call itself was dropped.
+    settle(&learner).await;
+    gate.add_permits(10);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(learned(&store).await.is_empty(), "the reply was not stored");
+    assert!(
+        sink.changes.lock().unwrap().is_empty(),
+        "nothing was reported"
+    );
+    assert_eq!(learner.pending_turns(), 0, "what was waiting is forgotten");
+    assert_eq!(script.count(), 1);
+    assert!(learner.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancelled_learner_does_not_retry_a_failed_batch_or_take_new_text() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        reply(&json!([note(
+            "Dependencies are managed with pnpm.",
+            "always use pnpm",
+        )])),
+    ]);
+    let mut slow = config();
+    slow.retry_delay = Duration::from_millis(300);
+    let learner = learner(&store, &script, slow);
+    let mut history = vec![user("Remember: always use pnpm.")];
+    learner.observe(&history);
+    wait_for_calls(&script, 1).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    learner.cancel();
+    history.push(user("Remember: more text after the withdrawal."));
+    learner.observe(&history);
+    learner.flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(script.count(), 1, "the failed batch was not sent again");
+    assert_eq!(learned(&store).await.len(), 0);
+    assert_eq!(
+        learner.pending_turns(),
+        0,
+        "text offered after cancel is not read"
+    );
+}
+
+#[tokio::test]
+async fn the_log_never_carries_control_or_bidirectional_characters_from_a_reply() {
+    let (_tmp, store) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("learn.log");
+    let mut logging = config();
+    logging.log = Some(path.clone());
+    logging.max_failures = 1;
+    let script = Script::new(vec![Reply::Text(
+        "\u{1b}[31mred\u{202e}reversed\u{200b}zero\u{85}c1 and not json".to_owned(),
+    )]);
+    let learner = learner(&store, &script, logging);
+    learner.observe(&[user("Remember: this is only to trigger a call.")]);
+    settle(&learner).await;
+    let lines = log_lines(&path);
+    let head = lines[0]["reply_head"].as_str().unwrap();
+    assert!(head.contains("red"), "{head}");
+    assert!(
+        head.chars()
+            .all(|c| !c.is_control() && !matches!(c, '\u{202e}' | '\u{200b}' | '\u{85}')),
+        "{head:?}"
+    );
 }

@@ -6,7 +6,7 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M3: a provider-backed coding loop behind a daemon, driven by either a
+The repository is at M3, plus M3.1 and the memory-facing parts of M5, M6 and M7 (see `MILESTONES.md`): a provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
 relevant context and gives the model a search tool, and durable notes learned from conversations.
 The implemented vertical slice can:
@@ -23,7 +23,11 @@ The implemented vertical slice can:
 - add an ephemeral block of relevant files, and of notes learned in earlier sessions, to each turn,
   and a short repository brief to each session, none of which enters history;
 - ask a model, in the background, what is worth remembering from a conversation, and keep only what
-  survives verification (quote present, wording safe, evidence from the right speaker); and
+  survives verification (quote present, wording safe, evidence from the right speaker) — after the
+  person has said yes, once, to a question that names the model and what is sent;
+- show and control that memory from the clients: a `/memory` panel and `/forget <id>` in the TUI, a
+  transcript line for each note learned or used, `memory:` lines on a headless terminal's stderr,
+  and `elefante memory` going through the daemon when one is running; and
 - continue the conversation until the provider ends the turn, refuses, is interrupted, or
   reaches a configured round limit.
 
@@ -246,8 +250,9 @@ policy calls.
 
 Both shipped in M1 and are covered by its gate. `rpc` holds the wire types shared by daemon and
 client; `srv` is the daemon itself — socket, session registry, ring, and bounded delivery.
-Section 5 is the contract they implement. M2 added no method, notification, or error code: the
-wire contract is untouched. `srv` additionally owns the lifetime of each repository's index (below).
+Section 5 is the contract they implement. M2 added no method, notification, or error code; the
+memory additions (the `memory` result field, three events, six methods, two error codes) are
+listed under **Memory wire** in §5. `srv` additionally owns the lifetime of each repository's index (below).
 
 ### `elefante-mem`
 
@@ -323,8 +328,17 @@ detail; the contract is:
   note is no longer retrieved and compaction removes it.
 - *Presentation.* A separate `<repo-memory>` section, at most 400 estimated tokens, framed as
   unverified notes. A query with no notes renders exactly what it did before they existed.
-- *Controls.* `elefante memory list | forget | approve | clear`.
-- *Switches.* `ELEFANTE_LEARN=0` stops extraction alone; `ELEFANTE_MEMORY=0` stops everything.
+- *Controls.* `elefante memory list | forget | approve | clear | learn on|off`. They go through the
+  daemon (`memory.*` by `cwd`) when one is listening and open the store directly when none is.
+  `list` checks the stamp first and prints only an explanation for a foreign store.
+- *Display.* Every string a person or a client sees (all columns, every `Note` on the wire) goes
+  through `learn::display_safe`, which removes Unicode categories Cc, Cf, Zl and Zp and collapses
+  whitespace. The same function strips candidates at ingest, so notes are stored clean; older
+  rows are cleaned at display.
+- *Consent.* Learning asks first (see **Memory wire** in §5). Until a person answers, the daemon
+  never calls `Learner::observe`, so nothing is read or held, and a later "yes" is not retroactive.
+- *Switches.* `ELEFANTE_LEARN` unset asks, `1`/`on` is the operator's consent, `0`/`off` stops
+  extraction alone; `ELEFANTE_MEMORY=0` stops everything.
   `ELEFANTE_EXTRACT_MODEL` and `ELEFANTE_EXTRACT_EFFORT` choose the extractor, defaulting to the
   session's model at low effort.
 
@@ -408,7 +422,8 @@ will not round-trip our notifications**. Both sides hand-roll the envelope.
   and across reconnects. `session.create` returns 0, so the first event is 1.
 - `turn_id` groups events; "the third event of turn 7" is counted client-side, so there is no
   second counter to keep in sync.
-- Events outside a turn carry `turn_id: null`.
+- Events outside a turn carry `turn_id: null`. `memory.status` and `memory.learned` always do, even
+  when a turn happens to be running: they belong to the session, not to that turn.
 
 A gap in `seq` means the client missed something and must resynchronise. It must never be read
 as "nothing happened."
@@ -419,13 +434,19 @@ Client → server:
 
 | Method | Params | Result |
 |---|---|---|
-| `session.create` | `{ cwd, model?, effort?, max_rounds?, max_tokens? }` | `{ session_id, seq }` |
+| `session.create` | `{ cwd, model?, effort?, max_rounds?, max_tokens? }` | `{ session_id, seq, memory? }` |
 | `session.prompt` | `{ session_id, text }` | `{ turn_id }` — notifications follow |
 | `session.interrupt` | `{ session_id }` | `{}` |
 | `session.attach` | `{ session_id, since?: number }` | see **Attach and resume** |
 | `session.close` | `{ session_id }` | `{}` |
 | `session.resolve_approval` | `{ session_id, approval_id, decision: "allow" \| "deny" }` | `{}` |
 | `key.set` | `{ api_key }` | `{}` — first-run setup |
+| `memory.consent` | `{ answer: "learn" \| "off" }` | `{ consent }` — see **Memory wire** |
+| `memory.list` | `{ cwd, all?: bool }` | `{ notes: [Row] }` |
+| `memory.forget` | `{ cwd, id }` | `{}` |
+| `memory.approve` | `{ cwd, id }` | `{}` |
+| `memory.clear` | `{ cwd }` | `{ removed }` |
+| `memory.status` | `{ cwd }` | `MemoryStatus` |
 
 `session.create` validates `cwd`: it must exist, be a directory, and be canonicalisable. A
 long-lived daemon that roots a `ToolExecutor` at any path a caller names is a larger blast
@@ -447,6 +468,9 @@ Server → client notifications:
 | `approval.resolved` | `{ approval_id, approved }` |
 | `turn.finished` | `{ stop_reason, usage }` |
 | `session.error` | `{ message }` — turn ended abnormally, always followed by `turn.finished` |
+| `memory.status` | `MemoryStatus` — session event, `turn_id: null` |
+| `memory.learned` | `{ note, change, replaced? }` — session event, `turn_id: null` |
+| `memory.context` | `{ notes }` — carries the turn's `turn_id` |
 
 `approval.requested` carries **no `reason`**: `BashDecision` has `verdict` and `rule` only, and
 a prose reason is the M4 triage-critic verdict.
@@ -511,6 +535,8 @@ mark discards 413 and 414 as already-seen. **Client-side dedupe is therefore a s
 the resume window, not a watermark** — a watermark cannot distinguish "already applied" from
 "arrived out of order."
 
+Both `resumed` and `snapshot` results also carry the optional `memory` object (see **Memory wire**).
+
 The snapshot is materialised state, not an event log: `session_id`, `seq`, `cwd`, `model`,
 completed `turns[]`, and `active_turn` (null when idle). Tool entries use **one shape
 everywhere** — `{ tool_call_id, name, state, is_error }` — in both, so the reducer never
@@ -542,7 +568,7 @@ operation.
 transport*, and only under load — so issue #4 would reappear as an intermittent defect no
 render-site fix could reach. A queue fed `reasoning, reasoning, text, text` emits **two**
 events, not one. Discrete events — `tool.started`, `tool.finished`, `approval.requested`,
-`turn.finished` — are never merged or dropped.
+`turn.finished`, and the three `memory.*` events — are never merged or dropped.
 
 Coalescing only helps on runs of the same method, so a turn interleaving
 `text, tool.started, text, tool.finished` coalesces nothing and a hung client on that workload
@@ -583,9 +609,114 @@ Standard JSON-RPC error objects, application codes in the `-32000` range:
 | `-32003` | `since` exceeds the session's current `seq` — the client claims events that do not exist. A `since` that merely predates the ring is **not** an error; it returns a snapshot. |
 | `-32004` | No API key configured — client should prompt and call `key.set` |
 | `-32005` | Unknown approval id, or approval already resolved |
+| `-32006` | `UNKNOWN_NOTE`: `memory.forget` or `memory.approve` named a note that is absent, is not a learned note, or (for approve) is not pending |
+| `-32007` | `MEMORY_OFF`: a `memory.list`, `forget`, `approve`, `clear` or `status` for a `cwd` whose repository has no usable store — `ELEFANTE_MEMORY=0`, no repository root (`/`, `$HOME`), or the store could not be opened |
 
 Transport and provider failures *inside* a turn are not RPC errors — the request already
 succeeded. They arrive as `session.error` followed by `turn.finished`.
+
+### Memory wire
+
+Everything the learned-memory feature adds to the protocol. It is additive: nothing above changed
+shape, and a client that ignores it loses only the memory UI.
+
+**State is truth, events are hints.** What a client must rely on — consent, note counts, whether
+learning is working, cumulative memory spend — is the `memory` object, which arrives in the
+`session.create` result and in **both** `session.attach` result kinds (`resumed` and `snapshot`),
+as a sibling of `kind`. A lost event costs a missing transcript line, never a wrong total. The
+field is optional: a daemon that omits it means "no memory UI", and a client must show nothing.
+
+```jsonc
+"memory": {
+  "enabled": true,            // ELEFANTE_MEMORY is on and this repository's store opened
+  "consent": "granted",       // "unset" | "granted" | "declined" | "off"
+  "learning": "working",      // "working" | "paused" | "failing"
+  "extractor": "provider/model",   // null unless learning could run in this session
+  "notes": { "active": 12, "pending": 1 },   // learned notes in the repository's store
+  "index": "ready",           // "off" | "building" | "ready"
+  "spend": { /* Usage: this session's cumulative extractor spend, cost null until reported */ },
+  "problem": null             // fixed vocabulary below, or null
+}
+```
+
+- `consent`: `granted` and `declined` are the person's answer for **this extractor model**;
+  `unset` means no answer (or one made for a different extractor, or an unreadable file); `off`
+  means the operator switch is off (`ELEFANTE_LEARN=0`, or `ELEFANTE_MEMORY=0`). `unset` with
+  `extractor: null` means the session has nothing to ask about (memory unavailable for it); a
+  client asks only when `consent` is `unset` **and** `extractor` is not null.
+- `learning`: `working` only when memory is enabled and consent is `granted`; `failing` when, in
+  addition, the learner has failed three times in a row (cleared by the next success); `paused` is
+  every other state, including `declined` and `off`, so read `consent` for why. In `paused`
+  **no conversation text has been read or kept**, and a later grant is not retroactive: a turn is
+  read only if consent was granted when it began and still is when it ends.
+- `problem` is never the provider's text. It is one of `"the provider refused the request (HTTP
+  <status>)"`, `"no reply from the provider"`, `"the reply could not be read"`, `"the memory key is
+  unavailable"` (also reported when memory is on but the store did not open), or `"memory was
+  reset: it was not made by this installation"` (the store was rebuilt; cleared when the next turn
+  ends). The status code is the only provider-supplied datum.
+- `spend` is per session and cumulative, so displayed cost is the client's turn total plus
+  `spend.cost`, and a snapshot restores it exactly. There is no usage event.
+- `notes` and `index` describe the repository store, which sessions in one repository share.
+
+**Events.** Three notifications, in the ordinary ring and sequence space:
+
+| Event | Params | When |
+|---|---|---|
+| `memory.status` | `MemoryStatus` | Any field of the session's status changed: after an extraction commits, spend or health changes, a turn ends (this clears the rebuilt-store `problem`), or a `memory.consent` answer arrives (sent to **every** live session). Not sent at create or attach: those return the status. |
+| `memory.learned` | `{ note, change, replaced? }`; `change` is `added`, `promoted`, `superseded` or `revived`; `replaced` is the retired note for `superseded` | After an ingest, one per changed note (at most 8 per extraction). A **reinforced** note emits nothing. `turn_id` is always `null`. A `memory.status` follows when the counts changed. |
+| `memory.context` | `{ notes }` | At turn start, directly **after** `turn.started`, only when learned notes were injected into that turn. It carries the turn's `turn_id`. |
+
+`note` is `{ id, kind, status, statement, origin }`; every field has already passed
+`learn::display_safe` (no control, bidirectional or zero-width characters). A `pending` note
+(only the assistant vouched for it) is a valid `memory.learned` payload but is never used by the
+model until approved, and the shipped clients draw no line for it.
+
+**`memory_note_ids`.** Both `CompletedTurn` and `ActiveTurn` in a snapshot carry the ids of the
+learned notes injected into that turn. The field is a list of integers, empty when none, and is
+omitted by the Rust types when empty; read an absent field as empty. The daemon fills it from
+`memory.context`, so a client attaching late can still say a turn used notes.
+
+**Lenient clients.** A notification with an unrecognised `method` is not an error. The Rust
+`NotificationEvent` deserialises it as `Unknown { method }` (never serialised), the TypeScript
+parser accepts it, and both ignore it while still counting its `seq`. The Rust parser still
+requires an object `params`, a `turn_id` and a valid sequence. New events therefore never need a version field
+and share the one sequence space, so `seq` has no holes for any client.
+
+**Methods.** The `memory.*` methods other than `consent` take a `cwd`, not a `session_id`: they work
+with no session open, and after the session that learned a note has closed. `cwd` is validated like
+`session.create`'s and resolved to a repository root; the daemon opens that repository's store on
+demand, without starting an indexer refresh.
+
+| Method | Result and behaviour |
+|---|---|
+| `memory.list` | `{ notes: [Row] }`; `Row` is a `Note` plus `confidence` (effective, after decay), `verified` and `reinforcements`. `all: true` includes superseded notes. |
+| `memory.forget` `{cwd,id}` | `{}`. `UNKNOWN_NOTE` if the id is absent or not a learned note. Index rows can never be forgotten through it. |
+| `memory.approve` `{cwd,id}` | `{}`. Promotes a pending note. `UNKNOWN_NOTE` if there is no such pending note. |
+| `memory.clear` `{cwd}` | `{ removed }`. Deletes every learned note and leaves the code graph alone. |
+| `memory.status` `{cwd}` | A `MemoryStatus`. With live sessions in that repository it is deterministic: the most recently created session speaks for consent and extractor, `spend` is the sum over all of them, and one failing session makes it `failing`. With none, a fresh one for the default extractor; with no store at all, one with no notes and `enabled: false`. |
+| `memory.consent` `{answer, extractor?}` | `{ consent }`, the resulting state. User-level, not per repository: it persists, applies to every live session whose extractor it names at once, and emits `memory.status` to each. An answer is **for one extractor model**: `extractor` if given (a blank one is `-32602`), else the extractor of the **last session this connection created or attached**, else the configured default extractor (`ELEFANTE_EXTRACT_MODEL`, `OPENROUTER_MODEL`, the built-in default). Answering for one model neither grants nor withdraws anything for another. When the operator switch decides (`ELEFANTE_LEARN` is `1`/`on` or `0`/`off`), it changes nothing and returns `off` or `granted`. An answer that revokes consent discards any text the learner was holding. |
+
+These methods **never create or rebuild a store**; only starting a session may. With no store
+beneath the directory they answer as an empty store would (`list` → `[]`, `clear` → `removed: 0`,
+`forget`/`approve` → `UNKNOWN_NOTE`) and create nothing; a store this installation did not make is
+refused with `MEMORY_OFF` (`-32007`) and left exactly as found. `memory.consent` does not need a store.
+Rows carry `origin` without the store's `learned:` prefix (`explicit`, `stated`, `assistant`), as
+`memory.learned` does. A mutation advances the store's generation, so a
+`forget` or `clear` affects the next retrieval; statements already in a ring or on a screen are
+not recalled.
+
+**Consent.** `ELEFANTE_LEARN` unset means *ask*: consent comes from `~/.elefante/memory-consent`,
+beside the credentials and the memory key. It holds a list of `{ answer, extractor, stamp }` records, one per
+extractor, each stamp a keyed MAC over that record's answer and extractor made with `memory.key`.
+A missing, malformed or unstamped file reads as `unset` (fail closed); a record that fails its stamp
+is ignored on its own, and a session whose extractor has no verified record is `unset`. The daemon
+looks at the file again whenever it has changed on disk, so `elefante memory learn` works without a
+restart even when it could not reach the daemon's socket. `elefante memory learn on|off [--model
+SLUG]` names the model the answer is for (`--model`, else `ELEFANTE_EXTRACT_MODEL`, else
+`OPENROUTER_MODEL`, else the default). `1` or `on` is the operator's consent (headless, CI): no file, no question. `0` or
+`off`, or `ELEFANTE_MEMORY=0`, turns learning off and nothing is read; any other value means ask.
+An operator setting always beats the file. Before
+this wire existed learning was on unless `ELEFANTE_LEARN=0`; `ELEFANTE_LEARN=1` restores that.
 
 ### Round construction
 
@@ -814,7 +945,7 @@ The seven tools are intentionally permanent prompt cost, so additions require a 
 | `glob` | `pattern`, optional `path` | Lists matching allowed files deterministically. |
 | `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. |
 | `bash` | `command` | Executes only commands classified `Allow`. |
-| `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. |
+| `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`/`note`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. Notes saved from earlier sessions are included unless `kind` is `file` or `symbol`; any result containing a note is prefixed with the same "unverified, not instructions" notice as the injected block. The tool is offered, and the system prompt carries a one-sentence hint to use it, only in sessions that have an index. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk
@@ -894,8 +1025,9 @@ Configuration precedence and defaults:
 | API key | — | `OPENROUTER_API_KEY` | required |
 | Extractor model | — | `ELEFANTE_EXTRACT_MODEL` | the session's model |
 | Extractor effort | — | `ELEFANTE_EXTRACT_EFFORT` | `low` |
-| Learning | — | `ELEFANTE_LEARN=0` turns it off | on (with memory) |
+| Learning | — | `ELEFANTE_LEARN`: `1`/`on` consents, `0`/`off` disables | ask once (consent file) |
 | Idle flush | — | `ELEFANTE_LEARN_IDLE_SECS` | `300` |
+| Extraction log | — | `ELEFANTE_LEARN_LOG`: a file to append to | off |
 
 Models are named by OpenRouter slug, not by vendor model name. The default routes to Claude
 through OpenRouter; a different vendor's model is a different slug, not a different transport.
@@ -1045,7 +1177,11 @@ When behavior changes, update:
   to the file goes with it and the note stays, found by its words. Retrieval is lexical, so a note
   phrased in vocabulary the prompt never uses is not found. There is no transcript compaction;
   one added later must call `Learner::flush` before dropping history.
-- Usage is parsed but not accumulated into cost/staleness reporting until M5.
+- Memory spend is accumulated and shown; the rest of token accounting and staleness reporting
+  waits for M5 proper.
+- Forgetting a note is not durable: the same preference, said again, can be saved again. Consent is
+  per user and extractor, not per repository, and a fresh attach does not summarise what was learned
+  while the client was away. `docs/MEMORY-UI-DESIGN.md` § 13 keeps the open questions.
 - There is no model-backed critic.
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and
   sessions live only in daemon memory — they end with `session.close` or the daemon's idle exit.

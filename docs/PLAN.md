@@ -206,6 +206,12 @@ here". The learned-memory milestone ships the extractor role as environment vari
 (`ELEFANTE_EXTRACT_MODEL`, `ELEFANTE_EXTRACT_EFFORT`); this flow later becomes their home, and the
 variables stay as overrides.
 
+M3.1's launch-time consent question is the stopgap for step 3 until this flow exists; when it lands,
+step 3's sentence *is* the consent question, and answering the picker records the same stamped consent
+bound to the chosen model. **The stopgap has shipped** (M3.1, below): the TUI asks once, the answer is
+stored in `~/.elefante/memory-consent` bound to the extractor, and `elefante memory learn on|off` answers
+headlessly. Steps 1 and 2, the pickers, and the whole flow remain unbuilt.
+
 Open for its design pass: whether the flow is re-runnable (a `setup` subcommand or TUI command)
 so a changed mind does not mean editing a file by hand, and whether the critic and triage roles
 join the flow when they exist or stay in `config.toml` as advanced settings.
@@ -389,8 +395,9 @@ Constraints that follow from the existing design, to be honoured when the design
   prompt cache once its TTL has lapsed; that is a cost, not a defect.
 - **Transcripts are secrets-adjacent.** User prompts are not scrubbed today and can contain a
   pasted key. Every durable write goes through `Scrubber`, the same call site M3 uses for memory
-  rows. The path policy also denies only `.elefante/credentials.toml`; once transcripts live in
-  `<repo>/.elefante/`, whether the agent may read its own history is a decision, not a default.
+  rows. The path policy now denies everything beneath `.elefante/` (harness state: learned notes, the
+  index, keys), for tools and for bash arguments alike; a transcript store placed there is therefore
+  hidden from the agent by default, and exposing it would be a deliberate exception.
 - **Snapshot growth gets decided here.** Developer guide §14 open question 1 — snapshots grow
   without bound per session — becomes real once conversations live for weeks. Paging completed
   turns, or capping the snapshot to the last N with the rest fetched on demand, is part of M6.
@@ -830,6 +837,30 @@ future compactor drops has already been read.
 - **M0–M2 gates still green.**
 - **Credentialed, once:** `live_learned_memory_is_extracted_stored_and_used`.
 
+### M3.1 — Learned-memory hardening and consent
+
+**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)). Follow-up to M3, designed in [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) (§ 7, § 8). It fixes two
+defects found in the merged code and changes one default; the rest of that document is assigned to M5,
+M6 and M7 below.
+
+**Baseline.** `learn::display_safe` (Unicode categories Cc, Cf, Zl, Zp) applied at ingest and to every
+column the CLI prints; `elefante memory list` verifies the store's stamp; the learner clears its failure
+state on success. `ELEFANTE_LEARN` becomes `LearnMode { Off, Ask, On }` with **unset meaning Ask**: the
+TUI asks once at launch (Y/N, no default, `Esc` asks later), the answer is stored beside the credentials
+with a keyed stamp and is bound to the extractor model, and until it is given the daemon reads and keeps
+nothing. `elefante memory learn on|off` answers headlessly; `memory.consent` and an additive
+`memory: { consent, extractor }` field on the create/attach results carry it.
+
+**Gate.**
+- No note, stored or displayed, holds a control or formatting character in any column; an unstamped
+  store prints nothing.
+- No extractor request is made before consent, on any client; the answer persists, is bound to the
+  extractor, is tamper-evident, and `ELEFANTE_LEARN` overrides it.
+- An old client ignores the new result field; a new client against a result without it shows no modal.
+- Nothing but the launch-time modal opens an overlay or takes focus; with consent granted the screen is
+  byte-identical to today's.
+- **M0–M3 gates still green.**
+
 ### M4 — Critics
 
 **Baseline.** `Critic` trait; bash escalation; plan and diff critics with structured findings; bounded revision loop; findings → memory. A critic runs on a different vendor's model by changing a slug — no second integration — so this milestone is single-concern.
@@ -844,12 +875,30 @@ future compactor drops has already been read.
 
 **Baseline.** Per-turn accounting from `usage`, cache-hit reporting, standing prompt overhead, staleness signals, cost attribution by role. Cost comes from `usage.cost` on each response rather than a local price table — the provider reports what the generation actually cost, including cache discounts, so there is no table to keep current.
 
+**Memory is the first background role to be accounted for.** *The memory parts of this milestone have
+shipped — `MemoryStatus`, `memory.status`, lenient clients, `View::emit_session`, the consecutive-failure
+count, `Store::reset_reason()`, the single cost total and the status suffix. `session.stale` and the rest
+of token analysis (the baseline above and every gate item that is not about memory or unknown events) are
+unbuilt, so M5 stays open.* The learned-memory extractor spends money
+the turn totals never see, so this milestone adds the full `MemoryStatus` from
+[`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) § 4.1 (grown in place from M3.1's `memory` field):
+consent, learning working/paused/failing, cumulative memory spend, and a fixed-vocabulary problem
+reason, carried in create/attach results and snapshots and refreshed by a `memory.status` event. The
+displayed cost becomes one total including memory. It is also the first milestone with a new
+notification event (`session.stale`, below), so **lenient clients** ship here: both parsers accept an
+unknown `method`, the Rust one through a hand-written `Deserialize` with `Unknown`, and new events share
+the existing `seq` space. Needs `View::emit_session` (events that belong to no turn), the learner's
+consecutive-failure count, and `Store::reset_reason()`.
+
 **Gate.**
 - Reported session cost equals the sum of per-response `usage.cost` for a scripted session against recorded fixtures.
 - Cache reporting distinguishes `cached_input_tokens` (reads) from `cache_write_tokens` (writes); a session with zero reads across repeated identical prefixes is surfaced as a warning, not silently.
 - `reasoning_tokens` are attributed separately from `output_tokens`, so effort changes are visible in the accounting.
 - Standing system-prompt overhead is reported and is **under the ~400-token target** — the number that makes conviction #1 enforced rather than aspirational.
 - Staleness signals fire on a synthetic session built to trigger each one.
+- Both clients ignore an unknown event, including one with params, and `seq` has no holes for any client.
+- `MemoryStatus` is correct for every switch and degradation, from a fresh attach and from a snapshot;
+  displayed cost equals turn usage plus cumulative memory spend and survives a reattach.
 - **M0–M4 gates still green.**
 
 ### M6 — Conversation history
@@ -865,7 +914,11 @@ with `--session ID` and `--new` to bypass it.
 what the live view discards. Today `View.turns` omits reasoning and truncates tool input and
 output to 2 KiB previews; the durable record instead holds, per turn: the prompt, the visible
 reasoning text, the answer, every tool call with its **full** input, output, duration, and
-approval decision, `stop_reason`, and `usage`. Encrypted reasoning blocks are replay state, not
+approval decision, `stop_reason`, and `usage` — and the ids of any learned notes injected into the turn
+(`InjectedContext` from [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) § 5), since what shaped a turn
+is part of auditing it. *`InjectedContext`, the `memory.context` event and `memory_note_ids` on snapshots
+have shipped (the in-daemon half of this audit); the durable record, and everything else in this
+milestone, has not.* Encrypted reasoning blocks are replay state, not
 readable text, and are stored only as the history needs them for resume — an audit cannot read
 what the provider does not disclose. Everything passes `Scrubber` on write, as above.
 
@@ -908,11 +961,44 @@ a third party:
   and with the endpoint down or slow the turn still completes and the sink drops rather than
   blocks.
 - With no sink configured, nothing is sent anywhere.
+- The stored record of a turn that received learned notes names them by id; a turn that received none
+  records none.
 - A second resume of a live conversation is refused with a named error; `session.close` ends the
   live session and leaves the stored conversation listed; `session.delete` removes it.
 - The TUI picker shows live and stored conversations in one list, bypasses on `--session` and
   `--new`, and a headless one-shot is unchanged.
 - **M0–M5 gates still green.**
+
+### M7 — Memory in the UI
+
+**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)), together with M3.1 and the memory parts of M5
+and M6. Two departures from the baseline below: the `/memory` panel is a standalone modal, not built on
+M6's list overlay (which does not exist), and the panel lists and forgets only — approve, history and
+clear stay in `elefante memory`. A tombstone for forgotten notes, per-repository consent and a "recent"
+summary on attach remain open (`MEMORY-UI-DESIGN.md` § 13).
+
+**Baseline.** The user-facing half of learned memory, specified in
+[`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) (§ 4.2, 4.3, 6). Depends on M5 (state, events, lenient
+clients) and M6 (`repo_root`, the list overlay, injected-note ids).
+- `LearnSink` and the `memory.learned` and `memory.context` events; a learned note becomes a persistent
+  transcript line (`◇ remembered: … /forget 14`), and a turn that used notes shows
+  `◇ used N saved notes`. Nothing is added to the screen while memory is healthy.
+- `memory.list | forget | approve | clear`, keyed by `cwd` so they work with no session open; the daemon
+  is the preferred writer and `elefante memory` uses it when it is running, falling back to the
+  database directly.
+- A `/memory` panel (list, forget, close; provenance in words, built on M6's list overlay) and
+  `/forget <id>`; a slash command matches only exactly `/memory` or `/forget <integer>`.
+- The headless client's stderr lines.
+
+**Gate.**
+- `memory.learned` and `memory.context` carry the right `turn_id` and ordering; a reinforced note emits
+  nothing; bursts are bounded.
+- `forget`, `approve` and `clear` through the daemon take effect on the next retrieval and in
+  `MemoryStatus`; the CLI works with and without a daemon; `clear` leaves the code graph alone.
+- The panel never lets a key reach the prompt or interrupt a turn; `/usr/bin` and a pasted block are
+  prompts; control characters in a note never reach a renderable.
+- With learning working, the status line and screen layout are unchanged.
+- **M0–M6 gates still green.**
 
 ---
 
@@ -929,6 +1015,10 @@ Noted now so the architecture accommodates them, not built yet:
   Decide first whether collapse is global or per turn, whether it survives reattach (snapshots do
   not carry completed reasoning), and whether it should default to collapsed once a turn ends.
 - **Hooks and plugins.**
+- **Memory follow-ups after M7**, each needing a decision [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md)
+  § 13 leaves open: a tombstone so a forgotten note is not re-learned (key on the statement's hash or
+  its words); consent per repository for repositories marked sensitive; a bounded "learned while you
+  were away" summary on attach.
 - **Resolution beyond tier 1** — workspace-crate imports (`use elefante_core::…`), `tsconfig` paths and bare package imports; deferred from M2 because each is a second parser for a signal tier-1 edges and co-change already approximate. Also a call/reference graph and `.js`/`.jsx` extraction.
 - **Python and C/C++ extraction** — planned, after M3. A language is a grammar crate, an extractor and a
   resolver apiece (plus one registry line in `extract::language_for` and one arm in `resolve::resolve`),

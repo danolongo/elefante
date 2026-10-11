@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -12,15 +12,28 @@ use std::{
 
 use anyhow::Context as _;
 use elefante_core::{
-    ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate,
-    learn::{LearnConfig, Learner},
+    ApprovalOutcome, ApprovalSink, Note as CoreNote, OutputEvent, RunConfig, Session, ToolGate,
+    learn::{
+        ChangedNote, ENV_MODEL, LearnChange, LearnConfig, LearnFailure, LearnHealth, LearnSink,
+        Learner,
+    },
     memory::{MemContext, MemSearchTool},
 };
 use elefante_mem::{
-    Indexer, MemKey, RepoId, Store, indexer::IndexOptions, retrieve::Retriever, trust::KEY_FILE,
+    Indexer, MemKey, RepoId, Store, StoreDir,
+    consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
+    indexer::IndexOptions,
+    learn,
+    retrieve::Retriever,
+    schema::open_memory_reader,
+    trust::KEY_FILE,
 };
-use elefante_provider::{ModelId, OpenRouterProvider, Provider};
-use elefante_rpc::{Notification, NotificationEvent, truncate_preview};
+use elefante_provider::{Message, OpenRouterProvider, Provider};
+use elefante_rpc::{
+    MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
+    MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
+    UNKNOWN_NOTE, Usage, truncate_preview,
+};
 use elefante_tools::ToolExecutor;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -46,13 +59,19 @@ pub struct DaemonConfig {
     /// Index repositories and give sessions context from them. `ELEFANTE_MEMORY=0` turns it all
     /// off: no store is opened, nothing is written under `.elefante/`, no context is added.
     pub memory: bool,
-    /// Learn from conversations: ask a model, after turns, what is worth remembering.
-    /// `ELEFANTE_LEARN=0` turns this off alone; `ELEFANTE_MEMORY=0` turns it off with the rest.
-    pub learn: bool,
+    /// Whether learning is disabled, explicitly enabled, or waits for file-backed consent.
+    pub learn: LearnMode,
     /// How long after a session's last turn anything the learner is still holding is extracted.
     pub learn_idle: Duration,
     /// How long one extraction call may take before it counts as a failure.
     pub learn_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnMode {
+    Off,
+    Ask,
+    On,
 }
 
 /// Resolve the test override, runtime directory, then the home-directory fallback.
@@ -78,6 +97,17 @@ fn home() -> anyhow::Result<PathBuf> {
 /// An on/off environment switch: on unless explicitly `0`.
 fn switch(value: Option<&str>) -> bool {
     value.is_none_or(|value| value.trim() != "0")
+}
+
+fn learn_mode(memory: bool, value: Option<&str>) -> LearnMode {
+    if !memory {
+        return LearnMode::Off;
+    }
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "on") => LearnMode::On,
+        Some("0" | "off") => LearnMode::Off,
+        None | Some(_) => LearnMode::Ask,
+    }
 }
 
 impl DaemonConfig {
@@ -106,7 +136,7 @@ impl DaemonConfig {
                     .context("invalid ELEFANTE_IDLE_SECS")?,
             ),
             memory,
-            learn: memory && switch(env::var("ELEFANTE_LEARN").ok().as_deref()),
+            learn: learn_mode(memory, env::var("ELEFANTE_LEARN").ok().as_deref()),
             learn_idle: Duration::from_secs(
                 env::var("ELEFANTE_LEARN_IDLE_SECS")
                     .map_or(Ok(300), |value| value.parse())
@@ -228,11 +258,150 @@ impl RepoMemory {
     }
 }
 
+/// What was last read from the consent file, and when the file was last seen to change.
+#[derive(Default)]
+struct ConsentCache {
+    answers: HashMap<String, ConsentAnswer>,
+    seen: Option<(std::time::SystemTime, u64)>,
+}
+
+/// One answer per extractor model. The file can be rewritten by `elefante memory learn` while no
+/// daemon is listening on its socket, so it is looked at again whenever it has changed on disk.
+struct ConsentGate {
+    mode: LearnMode,
+    path: PathBuf,
+    key: Option<MemKey>,
+    cache: std::cell::RefCell<ConsentCache>,
+    revision: std::cell::Cell<u64>,
+}
+
+impl ConsentGate {
+    fn new(config: &DaemonConfig) -> Self {
+        let path = config.credentials.parent().map_or_else(
+            || PathBuf::from(CONSENT_FILE),
+            |parent| parent.join(CONSENT_FILE),
+        );
+        let key = (config.memory && config.learn != LearnMode::Off)
+            .then(|| memory_key(config))
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("elefante: cannot read memory consent: {error}");
+                None
+            });
+        let gate = Self {
+            mode: config.learn,
+            path,
+            key,
+            cache: std::cell::RefCell::new(ConsentCache::default()),
+            revision: std::cell::Cell::new(0),
+        };
+        gate.sync();
+        gate.revision.set(0);
+        gate
+    }
+
+    /// Bumped whenever an answer changes, by this daemon or by a write to the file.
+    fn revision(&self) -> u64 {
+        self.sync();
+        self.revision.get()
+    }
+
+    /// Re-reads the file if it changed since it was last read.
+    fn sync(&self) {
+        let Some(key) = &self.key else {
+            return;
+        };
+        let seen = fs::metadata(&self.path)
+            .ok()
+            .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
+        let mut cache = self.cache.borrow_mut();
+        if cache.seen == seen {
+            return;
+        }
+        let answers: HashMap<String, ConsentAnswer> = consent::read_all(&self.path, key)
+            .into_iter()
+            .map(|record| (record.extractor, record.answer))
+            .collect();
+        if answers != cache.answers {
+            self.revision.set(self.revision.get().wrapping_add(1));
+        }
+        cache.answers = answers;
+        cache.seen = seen;
+    }
+
+    fn seed(&self, extractor: Option<&str>) -> MemorySeed {
+        self.sync();
+        match (self.mode, extractor) {
+            (LearnMode::Off, _) => MemorySeed {
+                consent: MemoryConsentState::Off,
+                extractor: None,
+            },
+            (LearnMode::On, Some(extractor)) => MemorySeed {
+                consent: MemoryConsentState::Granted,
+                extractor: Some(extractor.to_owned()),
+            },
+            (LearnMode::Ask, Some(extractor)) => {
+                let consent = match self.cache.borrow().answers.get(extractor).copied() {
+                    Some(ConsentAnswer::Learn) => MemoryConsentState::Granted,
+                    Some(ConsentAnswer::Off) => MemoryConsentState::Declined,
+                    None => MemoryConsentState::Unset,
+                };
+                MemorySeed {
+                    consent,
+                    extractor: Some(extractor.to_owned()),
+                }
+            }
+            (_, None) => MemorySeed {
+                consent: MemoryConsentState::Unset,
+                extractor: None,
+            },
+        }
+    }
+
+    fn answer(
+        &mut self,
+        answer: ConsentAnswer,
+        extractor: &str,
+    ) -> Result<MemoryConsentState, elefante_mem::MemError> {
+        if self.key.is_none() {
+            let directory = self
+                .path
+                .parent()
+                .ok_or_else(|| elefante_mem::MemError::Refused {
+                    path: self.path.clone(),
+                    reason: "there is no directory to keep the memory key in",
+                })?;
+            self.key = Some(MemKey::load_or_create(&directory.join(KEY_FILE))?);
+        }
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| elefante_mem::MemError::Refused {
+                path: self.path.clone(),
+                reason: "the memory key is unavailable",
+            })?;
+        let record = ConsentRecord {
+            answer,
+            extractor: extractor.to_owned(),
+        };
+        consent::write(&self.path, key, &record)?;
+        // `sync` sees the file as changed and bumps the revision once, whatever else it read.
+        self.sync();
+        Ok(self.seed(Some(extractor)).consent)
+    }
+
+    fn granted(&self, extractor: Option<&str>) -> bool {
+        self.seed(extractor).consent == MemoryConsentState::Granted
+    }
+}
+
 struct Shared {
     config: DaemonConfig,
     provider: Mutex<Option<Arc<dyn Provider>>>,
     sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
     memories: Mutex<HashMap<PathBuf, Arc<RepoMemory>>>,
+    consent: Mutex<ConsentGate>,
+    standalone_extractor: String,
     next_id: AtomicU64,
     instance_id: String,
     clients: AtomicUsize,
@@ -244,6 +413,13 @@ fn instance_id() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(u128::from_ne_bytes(bytes).to_string())
+}
+
+fn standalone_extractor() -> String {
+    [ENV_MODEL, "OPENROUTER_MODEL"]
+        .into_iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| "anthropic/claude-sonnet-5".to_owned())
 }
 
 fn make_provider(
@@ -287,11 +463,15 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let Some((listener, _socket_guard)) = bind(&config.socket).await? else {
         return Ok(());
     };
+    let consent = ConsentGate::new(&config);
+    let standalone_extractor = standalone_extractor();
     let state = Arc::new(Shared {
         config,
         provider: Mutex::new(provider),
         sessions: Mutex::new(HashMap::new()),
         memories: Mutex::new(HashMap::new()),
+        consent: Mutex::new(consent),
+        standalone_extractor,
         next_id: AtomicU64::new(1),
         instance_id,
         clients: AtomicUsize::new(0),
@@ -325,15 +505,29 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 struct SessionEntry {
     session: tokio::sync::Mutex<Session>,
     memory: Option<Arc<RepoMemory>>,
-    /// The session's own model: the extractor falls back to it when none is configured.
-    author: ModelId,
-    /// Created at the first finished turn, once there is a provider to ask.
-    learner: OnceLock<Arc<Learner>>,
-    /// Counts finished turns, so an idle flush can tell whether anything happened since.
-    turns_done: AtomicU64,
+    learn_config: Option<LearnConfig>,
+    learning: Mutex<SessionLearning>,
+    memory_state: Mutex<SessionMemoryState>,
     tools: ToolExecutor,
     view: Mutex<View>,
     approvals: Arc<Approvals>,
+}
+
+#[derive(Default)]
+struct SessionMemoryState {
+    spend: Usage,
+    health: LearnHealth,
+    reset_pending: bool,
+}
+
+#[derive(Default)]
+struct SessionLearning {
+    /// Absolute watermark in the session history, including turns skipped before consent.
+    seen_messages: usize,
+    /// Only messages from turns that began and ended under the same granted consent revision.
+    history: Vec<Message>,
+    learner: Option<Arc<Learner>>,
+    idle_generation: u64,
 }
 
 struct View {
@@ -346,6 +540,7 @@ struct View {
     cancel: Option<CancellationToken>,
     ring: VecDeque<Value>,
     clients: Vec<Weak<ClientQueue>>,
+    memory: MemoryStatus,
 }
 
 impl View {
@@ -405,18 +600,41 @@ impl View {
                 }
                 "approval.requested" => active["pending_approval"] = params.clone(),
                 "approval.resolved" => active["pending_approval"] = Value::Null,
+                "memory.context" => {
+                    active["memory_note_ids"] = Value::Array(
+                        params["notes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|note| note["id"].as_i64().map(Value::from))
+                            .collect(),
+                    );
+                }
                 "turn.finished" => {
-                    self.turns.push(json!({"turn_id":active["turn_id"],"prompt":active["prompt"],"text":active["text_so_far"],"tools":active["tools"],"stop_reason":params["stop_reason"],"usage":params["usage"]}));
+                    self.turns.push(json!({"turn_id":active["turn_id"],"prompt":active["prompt"],"text":active["text_so_far"],"tools":active["tools"],"stop_reason":params["stop_reason"],"usage":params["usage"],"memory_note_ids":active["memory_note_ids"]}));
                     self.active = None;
                     self.cancel = None;
                 }
                 _ => {},
             }
         }
+        self.publish(note);
+    }
+
+    fn emit_session(&mut self, event: NotificationEvent) {
+        if let NotificationEvent::MemoryStatus(status) = &event {
+            self.memory = status.clone();
+        }
+        self.seq += 1;
+        let note = serde_json::to_value(Notification::new(&self.id, self.seq, None, event))
+            .expect("notification serialization");
+        self.publish(note);
+    }
+
+    fn publish(&mut self, note: Value) {
         if self.ring.len() == RING_CAPACITY {
             self.ring.pop_front();
         }
-        self.ring.push_back(note.clone());
         self.clients.retain(|client| {
             if let Some(client) = client.upgrade() {
                 client.push(note.clone());
@@ -425,12 +643,16 @@ impl View {
                 false
             }
         });
+        self.ring.push_back(note);
     }
 }
 
 fn output(event: OutputEvent) -> NotificationEvent {
     match event {
         OutputEvent::TurnStarted => NotificationEvent::TurnStarted {},
+        OutputEvent::Context { notes } => NotificationEvent::MemoryContext {
+            notes: notes.iter().map(wire_context_note).collect(),
+        },
         OutputEvent::ReasoningDelta(text) => NotificationEvent::ReasoningDelta { text },
         OutputEvent::TextDelta(text) => NotificationEvent::TextDelta { text },
         OutputEvent::ToolStarted {
@@ -474,6 +696,16 @@ fn output(event: OutputEvent) -> NotificationEvent {
             NotificationEvent::TurnFinished { stop_reason, usage }
         }
         OutputEvent::Error { message } => NotificationEvent::SessionError { message },
+    }
+}
+
+fn wire_context_note(note: &CoreNote) -> MemoryNote {
+    MemoryNote {
+        id: note.id,
+        kind: learn::display_safe(&note.kind),
+        status: learn::display_safe(&note.status),
+        statement: learn::display_safe(&note.statement),
+        origin: learn::display_safe(&note.origin),
     }
 }
 
@@ -557,6 +789,7 @@ async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()
         writer_queue.closed.cancel();
     });
     let mut reader = BufReader::new(read);
+    let mut consent_target = Some(state.standalone_extractor.clone());
     loop {
         let mut bytes = Vec::new();
         let mut limited = (&mut reader).take((MAX_LINE_BYTES + 2) as u64);
@@ -572,7 +805,7 @@ async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()
             break;
         }
         match serde_json::from_slice::<Value>(&bytes) {
-            Ok(request) => handle(&state, &queue, &request),
+            Ok(request) => handle(&state, &queue, &request, &mut consent_target).await,
             Err(_) => queue.push(error(Value::Null, -32700, "invalid JSON")),
         }
     }
@@ -593,7 +826,12 @@ fn error(id: Value, code: i32, message: &str) -> Value {
         .expect("error serialization")
 }
 
-fn handle(state: &Arc<Shared>, queue: &Arc<ClientQueue>, request: &Value) {
+async fn handle(
+    state: &Arc<Shared>,
+    queue: &Arc<ClientQueue>,
+    request: &Value,
+    consent_target: &mut Option<String>,
+) {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if !request.is_object()
         || request.get("id").is_none()
@@ -609,7 +847,9 @@ fn handle(state: &Arc<Shared>, queue: &Arc<ClientQueue>, request: &Value) {
         &id,
         request["method"].as_str().unwrap_or_default(),
         &params,
-    );
+        consent_target,
+    )
+    .await;
     if let Err((code, message)) = result {
         queue.push(error(id, code, &message));
     }
@@ -625,11 +865,104 @@ fn string<'a>(params: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
         .ok_or_else(|| invalid(format!("{name} must be a string")))
 }
 
+fn note_counts(memory: Option<&Arc<RepoMemory>>) -> MemoryNoteCounts {
+    let Some(memory) = memory else {
+        return MemoryNoteCounts::default();
+    };
+    let counts = memory.store.learned_counts();
+    MemoryNoteCounts {
+        active: counts.active,
+        pending: counts.pending,
+    }
+}
+
+fn health_problem(health: LearnHealth, threshold: u32) -> Option<String> {
+    if health.consecutive_failures < threshold {
+        return None;
+    }
+    Some(match health.failure {
+        Some(LearnFailure::ProviderStatus(status)) => {
+            format!("the provider refused the request (HTTP {status})")
+        }
+        Some(LearnFailure::UnreadableReply) => "the reply could not be read".to_owned(),
+        Some(LearnFailure::NoReply) => "no reply from the provider".to_owned(),
+        Some(LearnFailure::Store) | None => "the memory key is unavailable".to_owned(),
+    })
+}
+
+fn build_memory_status(
+    state: &Shared,
+    memory: Option<&Arc<RepoMemory>>,
+    learn_config: Option<&LearnConfig>,
+    local: &SessionMemoryState,
+) -> MemoryStatus {
+    let seed = state
+        .consent
+        .lock()
+        .expect("consent poisoned")
+        .seed(learn_config.map(|config| config.model.as_str()));
+    let enabled = state.config.memory && memory.is_some();
+    let threshold = learn_config.map_or(3, |config| config.max_failures);
+    let failing = enabled
+        && seed.consent == MemoryConsentState::Granted
+        && local.health.consecutive_failures >= threshold;
+    let learning = if failing {
+        MemoryLearningState::Failing
+    } else if enabled && seed.consent == MemoryConsentState::Granted {
+        MemoryLearningState::Working
+    } else {
+        MemoryLearningState::Paused
+    };
+    let index = if !state.config.memory || memory.is_none() {
+        MemoryIndexState::Off
+    } else if memory.is_some_and(|memory| memory.store.index_state().is_complete()) {
+        MemoryIndexState::Ready
+    } else {
+        MemoryIndexState::Building
+    };
+    let problem = if state.config.memory && memory.is_none() {
+        Some("the memory key is unavailable".to_owned())
+    } else if local.reset_pending {
+        Some("memory was reset: it was not made by this installation".to_owned())
+    } else {
+        health_problem(local.health, threshold)
+    };
+    MemoryStatus {
+        enabled,
+        consent: seed.consent,
+        learning,
+        extractor: seed.extractor,
+        notes: note_counts(memory),
+        index,
+        spend: local.spend,
+        problem,
+    }
+}
+
+fn memory_status(state: &Shared, entry: &SessionEntry) -> MemoryStatus {
+    let local = entry.memory_state.lock().expect("memory state poisoned");
+    build_memory_status(
+        state,
+        entry.memory.as_ref(),
+        entry.learn_config.as_ref(),
+        &local,
+    )
+}
+
+fn refresh_memory_status(state: &Shared, entry: &SessionEntry) {
+    let status = memory_status(state, entry);
+    let mut view = entry.view.lock().expect("view poisoned");
+    if view.memory != status {
+        view.emit_session(NotificationEvent::MemoryStatus(status));
+    }
+}
+
 fn create_session(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
     id: &Value,
     params: &Value,
+    consent_target: &mut Option<String>,
 ) -> RpcResult {
     let cwd = fs::canonicalize(string(params, "cwd")?).map_err(invalid)?;
     if !cwd.is_dir() {
@@ -663,17 +996,35 @@ fn create_session(
     let tools = ToolExecutor::new(&cwd).map_err(invalid)?;
     let author = config.model.clone();
     let (session, tools, memory) = attach_memory(state, &cwd, Session::new(config), tools);
+    let learn_config = (memory.is_some() && state.config.learn != LearnMode::Off).then(|| {
+        let mut config = LearnConfig::from_env(&author, &|name| env::var(name).ok());
+        config.call_timeout = state.config.learn_timeout;
+        config
+    });
+    // Only a session in which learning can run is told the harness may save preferences.
+    let session = if learn_config.is_some() {
+        session.with_system_note(elefante_core::LEARNING_HINT)
+    } else {
+        session
+    };
     let session_id = format!(
         "s{}-{}",
         state.instance_id,
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
+    let memory_state = SessionMemoryState {
+        reset_pending: memory
+            .as_ref()
+            .is_some_and(|memory| memory.store.reset_reason().is_some()),
+        ..SessionMemoryState::default()
+    };
+    let status = build_memory_status(state, memory.as_ref(), learn_config.as_ref(), &memory_state);
     let entry = Arc::new(SessionEntry {
         session: tokio::sync::Mutex::new(session),
         memory,
-        author,
-        learner: OnceLock::new(),
-        turns_done: AtomicU64::new(0),
+        learn_config,
+        learning: Mutex::new(SessionLearning::default()),
+        memory_state: Mutex::new(memory_state),
         tools,
         approvals: Arc::new(Approvals::default()),
         view: Mutex::new(View {
@@ -686,8 +1037,10 @@ fn create_session(
             cancel: None,
             ring: VecDeque::new(),
             clients: vec![Arc::downgrade(queue)],
+            memory: status.clone(),
         }),
     });
+    consent_target.clone_from(&status.extractor);
     state
         .sessions
         .lock()
@@ -695,7 +1048,7 @@ fn create_session(
         .insert(session_id.clone(), entry);
     queue.push(response(
         id.clone(),
-        json!({"session_id":session_id,"seq":0}),
+        json!({"session_id":session_id,"seq":0,"memory":status}),
     ));
     Ok(())
 }
@@ -769,12 +1122,260 @@ fn attach_memory(
     )
 }
 
-fn handle_method(
+fn validated_cwd(params: &Value) -> Result<PathBuf, (i32, String)> {
+    let cwd = fs::canonicalize(string(params, "cwd")?).map_err(invalid)?;
+    if !cwd.is_dir() {
+        return Err(invalid("cwd must be a directory"));
+    }
+    Ok(cwd)
+}
+
+/// What a repository-level request found at a working directory.
+enum RepoAccess {
+    /// A store this installation made, open for the request.
+    Live(Arc<RepoMemory>),
+    /// Nothing has been saved here: there is no store, and reading about one must not make it.
+    Absent,
+    /// A store this installation did not make. It is left exactly as found.
+    Foreign,
+}
+
+const FOREIGN_STORE: &str = "memory here was not made by this installation";
+
+/// Finds the repository's store for a `memory.*` request without creating or rebuilding anything.
+/// A live session's store is reused. Otherwise an existing store is opened only if its stamp
+/// verifies, and is dropped when the request ends. Sessions are the only path that may create or
+/// rebuild a store.
+fn repository_memory(state: &Shared, cwd: &Path) -> Result<RepoAccess, (i32, String)> {
+    if !state.config.memory {
+        return Err((MEMORY_OFF, "memory is off".to_owned()));
+    }
+    let repo =
+        RepoId::resolve(cwd).map_err(|_| (MEMORY_OFF, "memory is unavailable".to_owned()))?;
+    if let Some(memory) = state
+        .memories
+        .lock()
+        .expect("memory registry poisoned")
+        .get(repo.root())
+    {
+        return Ok(RepoAccess::Live(Arc::clone(memory)));
+    }
+    let database = StoreDir::path_for(repo.root()).join("memory.db");
+    if !database.exists() {
+        return Ok(RepoAccess::Absent);
+    }
+    let unavailable = |_| (MEMORY_OFF, "memory is unavailable".to_owned());
+    let key = memory_key(&state.config).map_err(unavailable)?;
+    let trusted = open_memory_reader(&database)
+        .is_ok_and(|connection| learn::store_stamp_valid(&connection, &key));
+    if !trusted {
+        return Ok(RepoAccess::Foreign);
+    }
+    RepoMemory::open(&repo, key)
+        .map(|opened| RepoAccess::Live(Arc::new(opened)))
+        .map_err(unavailable)
+}
+
+/// The numeric part of a session id (`s<instance>-<n>`), so "most recent" is well defined.
+fn session_sequence(id: &str) -> u64 {
+    id.rsplit('-')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A repository's status for a client with no session of its own. With several live sessions it is
+/// deterministic: the most recently created session speaks for consent and the extractor, spend is
+/// the sum over them, and a failing session makes the whole failing.
+fn repository_status(state: &Shared, memory: &Arc<RepoMemory>) -> MemoryStatus {
+    let mut entries: Vec<(u64, Arc<SessionEntry>)> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .memory
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, memory))
+        })
+        .map(|(id, entry)| (session_sequence(id), Arc::clone(entry)))
+        .collect();
+    entries.sort_by_key(|(sequence, _)| *sequence);
+    let Some((_, latest)) = entries.last() else {
+        let config = LearnConfig::new(state.standalone_extractor.clone());
+        let local = SessionMemoryState {
+            reset_pending: memory.store.reset_reason().is_some(),
+            ..SessionMemoryState::default()
+        };
+        return build_memory_status(state, Some(memory), Some(&config), &local);
+    };
+    let mut status = memory_status(state, latest);
+    let mut spend = elefante_provider::Usage::default();
+    for (_, entry) in &entries {
+        let other = memory_status(state, entry);
+        spend.accumulate(other.spend);
+        if other.learning == MemoryLearningState::Failing {
+            status.learning = MemoryLearningState::Failing;
+            status.problem = status.problem.or(other.problem);
+        }
+    }
+    status.spend = spend;
+    status
+}
+
+/// The status of a repository with no store: nothing to count, nothing indexed.
+fn absent_status(state: &Shared) -> MemoryStatus {
+    let config = LearnConfig::new(state.standalone_extractor.clone());
+    build_memory_status(state, None, Some(&config), &SessionMemoryState::default())
+}
+
+/// A learned row as it goes on the wire: the origin without the store's `learned:` prefix, as
+/// `memory.learned` already sends it.
+fn wire_row(row: &learn::LearnedRow) -> Value {
+    let origin = row
+        .origin
+        .strip_prefix(learn::SOURCE_PREFIX)
+        .unwrap_or(&row.origin)
+        .to_owned();
+    json!({
+        "id":row.id,"kind":row.kind,"status":row.status,
+        "statement":row.statement,"origin":origin,
+        "confidence":row.effective_confidence,"verified":row.verified,
+        "reinforcements":row.reinforcements
+    })
+}
+
+async fn handle_repository_memory(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
     id: &Value,
     method: &str,
     params: &Value,
+) -> RpcResult {
+    let cwd = validated_cwd(params)?;
+    let memory = match repository_memory(state, &cwd)? {
+        RepoAccess::Live(memory) => memory,
+        RepoAccess::Foreign => return Err((MEMORY_OFF, FOREIGN_STORE.to_owned())),
+        RepoAccess::Absent => {
+            // Nothing is stored. Answer as an empty store would, and create nothing.
+            let result = match method {
+                "memory.list" => json!({"notes":[]}),
+                "memory.clear" => json!({"removed":0}),
+                "memory.forget" | "memory.approve" => {
+                    return Err((UNKNOWN_NOTE, "unknown learned note".to_owned()));
+                }
+                "memory.status" => {
+                    serde_json::to_value(absent_status(state)).expect("memory status serialization")
+                }
+                _ => return Err((-32601, "unknown method".to_owned())),
+            };
+            queue.push(response(id.clone(), result));
+            return Ok(());
+        }
+    };
+    match method {
+        "memory.list" => {
+            let all = match params.get("all") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| invalid("all must be a boolean"))?,
+            };
+            let rows = learn::list_async(&memory.store, all)
+                .await
+                .map_err(invalid)?;
+            let notes: Vec<_> = rows.iter().map(wire_row).collect();
+            queue.push(response(id.clone(), json!({"notes":notes})));
+        }
+        "memory.forget" | "memory.approve" => {
+            let note_id = params["id"]
+                .as_i64()
+                .ok_or_else(|| invalid("id must be an integer"))?;
+            let changed = if method == "memory.forget" {
+                learn::forget_async(&memory.store, note_id)
+                    .await
+                    .map_err(invalid)?
+            } else {
+                learn::approve_async(&memory.store, note_id)
+                    .await
+                    .map_err(invalid)?
+            };
+            if !changed {
+                return Err((UNKNOWN_NOTE, "unknown learned note".to_owned()));
+            }
+            queue.push(response(id.clone(), json!({})));
+        }
+        "memory.clear" => {
+            let removed = learn::clear_async(&memory.store).await.map_err(invalid)?;
+            queue.push(response(id.clone(), json!({"removed":removed})));
+        }
+        "memory.status" => {
+            queue.push(response(
+                id.clone(),
+                serde_json::to_value(repository_status(state, &memory))
+                    .expect("memory status serialization"),
+            ));
+        }
+        _ => return Err((-32601, "unknown method".to_owned())),
+    }
+    Ok(())
+}
+
+fn handle_memory_consent(
+    state: &Shared,
+    queue: &ClientQueue,
+    id: &Value,
+    params: &Value,
+    consent_target: Option<&str>,
+) -> RpcResult {
+    let answer = match string(params, "answer")? {
+        "learn" => ConsentAnswer::Learn,
+        "off" => ConsentAnswer::Off,
+        _ => return Err(invalid("answer must be learn or off")),
+    };
+    match state.config.learn {
+        LearnMode::Off => {
+            queue.push(response(id.clone(), json!({"consent":"off"})));
+            return Ok(());
+        }
+        LearnMode::On => {
+            queue.push(response(id.clone(), json!({"consent":"granted"})));
+            return Ok(());
+        }
+        LearnMode::Ask => {}
+    }
+    // An answer is for one extractor model: the one named, else the one the connection's last session
+    // uses.
+    let extractor = match params.get("extractor") {
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| invalid("extractor must be a model name"))?,
+        None => consent_target.ok_or_else(|| {
+            invalid("memory.consent requires an extractor or a learning-capable session target")
+        })?,
+    };
+    let consent = state
+        .consent
+        .lock()
+        .expect("consent poisoned")
+        .answer(answer, extractor)
+        .map_err(invalid)?;
+    discard_revoked_learning(state);
+    refresh_all_memory_status(state);
+    queue.push(response(id.clone(), json!({"consent":consent})));
+    Ok(())
+}
+
+async fn handle_method(
+    state: &Arc<Shared>,
+    queue: &Arc<ClientQueue>,
+    id: &Value,
+    method: &str,
+    params: &Value,
+    consent_target: &mut Option<String>,
 ) -> RpcResult {
     if method == "key.set" {
         let key = string(params, "api_key")?;
@@ -788,7 +1389,16 @@ fn handle_method(
         return Ok(());
     }
     if method == "session.create" {
-        return create_session(state, queue, id, params);
+        return create_session(state, queue, id, params, consent_target);
+    }
+    if method == "memory.consent" {
+        return handle_memory_consent(state, queue, id, params, consent_target.as_deref());
+    }
+    if matches!(
+        method,
+        "memory.list" | "memory.forget" | "memory.approve" | "memory.clear" | "memory.status"
+    ) {
+        return handle_repository_memory(state, queue, id, method, params).await;
     }
     if !matches!(
         method,
@@ -812,7 +1422,7 @@ fn handle_method(
                 cancel.cancel();
             }
             // Extract what the gate was holding; the response does not wait for it.
-            if let Some(learner) = entry.learner.get().cloned() {
+            if let Some(learner) = flushable_learner(state, &entry) {
                 tokio::spawn(async move { learner.flush().await });
             }
         }
@@ -828,7 +1438,7 @@ fn handle_method(
         .ok_or((-32001, "unknown session".into()))?;
     match method {
         "session.attach" => {
-            return attach_session(queue, id, &entry, params);
+            return attach_session(state, queue, id, &entry, params, consent_target);
         }
         "session.interrupt" => {
             if let Some(cancel) = &entry.view.lock().expect("view poisoned").cancel {
@@ -856,12 +1466,22 @@ fn handle_method(
 }
 
 fn attach_session(
+    state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
     id: &Value,
     entry: &SessionEntry,
     params: &Value,
+    consent_target: &mut Option<String>,
 ) -> RpcResult {
-    attach_session_with_result(queue, id, entry, params, attach_result)
+    let status = memory_status(state, entry);
+    let target = status.extractor.clone();
+    attach_session_with_result(queue, id, entry, params, move |view, since| {
+        let mut result = attach_result(view, since);
+        result["memory"] = serde_json::to_value(status).expect("memory status serialization");
+        result
+    })?;
+    *consent_target = target;
+    Ok(())
 }
 
 fn attach_session_with_result(
@@ -911,6 +1531,141 @@ fn attach_result(view: &View, since: Option<u64>) -> Value {
     }
 }
 
+fn extractor(entry: &SessionEntry) -> Option<&str> {
+    entry
+        .learn_config
+        .as_ref()
+        .map(|config| config.model.as_str())
+}
+
+fn discard_revoked_learning(state: &Shared) {
+    let entries: Vec<_> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .values()
+        .cloned()
+        .collect();
+    let mut cleared = Vec::new();
+    {
+        // Lock order everywhere is consent, then learning; memory state is taken on its own
+        // (it takes consent itself while building a status), so it is reset after this block.
+        let consent = state.consent.lock().expect("consent poisoned");
+        for entry in entries {
+            if !consent.granted(extractor(&entry)) {
+                let mut learning = entry.learning.lock().expect("learning poisoned");
+                learning.history.clear();
+                if let Some(learner) = learning.learner.take() {
+                    learner.cancel();
+                }
+                learning.idle_generation = learning.idle_generation.wrapping_add(1);
+                drop(learning);
+                cleared.push(entry);
+            }
+        }
+    }
+    for entry in cleared {
+        reset_learning_health(state, &entry);
+    }
+}
+
+/// A learner that is gone takes its failures with it: a new one starts healthy, and the status
+/// must say so rather than keep reporting the old learner's problem.
+fn reset_learning_health(state: &Shared, entry: &SessionEntry) {
+    entry
+        .memory_state
+        .lock()
+        .expect("memory state poisoned")
+        .health = LearnHealth::default();
+    refresh_memory_status(state, entry);
+}
+
+fn refresh_all_memory_status(state: &Shared) {
+    let entries: Vec<_> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .values()
+        .cloned()
+        .collect();
+    for entry in entries {
+        refresh_memory_status(state, &entry);
+    }
+}
+
+struct ServerLearnSink {
+    state: Weak<Shared>,
+    entry: Weak<SessionEntry>,
+}
+
+fn wire_note(note: &learn::LearnedNode) -> MemoryNote {
+    MemoryNote {
+        id: note.id,
+        kind: learn::display_safe(note.kind.as_str()),
+        status: learn::display_safe(note.status.as_str()),
+        statement: learn::display_safe(&note.statement),
+        origin: learn::display_safe(
+            note.origin
+                .source()
+                .strip_prefix(learn::SOURCE_PREFIX)
+                .unwrap_or(note.origin.source()),
+        ),
+    }
+}
+
+fn wire_change(change: LearnChange) -> MemoryChange {
+    match change {
+        LearnChange::Added => MemoryChange::Added,
+        LearnChange::Promoted => MemoryChange::Promoted,
+        LearnChange::Superseded => MemoryChange::Superseded,
+        LearnChange::Revived => MemoryChange::Revived,
+    }
+}
+
+impl LearnSink for ServerLearnSink {
+    fn learned(&self, changes: &[ChangedNote]) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        {
+            let mut view = entry.view.lock().expect("view poisoned");
+            for change in changes {
+                view.emit_session(NotificationEvent::MemoryLearned {
+                    note: wire_note(&change.note),
+                    change: wire_change(change.change),
+                    replaced: change.replaced.as_ref().map(wire_note),
+                });
+            }
+        }
+        refresh_memory_status(&state, &entry);
+    }
+
+    fn usage(&self, usage: Usage) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .spend
+            .accumulate(usage);
+        refresh_memory_status(&state, &entry);
+    }
+
+    fn health(&self, health: LearnHealth) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .health = health;
+        refresh_memory_status(&state, &entry);
+    }
+}
+
 fn prompt_session(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
@@ -931,8 +1686,12 @@ fn prompt_session(
     }
     let turn_id = format!("t{}", state.next_id.fetch_add(1, Ordering::Relaxed));
     let cancel = CancellationToken::new();
+    let consent_at_start = {
+        let consent = state.consent.lock().expect("consent poisoned");
+        (consent.granted(extractor(entry)), consent.revision())
+    };
     view.active = Some(
-        json!({"turn_id":turn_id,"prompt":text,"text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null}),
+        json!({"turn_id":turn_id,"prompt":text,"text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null,"memory_note_ids":[]}),
     );
     view.cancel = Some(cancel.clone());
     view.subscribe(queue);
@@ -975,58 +1734,140 @@ fn prompt_session(
         if let Some(memory) = &entry.memory {
             memory.indexer.refresh();
         }
-        if state.config.learn
-            && let Some(learner) = entry_learner(&state, &entry, &provider)
-        {
-            learner.observe(session.messages());
-            schedule_idle_flush(&state, &entry, learner);
-        }
+        observe_learning(
+            &state,
+            &entry,
+            &provider,
+            session.messages(),
+            consent_at_start,
+        );
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .reset_pending = false;
+        refresh_memory_status(&state, &entry);
         state.turns.fetch_sub(1, Ordering::SeqCst);
     });
     Ok(())
 }
 
-/// The session's learner, created on first use. `None` when the session has no index to learn into.
-fn entry_learner(
+fn observe_learning(
     state: &Arc<Shared>,
     entry: &Arc<SessionEntry>,
     provider: &Arc<dyn Provider>,
-) -> Option<Arc<Learner>> {
-    let memory = entry.memory.as_ref()?;
-    let learner = entry.learner.get_or_init(|| {
-        let config = LearnConfig::from_env(&entry.author, &|name| env::var(name).ok());
-        let mut config = config;
-        config.call_timeout = state.config.learn_timeout;
-        Learner::new(Arc::clone(&memory.store), Arc::clone(provider), config)
-    });
-    Some(Arc::clone(learner))
+    messages: &[Message],
+    (granted_at_start, start_revision): (bool, u64),
+) {
+    // The consent guard is held until the learner has been handed the text. Checking, releasing and
+    // then locking learning left a gap in which a revoke could clear everything and this turn would
+    // then start a new learner under consent that no longer existed.
+    let consent = state.consent.lock().expect("consent poisoned");
+    let still_granted = granted_at_start
+        && consent.revision() == start_revision
+        && consent.granted(extractor(entry));
+    let mut learning = entry.learning.lock().expect("learning poisoned");
+    let from = learning.seen_messages.min(messages.len());
+    learning.seen_messages = messages.len();
+    if !still_granted {
+        learning.history.clear();
+        let had_learner = learning.learner.take().inspect(|learner| learner.cancel());
+        learning.idle_generation = learning.idle_generation.wrapping_add(1);
+        drop(learning);
+        drop(consent);
+        if had_learner.is_some() {
+            reset_learning_health(state, entry);
+        }
+        return;
+    }
+    if from == messages.len() {
+        return;
+    }
+    learning.history.extend_from_slice(&messages[from..]);
+    let (Some(memory), Some(config)) = (&entry.memory, &entry.learn_config) else {
+        return;
+    };
+    let learner = Arc::clone(learning.learner.get_or_insert_with(|| {
+        Learner::with_sink(
+            Arc::clone(&memory.store),
+            Arc::clone(provider),
+            config.clone(),
+            Arc::new(ServerLearnSink {
+                state: Arc::downgrade(state),
+                entry: Arc::downgrade(entry),
+            }),
+        )
+    }));
+    learner.observe(&learning.history);
+    learning.idle_generation = learning.idle_generation.wrapping_add(1);
+    let generation = learning.idle_generation;
+    drop(learning);
+    drop(consent);
+    schedule_idle_flush(state, entry, learner, generation, start_revision);
 }
 
 /// After a quiet spell, extract whatever the gate was holding. A turn in between restarts the wait.
-fn schedule_idle_flush(state: &Arc<Shared>, entry: &Arc<SessionEntry>, learner: Arc<Learner>) {
-    let seen = entry.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
+fn schedule_idle_flush(
+    state: &Arc<Shared>,
+    entry: &Arc<SessionEntry>,
+    learner: Arc<Learner>,
+    generation: u64,
+    consent_revision: u64,
+) {
     let wait = state.config.learn_idle;
+    let state = Arc::clone(state);
     let entry = Arc::clone(entry);
     tokio::spawn(async move {
         tokio::time::sleep(wait).await;
-        if entry.turns_done.load(Ordering::SeqCst) == seen {
+        let consent_valid = {
+            let consent = state.consent.lock().expect("consent poisoned");
+            consent.revision() == consent_revision && consent.granted(extractor(&entry))
+        };
+        let learner_current = {
+            let learning = entry.learning.lock().expect("learning poisoned");
+            learning.idle_generation == generation
+                && learning
+                    .learner
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &learner))
+        };
+        if consent_valid && learner_current {
             learner.flush().await;
         }
     });
 }
 
+fn flushable_learner(state: &Shared, entry: &SessionEntry) -> Option<Arc<Learner>> {
+    if !state
+        .consent
+        .lock()
+        .expect("consent poisoned")
+        .granted(extractor(entry))
+    {
+        return None;
+    }
+    entry
+        .learning
+        .lock()
+        .expect("learning poisoned")
+        .learner
+        .clone()
+}
+
 /// Extracts what every session is still holding, waiting a bounded time for each. Called as the
 /// daemon exits, because a session that never closed cleanly would otherwise lose its last turns.
 async fn flush_all(state: &Arc<Shared>) {
-    let learners: Vec<Arc<Learner>> = state
+    let entries: Vec<Arc<SessionEntry>> = state
         .sessions
         .lock()
         .expect("registry poisoned")
         .values()
-        .filter_map(|entry| entry.learner.get().cloned())
+        .cloned()
         .collect();
-    for learner in learners {
-        let _ = tokio::time::timeout(Duration::from_secs(10), learner.flush()).await;
+    for entry in entries {
+        if let Some(learner) = flushable_learner(state, &entry) {
+            let _ = tokio::time::timeout(Duration::from_secs(10), learner.flush()).await;
+        }
     }
 }
 
@@ -1034,13 +1875,21 @@ async fn flush_all(state: &Arc<Shared>) {
 mod tests {
     #[test]
     fn switches_are_on_unless_exactly_zero() {
-        use super::switch;
+        use super::{LearnMode, learn_mode, switch};
         assert!(switch(None));
         assert!(switch(Some("1")));
         assert!(switch(Some("yes")));
         assert!(switch(Some("")));
         assert!(!switch(Some("0")));
         assert!(!switch(Some(" 0 ")));
+        assert_eq!(learn_mode(true, None), LearnMode::Ask);
+        assert_eq!(learn_mode(true, Some("1")), LearnMode::On);
+        assert_eq!(learn_mode(true, Some(" ON ")), LearnMode::On);
+        assert_eq!(learn_mode(true, Some("0")), LearnMode::Off);
+        assert_eq!(learn_mode(true, Some(" off ")), LearnMode::Off);
+        assert_eq!(learn_mode(true, Some("unexpected")), LearnMode::Ask);
+        assert_eq!(learn_mode(false, None), LearnMode::Off);
+        assert_eq!(learn_mode(false, Some("on")), LearnMode::Off);
     }
 
     use super::*;
@@ -1085,7 +1934,7 @@ mod tests {
         }
     }
 
-    async fn existing_subscriber(dir: &Path) -> (Arc<ClientQueue>, Arc<SessionEntry>) {
+    async fn existing_subscriber(dir: &Path) -> (Arc<Shared>, Arc<ClientQueue>, Arc<SessionEntry>) {
         let state = Arc::new(Shared {
             config: DaemonConfig {
                 socket: dir.join("socket"),
@@ -1095,20 +1944,28 @@ mod tests {
                 stub_provider: None,
                 idle_timeout: Duration::from_secs(20),
                 memory: false,
-                learn: false,
+                learn: LearnMode::Off,
                 learn_idle: Duration::from_secs(300),
                 learn_timeout: Duration::from_secs(60),
             },
             provider: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             memories: Mutex::new(HashMap::new()),
+            consent: Mutex::new(ConsentGate {
+                mode: LearnMode::Off,
+                path: dir.join(CONSENT_FILE),
+                key: None,
+                cache: std::cell::RefCell::new(ConsentCache::default()),
+                revision: std::cell::Cell::new(0),
+            }),
+            standalone_extractor: "anthropic/claude-sonnet-5".to_owned(),
             next_id: AtomicU64::new(1),
             instance_id: instance_id().unwrap(),
             clients: AtomicUsize::new(0),
             turns: AtomicUsize::new(0),
         });
         let queue = Arc::new(ClientQueue::new());
-        create_session(&state, &queue, &json!(1), &json!({"cwd":dir})).unwrap();
+        create_session(&state, &queue, &json!(1), &json!({"cwd":dir}), &mut None).unwrap();
         let created = queue.pop().await.unwrap();
         let id = created["result"]["session_id"].as_str().unwrap();
         let entry = state.sessions.lock().unwrap()[id].clone();
@@ -1121,14 +1978,14 @@ mod tests {
             "turn_id":"old", "prompt":"history", "text":"x".repeat(1024 * 1024),
             "tools":[], "stop_reason":"end_turn", "usage":null,
         }));
-        (queue, entry)
+        (state, queue, entry)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn existing_subscriber_attach_invalidates_held_writer_frame() {
         for initial_allowance in [0, 1] {
             let dir = tempfile::tempdir().unwrap();
-            let (queue, entry) = existing_subscriber(dir.path()).await;
+            let (state, queue, entry) = existing_subscriber(dir.path()).await;
             let (stream, reader) = UnixStream::pair().unwrap();
             let allowance = Arc::new(AtomicUsize::new(initial_allowance));
             let blocked = Arc::new(Notify::new());
@@ -1152,9 +2009,16 @@ mod tests {
             // Writer has already popped this subscriber's notification, and may
             // have sent one byte. Attach must coordinate with that exact state.
             assert_eq!(
-                attach_session(&queue, &json!(99), &entry, &json!({"since":999}))
-                    .unwrap_err()
-                    .0,
+                attach_session(
+                    &state,
+                    &queue,
+                    &json!(99),
+                    &entry,
+                    &json!({"since":999}),
+                    &mut None,
+                )
+                .unwrap_err()
+                .0,
                 -32003
             );
             assert!(

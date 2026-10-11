@@ -5,7 +5,9 @@ use std::{fs, path::Path, process::Command};
 use elefante_cli::memory;
 use elefante_mem::{
     MemKey, RepoId, Store,
+    consent::{self, ConsentAnswer},
     learn::{self, Candidate, IngestInput, Kind, Relation, Speaker, Turn},
+    trust::RowFields,
 };
 
 struct Fixture {
@@ -187,6 +189,84 @@ fn a_tampered_note_is_listed_flagged_so_it_can_be_removed() {
     assert_eq!(cmd(&f, &["forget", &active.to_string()]).0, 0);
 }
 
+#[test]
+fn every_database_supplied_column_is_sanitized_before_display() {
+    let f = fixture();
+    let (active, _) = teach(&f);
+    let key = MemKey::load_or_create(&f.key_path).unwrap();
+    let db = f.repo.join(".elefante/memory.db");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let (kind, node_key, created): (String, String, i64) = conn
+        .query_row(
+            "SELECT kind, key, created_at_ns FROM node WHERE id = ?1",
+            [active],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let label = "Branch\u{202e}\u{200b} naming";
+    let body = "Branches\u{1b}[31m are\t named\u{2066} after tickets.";
+    let source = "learned:explicit\u{202e}";
+    let mac = key.row_mac(&RowFields {
+        kind: &kind,
+        key: &node_key,
+        name: label,
+        body,
+        source,
+        created_at_ns: created,
+    });
+    conn.execute(
+        "UPDATE node SET name = ?1, body = ?2, source = ?3, status = ?4, mac = ?5 WHERE id = ?6",
+        rusqlite::params![
+            label,
+            body,
+            source,
+            "active\u{200b}",
+            mac.as_slice(),
+            active
+        ],
+    )
+    .unwrap();
+
+    let (code, listed) = cmd(&f, &["list", "--all"]);
+    assert_eq!(code, 0);
+    assert!(listed.contains("active"), "{listed}");
+    assert!(listed.contains("explicit"), "{listed}");
+    assert!(
+        listed.contains("Branches[31m are named after tickets."),
+        "{listed}"
+    );
+    for unsafe_char in ['\u{1b}', '\u{202e}', '\u{2066}', '\u{200b}'] {
+        assert!(!listed.contains(unsafe_char), "{listed:?}");
+    }
+}
+
+#[test]
+fn an_unstamped_store_prints_only_an_explanation() {
+    let f = fixture();
+    let dir = f.repo.join(".elefante");
+    fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('graph_epoch', 'foreign');
+         CREATE TABLE node(kind TEXT, status TEXT, source TEXT, body TEXT);
+         INSERT INTO node VALUES (
+           'fact' || char(27), 'active' || char(27),
+           'learned:explicit' || char(27), 'hostile row' || char(27)
+         );",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        cmd(&f, &["list"]),
+        (
+            0,
+            "memory store is not from this Elefante installation; no notes shown\n".to_owned()
+        )
+    );
+}
+
 /// Alters a learned row without access to the key.
 fn tamper(db: &Path, id: i64) {
     rusqlite::Connection::open(db)
@@ -238,4 +318,140 @@ fn the_binary_dispatches_memory_commands_without_a_daemon() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let socket = tmp.path().join("no-daemon.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env("ELEFANTE_EXTRACT_MODEL", " vendor/extractor ")
+        .env("OPENROUTER_MODEL", "vendor/chat")
+        .args(["memory", "learn", "on"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"memory learning is granted for vendor/extractor\n"
+    );
+    assert_eq!(output.stderr.len(), 0);
+
+    let key_path = home.join(".elefante/memory.key");
+    let key = MemKey::load_or_create(&key_path).unwrap();
+    let consent_path = home.join(".elefante/memory-consent");
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Learn);
+    assert_eq!(record.extractor, "vendor/extractor");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env_remove("ELEFANTE_EXTRACT_MODEL")
+        .env("OPENROUTER_MODEL", "vendor/chat")
+        .args(["memory", "learn", "off"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"memory learning is declined for vendor/chat\n"
+    );
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Off);
+    assert_eq!(record.extractor, "vendor/chat");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env_remove("ELEFANTE_EXTRACT_MODEL")
+        .env_remove("OPENROUTER_MODEL")
+        .args(["memory", "learn", "on"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let record = consent::read_all(&consent_path, &key)
+        .into_iter()
+        .last()
+        .unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Learn);
+    assert_eq!(record.extractor, "anthropic/claude-sonnet-5");
+}
+
+#[test]
+fn memory_learn_rejects_bad_settings_before_resolving_a_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    for args in [vec!["memory", "learn"], vec!["memory", "learn", "maybe"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+            .current_dir(tmp.path())
+            .env("HOME", &home)
+            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("memory learn"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn memory_learn_names_the_model_and_an_answer_for_one_model_leaves_another_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_elefante"))
+            .current_dir(tmp.path())
+            .env("HOME", &home)
+            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+            .env_remove("ELEFANTE_EXTRACT_MODEL")
+            .env("OPENROUTER_MODEL", "vendor/chat")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let first = run(&["memory", "learn", "on", "--model", "vendor/one"]);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(first.stdout, b"memory learning is granted for vendor/one\n");
+    let second = run(&["memory", "learn", "--model", "vendor/two", "off"]);
+    assert_eq!(
+        second.stdout,
+        b"memory learning is declined for vendor/two\n"
+    );
+
+    let key = MemKey::load_or_create(&home.join(".elefante/memory.key")).unwrap();
+    let path = home.join(".elefante/memory-consent");
+    assert_eq!(
+        consent::read_for(&path, &key, "vendor/one").unwrap().answer,
+        ConsentAnswer::Learn,
+        "answering for another model did not withdraw this one"
+    );
+    assert_eq!(
+        consent::read_for(&path, &key, "vendor/two").unwrap().answer,
+        ConsentAnswer::Off
+    );
+    assert!(consent::read_for(&path, &key, "vendor/chat").is_none());
+
+    for bad in [
+        &["memory", "learn", "on", "--model"][..],
+        &["memory", "learn", "on", "--model", "a", "--model", "b"],
+        &["memory", "learn", "on", "off"],
+    ] {
+        assert!(!run(bad).status.success(), "{bad:?}");
+    }
 }

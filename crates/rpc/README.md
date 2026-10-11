@@ -10,9 +10,9 @@ the point — one definition, so the two sides cannot disagree about the format.
 |---|---:|---|
 | `src/lib.rs` | 14 | Module declarations, glob re-exports, and the two capacity constants. |
 | `src/framing.rs` | 124 | NDJSON encode/decode, `FrameDecoder`, preview truncation. |
-| `src/notification.rs` | 197 | `Notification`, `NotificationEvent`, and `Sequence` with its coalescing rule. |
-| `src/request.rs` | 207 | `Request`, `Method`, `Response`, and the ten error codes. |
-| `src/snapshot.rs` | 68 | `AttachResult`, `SessionSnapshot`, `CompletedTurn`, `ActiveTurn`, `ToolStatus`. |
+| `src/notification.rs` | 352 | `Notification`, `NotificationEvent` (hand-written `Deserialize`, `Unknown`), and `Sequence` with its coalescing rule. |
+| `src/request.rs` | 352 | `Request`, `Method`, `Response`, the twelve error codes, and the memory types: `MemoryStatus`, `MemorySeed`, `MemoryNote`, `MemoryRow`, `MemoryChange`, the consent and learning enums. |
+| `src/snapshot.rs` | 76 | `AttachResult` (both kinds carry optional `memory`), `SessionSnapshot`, `CompletedTurn` and `ActiveTurn` (with `memory_note_ids`), `ToolStatus`. |
 
 ## Entry points
 
@@ -53,6 +53,18 @@ same-method deltas.** The range is what makes a merge distinguishable from a gap
 event carrying only its highest `seq` would trip the client's own resynchronise rule during
 normal operation. `coalesce` returns `bool` so the caller knows whether the merge happened.
 
+**`NotificationEvent` accepts a method it does not know.** `Deserialize` is written by hand because
+`#[serde(other)]` does not work on this adjacently-tagged enum for events with `params`: it reads the
+`method`, deserialises the known ones, and returns `Unknown { method }` for the rest, provided `params`
+is an object. `Unknown` is never serialised. A new event therefore needs no version field and shares
+the existing `seq` space; only an old client attached to a daemon replaced under it could still
+choke, which a normal upgrade cannot produce. The memory events (`memory.status`, `memory.learned`,
+`memory.context`) are known events and, like every non-delta, are never coalesced.
+
+**The memory fields are additive and optional.** `CreateResult.memory` and both `AttachResult`
+variants' `memory` are `Option<MemoryStatus>` skipped when absent; `memory_note_ids` is skipped when
+empty. Nothing in the crate denies unknown fields, so an older peer ignores them.
+
 Truncation cuts on a UTF-8 character boundary, never mid-codepoint. `DEVELOPER_GUIDE.md` §5 is
 the single source of truth for the protocol these types encode; this crate is where it is
 spelled, not where it is explained.
@@ -60,10 +72,11 @@ spelled, not where it is explained.
 ## Testing
 
 ```sh
-cargo test -p elefante-rpc     # 12 tests
+cargo test -p elefante-rpc     # 13 tests
 ```
 
-`tests/wire.rs` (9) round-trips every request, response, notification, and snapshot shape.
+`tests/wire.rs` (10) round-trips every request, response, notification, and snapshot shape, including the
+memory methods, events and results, and checks that an unknown method parses but cannot be serialised.
 `tests/framing.rs` (3) covers the byte-level cases that break naive line splitting — frames
 split across chunk boundaries, oversized lines, escaped newlines inside strings. Nothing is
 `#[ignore]`d; the crate is pure types and has no I/O to mock.

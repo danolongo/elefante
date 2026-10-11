@@ -13,6 +13,7 @@ pub struct PathPolicy {
     root: PathBuf,
     extra_denied: GlobSet,
     credentials: Option<PathBuf>,
+    home_harness: Vec<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -80,6 +81,7 @@ impl PathPolicy {
             root,
             extra_denied,
             credentials: canonical_credentials(),
+            home_harness: home_harness_dirs(),
         })
     }
 
@@ -89,6 +91,9 @@ impl PathPolicy {
     }
 
     /// Whether `path` names a built-in secret location, judged by its components alone.
+    ///
+    /// `path` is taken to be relative to a workspace root, so any `.elefante` component is the
+    /// harness's own state and counts, including a bare `.elefante` directory entry.
     ///
     /// Purely lexical: no filesystem access, no symlink resolution, and no root. That makes it
     /// cheap enough to run on every entry of a repository walk, which [`PathPolicy::resolve`]
@@ -164,7 +169,20 @@ impl PathPolicy {
                 rule: ".elefante/credentials.toml",
             });
         }
-        if let Some(rule) = built_in_secret_rule(absolute) {
+        // The user-level harness directory is denied by prefix. The `.elefante` component rule
+        // below runs on the root-relative path only, so a workspace that merely lives under some
+        // `.elefante/` directory keeps working.
+        if self
+            .home_harness
+            .iter()
+            .any(|dir| absolute.starts_with(dir))
+        {
+            return Err(PolicyError::Denied {
+                path: input.display().to_string(),
+                rule: "~/.elefante/** (harness state)",
+            });
+        }
+        if let Some(rule) = credential_rule(absolute).or_else(|| built_in_secret_rule(relative)) {
             return Err(PolicyError::Denied {
                 path: input.display().to_string(),
                 rule,
@@ -187,6 +205,26 @@ pub(crate) fn canonical_credentials() -> Option<PathBuf> {
             .canonicalize()
             .ok()
     })
+}
+
+/// `<home>/.elefante`, as given and canonicalized. Unlike [`canonical_credentials`] it does not
+/// need the directory to exist, so a not-yet-created harness directory is still protected.
+pub(crate) fn home_harness_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    let mut dirs = vec![home.join(".elefante")];
+    let canonical = [
+        home.canonicalize().ok().map(|home| home.join(".elefante")),
+        home.join(".elefante").canonicalize().ok(),
+    ];
+    for dir in canonical.into_iter().flatten() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 fn closest_existing_ancestor(
@@ -215,7 +253,7 @@ fn closest_existing_ancestor(
     Ok((ancestor, suffix))
 }
 
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -229,7 +267,19 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
+/// Every built-in rule, including the harness-state rule for any `.elefante` component. Meant
+/// for a path relative to the workspace root (or one typed that way in a shell command).
 pub(crate) fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
+    secret_rule(path, true)
+}
+
+/// The rules that hold wherever the workspace happens to live: credentials and key material, but
+/// not the harness-state rule, which depends on where the workspace root is.
+pub(crate) fn credential_rule(path: &Path) -> Option<&'static str> {
+    secret_rule(path, false)
+}
+
+fn secret_rule(path: &Path, harness_state: bool) -> Option<&'static str> {
     let components = path
         .components()
         .filter_map(|component| match component {
@@ -247,6 +297,12 @@ pub(crate) fn built_in_secret_rule(path: &Path) -> Option<&'static str> {
         }
         if *component == ".elefante" && components.get(index + 1) == Some(&"credentials.toml") {
             return Some(".elefante/credentials.toml");
+        }
+        // The harness's own state: learned notes, the index and its keys. The agent reaches them
+        // through the injected context and `memory_search`, never as files. The directory itself
+        // counts too, so listing or recursing into it is refused as well as opening a file in it.
+        if harness_state && *component == ".elefante" {
+            return Some(".elefante/** (harness state)");
         }
         if *component == ".env" || component.starts_with(".env.") {
             return Some(".env or .env.*");

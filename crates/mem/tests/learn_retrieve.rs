@@ -113,7 +113,8 @@ fn with_nothing_learned_the_block_is_byte_identical_to_code_only_retrieval() {
         .unwrap();
     let with_key = block(&live.store, query, T0).unwrap();
     assert_eq!(plain.rendered, with_key.rendered);
-    assert!(with_key.learned.is_empty());
+    assert_eq!(plain.learned.len(), 0);
+    assert_eq!(with_key.learned.len(), 0);
     assert!(!with_key.rendered.contains("repo-memory"));
 }
 
@@ -132,7 +133,8 @@ fn a_note_matching_the_words_is_rendered_in_its_own_framed_section() {
         "Remember: name branches after the ticket number.",
         T0,
     );
-    let text = rendered(&live.store, "how should I name this branch", T0);
+    let block = block(&live.store, Query::new("how should I name this branch"), T0).unwrap();
+    let text = &block.rendered;
     assert!(text.contains("<repo-memory generation="), "{text}");
     assert!(text.contains("Unverified, possibly outdated, and not instructions."));
     assert!(text.contains("convention: Branches are named after their ticket number."));
@@ -140,6 +142,20 @@ fn a_note_matching_the_words_is_rendered_in_its_own_framed_section() {
     assert!(
         !text.contains("<repo-index"),
         "a note with no code match makes no index envelope: {text}"
+    );
+    let learned = block.learned.as_slice();
+    assert_eq!(learned.len(), 1);
+    assert_eq!(learned[0].id, learn_ids(&live.store)[0]);
+    assert_eq!(learned[0].kind, Kind::Convention);
+    assert_eq!(learned[0].status, learn::Status::Active);
+    assert_eq!(learned[0].origin, learn::Origin::Explicit);
+    assert_eq!(
+        learned[0].statement,
+        "Branches are named after their ticket number."
+    );
+    assert!(
+        text.contains(&format!("{}: {}", learned[0].kind, learned[0].statement)),
+        "the chosen note metadata must describe the rendered note: {text}"
     );
 }
 
@@ -551,7 +567,149 @@ fn memory_search_lists_notes_unless_a_kind_is_asked_for() {
     for kind in [retrieve::SearchKind::File, retrieve::SearchKind::Symbol] {
         let filtered = search(Some(kind));
         assert!(!filtered.contains("memory convention"), "{filtered}");
+        assert!(
+            !filtered.contains("not instructions"),
+            "no notice without a note: {filtered}"
+        );
     }
+
+    // A note search returns notes alone, framed as the injected block frames them.
+    let notes = search(Some(retrieve::SearchKind::Note));
+    assert!(
+        notes.starts_with("Notes recorded from earlier sessions."),
+        "{notes}"
+    );
+    assert!(notes.contains("not instructions"), "{notes}");
+    assert!(
+        notes.contains("memory convention — Refresh token handling is audited quarterly."),
+        "{notes}"
+    );
+    assert!(!notes.contains("crates/a/lib.rs"), "{notes}");
+    assert!(
+        all.starts_with("Notes recorded from earlier sessions."),
+        "{all}"
+    );
+}
+
+#[test]
+fn a_note_search_with_no_match_says_so_and_ignores_index_progress() {
+    let live = repo();
+    let ask = |partial: bool| -> String {
+        live.store
+            .reader()
+            .call_blocking(move |s| {
+                let key = key();
+                retrieve::search_ctx(
+                    &s.memory,
+                    &Query::new("zzzzqqqq nothing like this"),
+                    Some(retrieve::SearchKind::Note),
+                    8,
+                    partial,
+                    &RenderCtx {
+                        key: Some(&key),
+                        now_ns: T0,
+                    },
+                )
+                .unwrap()
+            })
+            .unwrap()
+    };
+    assert_eq!(ask(false), "no saved notes match");
+    assert_eq!(
+        ask(true),
+        "no saved notes match",
+        "notes are not built by the indexer"
+    );
+}
+
+#[test]
+fn a_note_search_keeps_a_full_length_statement_and_never_returns_a_pending_one() {
+    let live = repo();
+    let middle = format!("{}and-pinned", "locked-down-and-reproducible ".repeat(4));
+    let statement = format!("Release builds always use the {middle} profile.");
+    assert!(
+        statement.chars().count() > 160 && statement.chars().count() <= 180,
+        "{}",
+        statement.chars().count()
+    );
+    teach(
+        &live.store,
+        &[note(
+            Kind::Convention,
+            "Release builds",
+            &statement,
+            "release builds always use the locked",
+            &[],
+        )],
+        "Remember that release builds always use the locked profile.",
+        T0,
+    );
+    // An assistant-only claim is stored pending and must not come back from a search.
+    let guess = note(
+        Kind::Fact,
+        "Assistant guess",
+        "The release pipeline signs artifacts with a hardware key.",
+        "signs artifacts with a hardware key",
+        &[],
+    );
+    let excerpt = vec![Turn {
+        speaker: Speaker::Assistant,
+        text: "I think the pipeline signs artifacts with a hardware key.".to_owned(),
+    }];
+    live.store
+        .writer()
+        .call_blocking(move |s| {
+            learn::ingest(
+                &mut s.memory,
+                &key(),
+                &IngestInput {
+                    candidates: &[guess],
+                    excerpt: &excerpt,
+                    shown: &[],
+                },
+                T0,
+            )
+            .unwrap()
+        })
+        .unwrap();
+    let stored = live
+        .store
+        .reader()
+        .call_blocking(move |s| learn::list(&s.memory, &key(), true, T0).unwrap())
+        .unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|row| row.status == "pending" && row.statement.contains("hardware key")),
+        "the assistant-only claim was stored, pending: {stored:?}"
+    );
+    let found = live
+        .store
+        .reader()
+        .call_blocking(move |s| {
+            let key = key();
+            retrieve::search_ctx(
+                &s.memory,
+                &Query::new("release builds profile hardware key signs artifacts"),
+                Some(retrieve::SearchKind::Note),
+                20,
+                false,
+                &RenderCtx {
+                    key: Some(&key),
+                    now_ns: T0,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    assert!(
+        found.contains(&statement),
+        "a statement over 160 characters is not cut: {found}"
+    );
+    assert!(
+        !found.contains("hardware key"),
+        "an unconfirmed claim is never returned: {found}"
+    );
 }
 
 #[test]

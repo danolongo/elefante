@@ -1,4 +1,4 @@
-use crate::{Notification, StopReason, Usage};
+use crate::{MemoryStatus, Notification, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -7,10 +7,14 @@ pub enum AttachResult {
     Resumed {
         from: u64,
         events: Vec<Notification>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<MemoryStatus>,
     },
     Snapshot {
         seq: u64,
         snapshot: Box<SessionSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<MemoryStatus>,
     },
 }
 
@@ -32,6 +36,8 @@ pub struct CompletedTurn {
     pub tools: Vec<ToolState>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_note_ids: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +47,8 @@ pub struct ActiveTurn {
     pub reasoning_so_far: String,
     pub tools: Vec<ToolState>,
     pub pending_approval: Option<PendingApproval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_note_ids: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

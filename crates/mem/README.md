@@ -31,6 +31,7 @@ the graph.
 | `src/retrieve.rs` | 897 | Query processing, seeds, expansion, packing, rendering, `Retriever`. |
 | `src/brief.rs` | 259 | The repository brief and its Merkle-root cache. |
 | `src/terms.rs` | 109 | Identifier and path splitting for the search index. |
+| `src/consent.rs` | 111 | The user-level consent file: `ConsentRecord { answer, extractor }`, read and written with a keyed stamp. |
 | `src/trust.rs` | 190 | `MemKey` — the keyed `blake3` stamps and row MACs that say which rows this harness wrote. |
 | `src/learn/` | 1,900 | Learned memory: verify, dedupe, supersede, decay, compact, and the person's controls. |
 | `src/stats.rs` | 64 | `Counters` and `IndexStats` — what the gates assert on. |
@@ -167,7 +168,32 @@ most 400 estimated tokens after the `<repo-index>`; the index gets the rest, so 
 notes renders exactly what it did before notes existed. A note with no anchors belongs to the whole
 repository; an anchored one is shown only when something it is about is within the session's scope.
 
-**Controls.** `learn::list`, `forget`, `approve` and `clear` back `elefante memory …`.
+**Controls.** `learn::list`, `forget`, `approve` and `clear` back `elefante memory …`. The `*_async`
+forms in `learn/service.rs` (`list_async`, `forget_async`, `approve_async`, `clear_async`,
+`counts_async`, `load_by_ids_async`) run on the store's actors and advance its generation mirror and
+cached note counts, which is what lets the daemon serve `memory.*` and report counts without a refresh;
+`forget` returns `false` for an absent or non-learned note and `approve` for one that is not pending;
+the daemon reports either as `UNKNOWN_NOTE`. `clear` removes learned notes only, never the code graph.
+
+**Display.** `learn::display_safe(&str)` is the one definition of "safe to show": it removes Unicode
+categories Cc, Cf, Zl and Zp (controls, bidirectional and zero-width formatting, line and paragraph
+separators), turns tab and newline into a space and collapses whitespace. Ingest applies it to a
+candidate's label, statement and quote *before* verification (stripping, not rejecting, so pasted
+coloured output does not cost a legitimate note; the quote check ignores non-alphanumerics, so a
+stripped quote still matches), the prompt-path escapes use it, and the CLI and daemon apply it to every
+column they print or send. Notes stored before it existed are cleaned at display.
+
+**Consent** (`consent.rs`). The file `memory-consent` beside `memory.key` holds a list of
+`{ answer: "learn" | "off", extractor, stamp }` records, one per extractor, each stamp a keyed MAC over
+its answer and extractor. `read_all` / `read_for` return only records that verify — a missing,
+malformed, tampered or foreign-key record is indistinguishable from no answer, so it fails closed —
+and `write` replaces the answer for one extractor, keeps the verified others, and is atomic and
+`0600`. This crate stores the answer; whether
+learning may run is the daemon's decision.
+
+**Rebuilds are reportable.** `Store::reset_reason()` is `Some(Untrusted | SchemaVersion)` when opening
+discarded and recreated the database, so the daemon can say "memory was reset" instead of silently
+losing learned notes.
 
 ## Invariants
 

@@ -36,6 +36,17 @@ assert_eq!(decision.rule, "destructive-command");
 let clean = Scrubber::new().scrub(&tool_output);
 ```
 
+Any `.elefante` path component, relative to the workspace root, is denied as harness state
+(learned notes, the index, keys), including the bare directory, so `cat .elefante` and
+`grep -ra x .elefante` fail as well as `cat .elefante/memory.db`. The rule is applied to the
+root-relative path, so a workspace that itself lives under some `.elefante/` still works; the
+user-level `<home>/.elefante` is denied separately by canonical prefix. In shell commands, glob
+arguments that can expand to `.elefante` (`.elef*`, `.[e]lefante`) are denied, and recursive
+content readers over the workspace root (`grep -r x .`, `grep -rn x`, `rg -uuu x`,
+`rg --hidden x`) are escalated, because they read `.elefante/` without naming it. This reduces
+accidental reads; it is not a sandbox. Notes reach the agent through the injected context and
+`memory_search`, and a determined command can still read around the rule (see `known_gaps()`).
+
 `PathPolicy::with_denied_patterns` adds repository-relative globs on top of the built-in secret
 rules. `BashClassifier::classify` is the same as `classify_in` rooted at `.`.
 
@@ -53,10 +64,12 @@ inspected, including nodes nested under lists, pipelines, subshells, and command
 A parse error is `Escalate`, never `Allow` — unparseable input is exactly when a static
 classifier knows least.
 
-**`known_gaps()` exists so callers cannot overstate this gate.** It names four things static
+**`known_gaps()` exists so callers cannot overstate this gate.** It names what static
 classification cannot catch: runtime aliases and shell functions, commands assembled through
-variable expansion or `eval`, obfuscated command names and interpreter payloads, and filesystem
-races after classification. Stated plainly: shell obfuscation is unbounded. This is
+variable expansion or `eval`, obfuscated command names and interpreter payloads, filesystem
+races after classification, and, for `.elefante/`, shell variables naming the path
+(`D=.elefante; cat $D/memory.db`), `cd` then a relative path, interpreters or `sqlite3` reading a
+path assembled at runtime, and `xargs` or command substitution producing a path. Stated plainly: shell obfuscation is unbounded. This is
 deny-by-default for destructive verbs outside an allowlist, not pattern-matching for badness,
 and `documents_known_not_caught_obfuscation` asserts we don't claim otherwise.
 
@@ -72,11 +85,11 @@ following symlinks. `DEVELOPER_GUIDE.md` §9 has the full algorithm.
 ## Testing
 
 ```sh
-cargo test -p elefante-guard        # 15 tests, no fixtures, no network
+cargo test -p elefante-guard        # no fixtures, no network
 ```
 
-Three files mirroring the three modules — `tests/bash_classifier.rs` (4),
-`tests/path_policy.rs` (8), `tests/scrubber.rs` (3). Nothing is `#[ignore]`d and nothing needs
+Three files mirroring the three modules — `tests/bash_classifier.rs`,
+`tests/path_policy.rs`, `tests/scrubber.rs`. Nothing is `#[ignore]`d and nothing needs
 credentials; the whole crate is pure decision logic, which is the point.
 
 The path tests do real symlink and `$HOME` manipulation inside `tempfile` directories —

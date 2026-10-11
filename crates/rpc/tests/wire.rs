@@ -53,6 +53,12 @@ fn every_request_method_round_trips_with_fixed_members() {
         ("key.set", json!({"api_key":"secret"})),
         ("memory.consent", json!({"answer":"learn"})),
         ("memory.consent", json!({"answer":"off"})),
+        ("memory.list", json!({"cwd":"/tmp"})),
+        ("memory.list", json!({"cwd":"/tmp","all":true})),
+        ("memory.forget", json!({"cwd":"/tmp","id":14})),
+        ("memory.approve", json!({"cwd":"/tmp","id":14})),
+        ("memory.clear", json!({"cwd":"/tmp"})),
+        ("memory.status", json!({"cwd":"/tmp"})),
     ] {
         round_trip::<Request>(json!({"id":17,"method":method,"params":params}));
     }
@@ -80,6 +86,29 @@ fn every_request_method_round_trips_with_fixed_members() {
 
 fn usage() -> Value {
     json!({"input_tokens":1,"output_tokens":2,"reasoning_tokens":3,"cached_input_tokens":4,"cache_write_tokens":5,"cost":null})
+}
+
+fn memory_status() -> Value {
+    json!({
+        "enabled":true,
+        "consent":"granted",
+        "learning":"working",
+        "extractor":"provider/model",
+        "notes":{"active":12,"pending":1},
+        "index":"ready",
+        "spend":usage(),
+        "problem":null
+    })
+}
+
+fn memory_note(id: i64) -> Value {
+    json!({
+        "id":id,
+        "kind":"convention",
+        "status":"active",
+        "statement":"Use pnpm.",
+        "origin":"explicit"
+    })
 }
 
 fn note(seq: u64, method: &str, params: Value) -> Value {
@@ -115,6 +144,16 @@ fn every_notification_has_one_fixed_envelope() {
             json!({"stop_reason":"end_turn","usage":usage()}),
         ),
         ("session.error", json!({"message":"provider failed"})),
+        ("memory.status", memory_status()),
+        (
+            "memory.learned",
+            json!({"note":memory_note(14),"change":"added"}),
+        ),
+        (
+            "memory.learned",
+            json!({"note":memory_note(15),"change":"superseded","replaced":memory_note(14)}),
+        ),
+        ("memory.context", json!({"notes":[memory_note(14)]})),
     ] {
         round_trip::<Notification>(note(413, method, params));
     }
@@ -191,6 +230,12 @@ fn method_results_and_all_application_errors_round_trip() {
         "memory":{"consent":"unset","extractor":"provider/model"}
     }));
     round_trip::<MemoryConsentResult>(json!({"consent":"granted"}));
+    round_trip::<MemoryStatus>(memory_status());
+    round_trip::<MemoryListResult>(json!({"notes":[{
+        "id":14,"kind":"convention","status":"active","statement":"Use pnpm.",
+        "origin":"explicit","confidence":0.9,"verified":true,"reinforcements":2
+    }]}));
+    round_trip::<MemoryClearResult>(json!({"removed":3}));
     round_trip::<PromptResult>(json!({"turn_id":"t1"}));
     round_trip::<EmptyResult>(json!({}));
     round_trip::<Response>(json!({"id":"r1","result":{"session_id":"s1","seq":0}}));
@@ -201,6 +246,8 @@ fn method_results_and_all_application_errors_round_trip() {
         INVALID_SINCE,
         NO_API_KEY,
         UNKNOWN_APPROVAL,
+        UNKNOWN_NOTE,
+        MEMORY_OFF,
     ] {
         round_trip::<Response>(json!({"id":1,"error":{"code":code,"message":"message"}}));
     }

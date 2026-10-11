@@ -1,4 +1,4 @@
-use crate::{StopReason, Usage, encode_frame};
+use crate::{MemoryChange, MemoryNote, MemoryStatus, StopReason, Usage, encode_frame};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -187,6 +187,17 @@ pub enum NotificationEvent {
     },
     #[serde(rename = "session.error")]
     SessionError { message: String },
+    #[serde(rename = "memory.status")]
+    MemoryStatus(MemoryStatus),
+    #[serde(rename = "memory.learned")]
+    MemoryLearned {
+        note: MemoryNote,
+        change: MemoryChange,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced: Option<MemoryNote>,
+    },
+    #[serde(rename = "memory.context")]
+    MemoryContext { notes: Vec<MemoryNote> },
     #[serde(skip_serializing)]
     Unknown { method: String },
 }
@@ -228,6 +239,17 @@ enum KnownNotificationEvent {
     },
     #[serde(rename = "session.error")]
     SessionError { message: String },
+    #[serde(rename = "memory.status")]
+    MemoryStatus(MemoryStatus),
+    #[serde(rename = "memory.learned")]
+    MemoryLearned {
+        note: MemoryNote,
+        change: MemoryChange,
+        #[serde(default)]
+        replaced: Option<MemoryNote>,
+    },
+    #[serde(rename = "memory.context")]
+    MemoryContext { notes: Vec<MemoryNote> },
 }
 
 impl From<KnownNotificationEvent> for NotificationEvent {
@@ -276,6 +298,17 @@ impl From<KnownNotificationEvent> for NotificationEvent {
                 Self::TurnFinished { stop_reason, usage }
             }
             KnownNotificationEvent::SessionError { message } => Self::SessionError { message },
+            KnownNotificationEvent::MemoryStatus(status) => Self::MemoryStatus(status),
+            KnownNotificationEvent::MemoryLearned {
+                note,
+                change,
+                replaced,
+            } => Self::MemoryLearned {
+                note,
+                change,
+                replaced,
+            },
+            KnownNotificationEvent::MemoryContext { notes } => Self::MemoryContext { notes },
         }
     }
 }
@@ -292,9 +325,11 @@ impl<'de> Deserialize<'de> for NotificationEvent {
         match method.as_str() {
             "turn.started" | "reasoning.delta" | "text.delta" | "tool.started"
             | "tool.finished" | "approval.requested" | "approval.resolved" | "turn.finished"
-            | "session.error" => serde_json::from_value::<KnownNotificationEvent>(value)
-                .map(Into::into)
-                .map_err(serde::de::Error::custom),
+            | "session.error" | "memory.status" | "memory.learned" | "memory.context" => {
+                serde_json::from_value::<KnownNotificationEvent>(value)
+                    .map(Into::into)
+                    .map_err(serde::de::Error::custom)
+            }
             _ if value
                 .as_object()
                 .and_then(|object| object.get("params"))

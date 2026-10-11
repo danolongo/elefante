@@ -7,6 +7,8 @@ pub const TURN_IN_PROGRESS: i32 = -32002;
 pub const INVALID_SINCE: i32 = -32003;
 pub const NO_API_KEY: i32 = -32004;
 pub const UNKNOWN_APPROVAL: i32 = -32005;
+pub const UNKNOWN_NOTE: i32 = -32006;
+pub const MEMORY_OFF: i32 = -32007;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
@@ -58,6 +60,16 @@ pub enum Method {
     KeySet(KeySetParams),
     #[serde(rename = "memory.consent")]
     MemoryConsent(MemoryConsentParams),
+    #[serde(rename = "memory.list")]
+    MemoryList(MemoryListParams),
+    #[serde(rename = "memory.forget")]
+    MemoryForget(MemoryIdParams),
+    #[serde(rename = "memory.approve")]
+    MemoryApprove(MemoryIdParams),
+    #[serde(rename = "memory.clear")]
+    MemoryClear(MemoryCwdParams),
+    #[serde(rename = "memory.status")]
+    MemoryStatus(MemoryCwdParams),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +140,29 @@ pub enum MemoryConsentAnswer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryConsentParams {
     pub answer: MemoryConsentAnswer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCwdParams {
+    pub cwd: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIdParams {
+    pub cwd: String,
+    pub id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryListParams {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -227,6 +262,80 @@ pub enum MemoryConsentState {
 pub struct MemorySeed {
     pub consent: MemoryConsentState,
     pub extractor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLearningState {
+    Working,
+    Paused,
+    Failing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryIndexState {
+    Off,
+    Building,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryNoteCounts {
+    pub active: u64,
+    pub pending: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryStatus {
+    pub enabled: bool,
+    pub consent: MemoryConsentState,
+    pub learning: MemoryLearningState,
+    pub extractor: Option<String>,
+    pub notes: MemoryNoteCounts,
+    pub index: MemoryIndexState,
+    pub spend: crate::Usage,
+    pub problem: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryNote {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub statement: String,
+    pub origin: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryChange {
+    Added,
+    Promoted,
+    Superseded,
+    Revived,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub statement: String,
+    pub origin: String,
+    pub confidence: f64,
+    pub verified: bool,
+    pub reinforcements: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryListResult {
+    pub notes: Vec<MemoryRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryClearResult {
+    pub removed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

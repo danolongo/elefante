@@ -176,6 +176,40 @@ Open questions for the M1 design pass: file permissions and format for the store
 to offer the OS keychain; and whether an already-set `OPENROUTER_API_KEY` environment
 variable should win over the stored key (it should — env beats config everywhere else here).
 
+### First-run setup flow
+
+**Planned, not built.** The first-run key prompt grows into a short guided setup that runs once,
+when the harness is launched interactively with nothing configured. Three steps, in this order,
+because each needs the one before it:
+
+1. **API key.** The prompt described above (`key.set` already carries it over the wire). It comes
+   first because the next two steps list models, and the catalogue is fetched with the user's key.
+   A successful catalogue fetch doubles as proof the key works.
+2. **Default agent model.** One sentence beside the picker: *"The model that does your coding work
+   in each session — it reads, edits and runs commands, so it drives quality and cost."*
+3. **Default memory extractor model.** One sentence beside the picker: *"A background model that
+   reads excerpts of your conversations to note lasting preferences and project conventions; a
+   cheaper, faster model is usually enough."* The choices include **"same as the agent model"**,
+   which is also what an unset extractor falls back to. Because excerpts of the conversation are
+   sent to whichever model is chosen, the sentence must say so; the user should never learn that
+   from the bill.
+
+Both pickers are the model picker described below (user-scoped catalogue, pricing shown before
+the choice), not free text. Pressing Enter accepts a default at every step, so the whole flow is
+skippable, and none of it runs headless: a one-shot prompt keeps reading the environment only.
+
+Where it lands: the answers become the first rows of the `config.toml` role table
+(`[roles.author]`, `[roles.extractor]`), which is exactly the table § Role configuration defers
+until a second role exists. The extractor is that second role. **Precedence is environment, then
+`config.toml`, then fallback to the author model**, matching "env beats config everywhere else
+here". The learned-memory milestone ships the extractor role as environment variables only
+(`ELEFANTE_EXTRACT_MODEL`, `ELEFANTE_EXTRACT_EFFORT`); this flow later becomes their home, and the
+variables stay as overrides.
+
+Open for its design pass: whether the flow is re-runnable (a `setup` subcommand or TUI command)
+so a changed mind does not mean editing a file by hand, and whether the critic and triage roles
+join the flow when they exist or stay in `config.toml` as advanced settings.
+
 ### Model selection
 
 **Planned, not built.** A model is currently chosen by typing a slug into `OPENROUTER_MODEL`,

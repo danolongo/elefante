@@ -5,6 +5,7 @@ use std::{fs, path::Path, process::Command};
 use elefante_cli::memory;
 use elefante_mem::{
     MemKey, RepoId, Store,
+    consent::{self, ConsentAnswer},
     learn::{self, Candidate, IngestInput, Kind, Relation, Speaker, Turn},
     trust::RowFields,
 };
@@ -317,4 +318,79 @@ fn the_binary_dispatches_memory_commands_without_a_daemon() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let socket = tmp.path().join("no-daemon.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env("ELEFANTE_EXTRACT_MODEL", " vendor/extractor ")
+        .env("OPENROUTER_MODEL", "vendor/chat")
+        .args(["memory", "learn", "on"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"memory learning is granted\n");
+    assert!(output.stderr.is_empty());
+
+    let key_path = home.join(".elefante/memory.key");
+    let key = MemKey::load_or_create(&key_path).unwrap();
+    let consent_path = home.join(".elefante/memory-consent");
+    let record = consent::read(&consent_path, &key).unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Learn);
+    assert_eq!(record.extractor, "vendor/extractor");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env_remove("ELEFANTE_EXTRACT_MODEL")
+        .env("OPENROUTER_MODEL", "vendor/chat")
+        .args(["memory", "learn", "off"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"memory learning is declined\n");
+    let record = consent::read(&consent_path, &key).unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Off);
+    assert_eq!(record.extractor, "vendor/chat");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(tmp.path())
+        .env("HOME", &home)
+        .env("ELEFANTE_SOCKET", &socket)
+        .env_remove("ELEFANTE_EXTRACT_MODEL")
+        .env_remove("OPENROUTER_MODEL")
+        .args(["memory", "learn", "on"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let record = consent::read(&consent_path, &key).unwrap();
+    assert_eq!(record.answer, ConsentAnswer::Learn);
+    assert_eq!(record.extractor, "anthropic/claude-sonnet-5");
+}
+
+#[test]
+fn memory_learn_rejects_bad_settings_before_resolving_a_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    for args in [vec!["memory", "learn"], vec!["memory", "learn", "maybe"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+            .current_dir(tmp.path())
+            .env("HOME", &home)
+            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("memory learn"),
+            "{output:?}"
+        );
+    }
 }

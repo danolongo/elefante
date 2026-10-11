@@ -16,7 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear|learn>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const PAUSED_NOTICE: &str = "memory: learning is paused (not set up) — run “elefante memory learn on” or set ELEFANTE_LEARN=1";
+
+fn learning_is_paused(create_result: &Value) -> bool {
+    create_result["memory"]["consent"].as_str() == Some("unset")
+}
 
 struct Options {
     prompt: Option<String>,
@@ -416,6 +421,18 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("memory") {
         let cwd = env::current_dir().context("failed to determine current directory")?;
         let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
+        if let Some(answer) = elefante_cli::memory::learn_answer(&args[1..])? {
+            let path = socket_path()?;
+            if let Ok(stream) = UnixStream::connect(path) {
+                let mut client = Client::new(stream);
+                let result = client.request("memory.consent", json!({"answer":answer}))?;
+                let consent = result["consent"]
+                    .as_str()
+                    .context("memory.consent returned no consent state")?;
+                println!("memory learning is {consent}");
+                return Ok(());
+            }
+        }
         let code = elefante_cli::memory::run(&args[1..], &cwd, &key_path, &mut io::stdout())?;
         std::process::exit(code);
     }
@@ -427,6 +444,9 @@ fn main() -> anyhow::Result<()> {
     };
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let created = client.request("session.create", json!({"cwd":cwd,"model":options.model,"effort":options.effort,"max_rounds":options.max_rounds,"max_tokens":options.max_tokens}))?;
+    if learning_is_paused(&created) && io::stderr().is_terminal() {
+        eprintln!("{PAUSED_NOTICE}");
+    }
     let session = created["session_id"]
         .as_str()
         .context("session.create returned no session_id")?;
@@ -439,4 +459,24 @@ fn main() -> anyhow::Result<()> {
     result?;
     close?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_explicit_unset_seed_requests_the_headless_notice() {
+        assert!(learning_is_paused(
+            &json!({"memory":{"consent":"unset","extractor":"model"}})
+        ));
+        for result in [
+            json!({}),
+            json!({"memory":{"consent":"granted","extractor":"model"}}),
+            json!({"memory":{"consent":"declined","extractor":"model"}}),
+            json!({"memory":{"consent":"off","extractor":null}}),
+        ] {
+            assert!(!learning_is_paused(&result));
+        }
+    }
 }

@@ -19,9 +19,9 @@ Everything below describes the headless mode unless it says otherwise.
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/main.rs` | 435 | Argument and environment parsing, daemon discovery and spawn, socket client, session lifecycle. |
-| `src/lib.rs` | 125 | `StreamRenderer`, and the `memory` module. |
-| `src/memory.rs` | 140 | `elefante memory list \| forget \| approve \| clear` — see below. |
+| `src/main.rs` | 482 | Argument and environment parsing, daemon discovery and spawn, socket client, session lifecycle. |
+| `src/lib.rs` | 132 | `StreamRenderer`, and the `memory` module. |
+| `src/memory.rs` | 220 | `elefante memory` administration, including learned-memory consent — see below. |
 
 ## Entry points
 
@@ -42,10 +42,13 @@ elefante memory list [--all]   what was learned about this repository (--all add
 elefante memory forget <id>    delete one learned note
 elefante memory approve <id>   accept a note only the assistant had vouched for
 elefante memory clear --yes    delete every learned note for this repository
+elefante memory learn on|off   allow or decline learning from conversations
 ```
 
-These open the repository's store directly and never need the daemon. Learned notes are free-form
-text that is injected into prompts, so a person can always see them and remove them: `list` also
+The note commands open the repository's store directly. `memory learn` prefers an already-listening
+daemon so its answer applies to live sessions immediately; it never starts a daemon just for this
+command, and writes the tamper-evident user consent file directly when none is listening. Learned
+notes are free-form text that is injected into prompts, so a person can always see them and remove them: `list` also
 shows rows that fail their integrity check, flagged, so they can be forgotten. A running daemon
 notices a change within its cache lifetime (about thirty seconds). `clear` refuses without `--yes`.
 
@@ -75,6 +78,10 @@ reader thread so a daemon that dies during startup reports *why* rather than tim
 **With no key and a non-TTY stdin the client exits non-zero and does not prompt**
 (`main.rs:303`). A prompt written to a pipe is a hang, not a prompt. With a TTY it reads the key
 from stdin and sends `key.set`.
+
+**Headless learning setup is a notice, never a prompt.** If the daemon reports consent as unset, a
+one-shot invocation prints one instruction to terminal stderr before the turn. Redirected stderr and
+older daemons that omit the additive memory result remain silent; stdout is always only the answer.
 
 **Headless mode denies every escalated command.** On `approval.requested` it immediately sends
 `session.resolve_approval` with `deny` (`main.rs:382-396`), so a one-shot run can never execute a

@@ -30,6 +30,7 @@ pub use parse::{ParseOutcome, parse_output};
 pub use service::{ingest_async, nearest_async};
 pub use sim::{is_duplicate, jaccard, overlap, tokens};
 pub use store::{LearnedNode, load_active_and_pending, nearest};
+pub(crate) use store::{about_targets, anchor_paths, learned_about, load_active_by_ids, seed_ids};
 pub use verify::{has_explicit_cue, is_dangerous_token};
 
 // ----- limits: named, so tuning changes numbers and never structure -----

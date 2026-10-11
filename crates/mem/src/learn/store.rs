@@ -276,3 +276,124 @@ pub(super) fn delete_node(tx: &Transaction<'_>, id: i64) -> Result<(), MemError>
     tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
     Ok(())
 }
+
+// ----- reads for retrieval -----
+
+use std::collections::HashMap;
+
+/// Active learned notes with these ids that verify, in id order.
+pub(crate) fn load_active_by_ids(
+    conn: &Connection,
+    key: &MemKey,
+    ids: &[i64],
+) -> Result<Vec<LearnedNode>, MemError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM node
+         WHERE id IN ({list}) AND kind IN {KINDS_SQL} AND source LIKE '{SOURCE_PREFIX}%'
+           AND status = 'active' ORDER BY id"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| node_from_row(row, key))?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.extend(row?);
+    }
+    Ok(nodes)
+}
+
+/// The top `limit` active learned notes matching a full-text expression, best first.
+pub(crate) fn seed_ids(
+    conn: &Connection,
+    expression: &str,
+    limit: usize,
+) -> Result<Vec<i64>, MemError> {
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT n.id FROM node_fts f JOIN node n ON n.id = f.rowid
+         WHERE node_fts MATCH ?1 AND n.status = 'active'
+           AND n.kind IN {KINDS_SQL} AND n.source LIKE '{SOURCE_PREFIX}%'
+         ORDER BY bm25(node_fts, 10.0, 4.0, 1.0), n.key
+         LIMIT ?2"
+    ))?;
+    let ids = statement
+        .query_map(
+            params![expression, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |r| r.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// `(learned, code)` pairs for `about` edges leaving the given learned notes.
+pub(crate) fn about_targets(
+    conn: &Connection,
+    learned: &[i64],
+) -> Result<Vec<(i64, i64)>, MemError> {
+    if learned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = learned
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn.prepare(&format!(
+        "SELECT src, dst FROM edge WHERE src IN ({list}) AND rel = 'about' ORDER BY src, dst"
+    ))?;
+    let pairs = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(pairs)
+}
+
+/// `(code, learned)` pairs for active learned notes anchored at the given code nodes.
+pub(crate) fn learned_about(conn: &Connection, code: &[i64]) -> Result<Vec<(i64, i64)>, MemError> {
+    if code.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = code
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn.prepare(&format!(
+        "SELECT e.dst, e.src FROM edge e JOIN node s ON s.id = e.src
+         WHERE e.dst IN ({list}) AND e.rel = 'about' AND s.status = 'active'
+           AND s.kind IN {KINDS_SQL} AND s.source LIKE '{SOURCE_PREFIX}%'
+         ORDER BY e.dst, e.src"
+    ))?;
+    let pairs = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(pairs)
+}
+
+/// Repository paths each learned note is anchored to (a symbol anchor reports its file).
+pub(crate) fn anchor_paths(
+    conn: &Connection,
+    learned: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, MemError> {
+    let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+    if learned.is_empty() {
+        return Ok(out);
+    }
+    let list = learned
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn.prepare(&format!(
+        "SELECT e.src, COALESCE(f.key, n.key) FROM edge e JOIN node n ON n.id = e.dst
+         LEFT JOIN node f ON f.id = n.file_id
+         WHERE e.src IN ({list}) AND e.rel = 'about' ORDER BY e.src, 2"
+    ))?;
+    let rows = statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, path) = row?;
+        out.entry(id).or_default().push(path);
+    }
+    Ok(out)
+}

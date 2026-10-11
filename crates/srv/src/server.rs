@@ -20,11 +20,12 @@ use elefante_core::{
     memory::{MemContext, MemSearchTool},
 };
 use elefante_mem::{
-    Indexer, MemKey, RepoId, Store,
+    Indexer, MemKey, RepoId, Store, StoreDir,
     consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
     indexer::IndexOptions,
     learn,
     retrieve::Retriever,
+    schema::open_memory_reader,
     trust::KEY_FILE,
 };
 use elefante_provider::{Message, OpenRouterProvider, Provider};
@@ -1123,46 +1124,120 @@ fn validated_cwd(params: &Value) -> Result<PathBuf, (i32, String)> {
     Ok(cwd)
 }
 
-fn repository_memory(state: &Shared, cwd: &Path) -> Result<Arc<RepoMemory>, (i32, String)> {
+/// What a repository-level request found at a working directory.
+enum RepoAccess {
+    /// A store this installation made, open for the request.
+    Live(Arc<RepoMemory>),
+    /// Nothing has been saved here: there is no store, and reading about one must not make it.
+    Absent,
+    /// A store this installation did not make. It is left exactly as found.
+    Foreign,
+}
+
+const FOREIGN_STORE: &str = "memory here was not made by this installation";
+
+/// Finds the repository's store for a `memory.*` request without creating or rebuilding anything.
+/// A live session's store is reused. Otherwise an existing store is opened only if its stamp
+/// verifies, and is dropped when the request ends. Sessions are the only path that may create or
+/// rebuild a store.
+fn repository_memory(state: &Shared, cwd: &Path) -> Result<RepoAccess, (i32, String)> {
     if !state.config.memory {
         return Err((MEMORY_OFF, "memory is off".to_owned()));
     }
     let repo =
         RepoId::resolve(cwd).map_err(|_| (MEMORY_OFF, "memory is unavailable".to_owned()))?;
-    let mut memories = state.memories.lock().expect("memory registry poisoned");
-    if let Some(memory) = memories.get(repo.root()) {
-        return Ok(Arc::clone(memory));
+    if let Some(memory) = state
+        .memories
+        .lock()
+        .expect("memory registry poisoned")
+        .get(repo.root())
+    {
+        return Ok(RepoAccess::Live(Arc::clone(memory)));
     }
-    let opened = memory_key(&state.config)
-        .and_then(|key| RepoMemory::open(&repo, key))
-        .map_err(|_| (MEMORY_OFF, "memory is unavailable".to_owned()))?;
-    let opened = Arc::new(opened);
-    memories.insert(repo.root().to_path_buf(), Arc::clone(&opened));
-    Ok(opened)
+    let database = StoreDir::path_for(repo.root()).join("memory.db");
+    if !database.exists() {
+        return Ok(RepoAccess::Absent);
+    }
+    let unavailable = |_| (MEMORY_OFF, "memory is unavailable".to_owned());
+    let key = memory_key(&state.config).map_err(unavailable)?;
+    let trusted = open_memory_reader(&database)
+        .is_ok_and(|connection| learn::store_stamp_valid(&connection, &key));
+    if !trusted {
+        return Ok(RepoAccess::Foreign);
+    }
+    RepoMemory::open(&repo, key)
+        .map(|opened| RepoAccess::Live(Arc::new(opened)))
+        .map_err(unavailable)
 }
 
+/// The numeric part of a session id (`s<instance>-<n>`), so "most recent" is well defined.
+fn session_sequence(id: &str) -> u64 {
+    id.rsplit('-')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A repository's status for a client with no session of its own. With several live sessions it is
+/// deterministic: the most recently created session speaks for consent and the extractor, spend is
+/// the sum over them, and a failing session makes the whole failing.
 fn repository_status(state: &Shared, memory: &Arc<RepoMemory>) -> MemoryStatus {
-    let entry = {
-        let sessions = state.sessions.lock().expect("registry poisoned");
-        sessions
-            .values()
-            .find(|entry| {
-                entry
-                    .memory
-                    .as_ref()
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, memory))
-            })
-            .cloned()
+    let mut entries: Vec<(u64, Arc<SessionEntry>)> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .memory
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, memory))
+        })
+        .map(|(id, entry)| (session_sequence(id), Arc::clone(entry)))
+        .collect();
+    entries.sort_by_key(|(sequence, _)| *sequence);
+    let Some((_, latest)) = entries.last() else {
+        let config = LearnConfig::new(state.standalone_extractor.clone());
+        let local = SessionMemoryState {
+            reset_pending: memory.store.reset_reason().is_some(),
+            ..SessionMemoryState::default()
+        };
+        return build_memory_status(state, Some(memory), Some(&config), &local);
     };
-    if let Some(entry) = entry {
-        return memory_status(state, &entry);
+    let mut status = memory_status(state, latest);
+    let mut spend = elefante_provider::Usage::default();
+    for (_, entry) in &entries {
+        let other = memory_status(state, entry);
+        spend.accumulate(other.spend);
+        if other.learning == MemoryLearningState::Failing {
+            status.learning = MemoryLearningState::Failing;
+            status.problem = status.problem.or(other.problem);
+        }
     }
+    status.spend = spend;
+    status
+}
+
+/// The status of a repository with no store: nothing to count, nothing indexed.
+fn absent_status(state: &Shared) -> MemoryStatus {
     let config = LearnConfig::new(state.standalone_extractor.clone());
-    let local = SessionMemoryState {
-        reset_pending: memory.store.reset_reason().is_some(),
-        ..SessionMemoryState::default()
-    };
-    build_memory_status(state, Some(memory), Some(&config), &local)
+    build_memory_status(state, None, Some(&config), &SessionMemoryState::default())
+}
+
+/// A learned row as it goes on the wire: the origin without the store's `learned:` prefix, as
+/// `memory.learned` already sends it.
+fn wire_row(row: &learn::LearnedRow) -> Value {
+    let origin = row
+        .origin
+        .strip_prefix(learn::SOURCE_PREFIX)
+        .unwrap_or(&row.origin)
+        .to_owned();
+    json!({
+        "id":row.id,"kind":row.kind,"status":row.status,
+        "statement":row.statement,"origin":origin,
+        "confidence":row.effective_confidence,"verified":row.verified,
+        "reinforcements":row.reinforcements
+    })
 }
 
 async fn handle_repository_memory(
@@ -1173,7 +1248,26 @@ async fn handle_repository_memory(
     params: &Value,
 ) -> RpcResult {
     let cwd = validated_cwd(params)?;
-    let memory = repository_memory(state, &cwd)?;
+    let memory = match repository_memory(state, &cwd)? {
+        RepoAccess::Live(memory) => memory,
+        RepoAccess::Foreign => return Err((MEMORY_OFF, FOREIGN_STORE.to_owned())),
+        RepoAccess::Absent => {
+            // Nothing is stored. Answer as an empty store would, and create nothing.
+            let result = match method {
+                "memory.list" => json!({"notes":[]}),
+                "memory.clear" => json!({"removed":0}),
+                "memory.forget" | "memory.approve" => {
+                    return Err((UNKNOWN_NOTE, "unknown learned note".to_owned()));
+                }
+                "memory.status" => {
+                    serde_json::to_value(absent_status(state)).expect("memory status serialization")
+                }
+                _ => return Err((-32601, "unknown method".to_owned())),
+            };
+            queue.push(response(id.clone(), result));
+            return Ok(());
+        }
+    };
     match method {
         "memory.list" => {
             let all = match params.get("all") {
@@ -1185,17 +1279,7 @@ async fn handle_repository_memory(
             let rows = learn::list_async(&memory.store, all)
                 .await
                 .map_err(invalid)?;
-            let notes: Vec<_> = rows
-                .into_iter()
-                .map(|row| {
-                    json!({
-                        "id":row.id,"kind":row.kind,"status":row.status,
-                        "statement":row.statement,"origin":row.origin,
-                        "confidence":row.effective_confidence,"verified":row.verified,
-                        "reinforcements":row.reinforcements
-                    })
-                })
-                .collect();
+            let notes: Vec<_> = rows.iter().map(wire_row).collect();
             queue.push(response(id.clone(), json!({"notes":notes})));
         }
         "memory.forget" | "memory.approve" => {

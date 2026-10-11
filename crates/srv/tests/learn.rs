@@ -5,8 +5,9 @@
 use std::{fs, path::Path, time::Duration};
 
 use elefante_mem::{
-    MemKey,
+    MemKey, RepoId, Store,
     consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
+    learn,
     trust::KEY_FILE,
 };
 use elefante_rpc::Usage;
@@ -1194,4 +1195,170 @@ async fn a_change_written_to_the_consent_file_is_honoured_without_a_restart() {
 
     let after = h.create(&mut client, 2, Some("vendor/one")).await;
     assert_eq!(after["result"]["memory"]["consent"], "granted");
+}
+
+#[tokio::test]
+async fn reading_saved_notes_where_nothing_is_saved_creates_nothing() {
+    let h = Harness::start(Options::default()).await;
+    let plain = tempfile::tempdir().unwrap();
+    let mut client = Client::connect(&h.config.socket).await;
+    let cwd = json!({"cwd": plain.path()});
+
+    let list = client.rpc(1, "memory.list", cwd.clone()).await;
+    assert_eq!(list["result"]["notes"], json!([]));
+    let status = client.rpc(2, "memory.status", cwd.clone()).await;
+    assert_eq!(status["result"]["notes"], json!({"active":0,"pending":0}));
+    let forget = client
+        .rpc(3, "memory.forget", json!({"cwd": plain.path(), "id": 1}))
+        .await;
+    assert_eq!(forget["error"]["code"], -32006);
+    let approve = client
+        .rpc(4, "memory.approve", json!({"cwd": plain.path(), "id": 1}))
+        .await;
+    assert_eq!(approve["error"]["code"], -32006);
+    let clear = client.rpc(5, "memory.clear", cwd).await;
+    assert_eq!(clear["result"]["removed"], 0);
+
+    assert!(
+        !plain.path().join(".elefante").exists(),
+        "a read must not create a store directory"
+    );
+}
+
+#[tokio::test]
+async fn a_store_this_installation_did_not_make_is_refused_and_left_untouched() {
+    let h = Harness::start(Options::default()).await;
+    let repo = RepoId::resolve(h.repo.path()).unwrap();
+    {
+        // Another installation's store, with a note of its own in it.
+        let foreign = Store::open_with_key(&repo, MemKey::from_bytes([9; 32])).unwrap();
+        let foreign_candidate = vec![learn::Candidate {
+            kind: learn::Kind::Fact,
+            label: "Foreign".to_owned(),
+            statement: "Another installation wrote this.".to_owned(),
+            anchors: Vec::new(),
+            quote: "another installation wrote this".to_owned(),
+            relation: learn::Relation::New,
+        }];
+        let excerpt = vec![learn::Turn {
+            speaker: learn::Speaker::User,
+            text: "Remember: another installation wrote this.".to_owned(),
+        }];
+        foreign
+            .writer()
+            .call(move |s| {
+                learn::ingest(
+                    &mut s.memory,
+                    &MemKey::from_bytes([9; 32]),
+                    &learn::IngestInput {
+                        candidates: &foreign_candidate,
+                        excerpt: &excerpt,
+                        shown: &[],
+                    },
+                    1_000,
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let database = h.repo.path().join(".elefante/memory.db");
+    let before = fs::read(&database).unwrap();
+
+    let mut client = Client::connect(&h.config.socket).await;
+    for (id, method) in [
+        (1, "memory.list"),
+        (2, "memory.status"),
+        (3, "memory.clear"),
+    ] {
+        let reply = client.rpc(id, method, json!({"cwd": h.repo.path()})).await;
+        if method == "memory.status" {
+            continue;
+        }
+        assert_eq!(reply["error"]["code"], -32007, "{method}: {reply}");
+    }
+    let forget = client
+        .rpc(4, "memory.forget", json!({"cwd": h.repo.path(), "id": 1}))
+        .await;
+    assert_eq!(forget["error"]["code"], -32007);
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        before,
+        "nothing was rebuilt, rewritten or removed"
+    );
+}
+
+#[tokio::test]
+async fn a_repository_status_with_several_sessions_is_deterministic_and_worst_wins() {
+    let h = Harness::start(Options {
+        learn: LearnMode::On,
+        extract_errors: 3,
+        ..Options::default()
+    })
+    .await;
+    let mut first = Client::connect(&h.config.socket).await;
+    let mut second = Client::connect(&h.config.socket).await;
+    let quiet = h.create(&mut first, 1, None).await;
+    let quiet = quiet["result"]["session_id"].as_str().unwrap().to_owned();
+    let busy = h.create(&mut second, 1, None).await;
+    let busy = busy["result"]["session_id"].as_str().unwrap().to_owned();
+
+    let mut probe = Client::connect(&h.config.socket).await;
+    let cwd = json!({"cwd": h.repo.path()});
+    let healthy = probe.rpc(1, "memory.status", cwd.clone()).await;
+    assert_eq!(healthy["result"]["learning"], "working");
+
+    h.prompt(
+        &mut second,
+        &busy,
+        "Remember: name branches after the ticket number.",
+    )
+    .await;
+    let mut id = 10;
+    let mut repository = Value::Null;
+    for _ in 0..200 {
+        id += 1;
+        repository = probe.rpc(id, "memory.status", cwd.clone()).await["result"].clone();
+        if repository["learning"] == "failing" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(repository["learning"], "failing", "{repository}");
+    assert!(repository["problem"].is_string());
+    // The quiet session never failed, yet the repository does not hide the other one's problem, and
+    // asking again gives the same answer.
+    let untouched = memory_of(&mut first, 50, &quiet).await;
+    assert_eq!(untouched["learning"], "working");
+    let again = probe.rpc(60, "memory.status", cwd).await;
+    assert_eq!(again["result"]["learning"], "failing");
+}
+
+#[tokio::test]
+async fn listed_notes_carry_the_origin_without_the_stores_prefix() {
+    let h = Harness::start(Options {
+        learn: LearnMode::On,
+        extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: name branches after the ticket number.",
+    )
+    .await;
+    h.notes_appear(1).await;
+    let list = client
+        .rpc(3, "memory.list", json!({"cwd": h.repo.path()}))
+        .await;
+    let origin = list["result"]["notes"][0]["origin"].as_str().unwrap();
+    assert!(
+        ["explicit", "stated", "assistant"].contains(&origin),
+        "{origin}"
+    );
 }

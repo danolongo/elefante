@@ -693,11 +693,15 @@ demand, without starting an indexer refresh.
 | `memory.forget` `{cwd,id}` | `{}`. `UNKNOWN_NOTE` if the id is absent or not a learned note. Index rows can never be forgotten through it. |
 | `memory.approve` `{cwd,id}` | `{}`. Promotes a pending note. `UNKNOWN_NOTE` if there is no such pending note. |
 | `memory.clear` `{cwd}` | `{ removed }`. Deletes every learned note and leaves the code graph alone. |
-| `memory.status` `{cwd}` | A `MemoryStatus`: the live session's if one in that repository exists, else a fresh one for the default extractor. |
+| `memory.status` `{cwd}` | A `MemoryStatus`. With live sessions in that repository it is deterministic: the most recently created session speaks for consent and extractor, `spend` is the sum over all of them, and one failing session makes it `failing`. With none, a fresh one for the default extractor; with no store at all, one with no notes and `enabled: false`. |
 | `memory.consent` `{answer, extractor?}` | `{ consent }`, the resulting state. User-level, not per repository: it persists, applies to every live session whose extractor it names at once, and emits `memory.status` to each. An answer is **for one extractor model**: `extractor` if given (a blank one is `-32602`), else the extractor of the **last session this connection created or attached**, else the configured default extractor (`ELEFANTE_EXTRACT_MODEL`, `OPENROUTER_MODEL`, the built-in default). Answering for one model neither grants nor withdraws anything for another. When the operator switch decides (`ELEFANTE_LEARN` is `1`/`on` or `0`/`off`), it changes nothing and returns `off` or `granted`. An answer that revokes consent discards any text the learner was holding. |
 
-All of these answer `MEMORY_OFF` (`-32007`) when the repository has no usable store, except
-`memory.consent`, which does not need one. A mutation advances the store's generation, so a
+These methods **never create or rebuild a store**; only starting a session may. With no store
+beneath the directory they answer as an empty store would (`list` → `[]`, `clear` → `removed: 0`,
+`forget`/`approve` → `UNKNOWN_NOTE`) and create nothing; a store this installation did not make is
+refused with `MEMORY_OFF` (`-32007`) and left exactly as found. `memory.consent` does not need a store.
+Rows carry `origin` without the store's `learned:` prefix (`explicit`, `stated`, `assistant`), as
+`memory.learned` does. A mutation advances the store's generation, so a
 `forget` or `clear` affects the next retrieval; statements already in a ring or on a screen are
 not recalled.
 

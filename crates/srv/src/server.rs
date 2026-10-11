@@ -1415,7 +1415,9 @@ fn discard_revoked_learning(state: &Shared) {
         if !consent.granted(extractor(&entry)) {
             let mut learning = entry.learning.lock().expect("learning poisoned");
             learning.history.clear();
-            learning.learner = None;
+            if let Some(learner) = learning.learner.take() {
+                learner.cancel();
+            }
             learning.idle_generation = learning.idle_generation.wrapping_add(1);
         }
     }
@@ -1609,7 +1611,9 @@ fn observe_learning(
     learning.seen_messages = messages.len();
     if !still_granted {
         learning.history.clear();
-        learning.learner = None;
+        if let Some(learner) = learning.learner.take() {
+            learner.cancel();
+        }
         learning.idle_generation = learning.idle_generation.wrapping_add(1);
         return;
     }

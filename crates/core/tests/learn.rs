@@ -1091,3 +1091,80 @@ fn the_schema_asks_for_nothing_a_strict_provider_commonly_rejects() {
     assert!(!text.contains("anyOf") && !text.contains("oneOf"), "{text}");
     assert!(text.contains("\"additionalProperties\":false"));
 }
+
+// ----- withdrawing consent -----
+
+async fn wait_for_calls(script: &Script, calls: usize) {
+    for _ in 0..500 {
+        if script.count() >= calls {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("the extractor was never called {calls} times");
+}
+
+#[tokio::test]
+async fn cancelling_drops_a_call_in_flight_and_reports_nothing() {
+    let (_tmp, store) = store();
+    let gate = Arc::new(Semaphore::new(0));
+    let script = Script::gated(
+        vec![reply(&json!([note(
+            "Branches are named after their ticket number.",
+            "name branches after the ticket number",
+        )]))],
+        Arc::clone(&gate),
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let learner = learner_with_sink(&store, &script, config(), Arc::clone(&sink));
+    learner.observe(&[user("Remember: name branches after the ticket number.")]);
+    wait_for_calls(&script, 1).await;
+
+    learner.cancel();
+    // The call was never released, yet the learner goes idle: the call itself was dropped.
+    settle(&learner).await;
+    gate.add_permits(10);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(learned(&store).await.is_empty(), "the reply was not stored");
+    assert!(
+        sink.changes.lock().unwrap().is_empty(),
+        "nothing was reported"
+    );
+    assert_eq!(learner.pending_turns(), 0, "what was waiting is forgotten");
+    assert_eq!(script.count(), 1);
+    assert!(learner.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancelled_learner_does_not_retry_a_failed_batch_or_take_new_text() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        reply(&json!([note(
+            "Dependencies are managed with pnpm.",
+            "always use pnpm",
+        )])),
+    ]);
+    let mut slow = config();
+    slow.retry_delay = Duration::from_millis(300);
+    let learner = learner(&store, &script, slow);
+    let mut history = vec![user("Remember: always use pnpm.")];
+    learner.observe(&history);
+    wait_for_calls(&script, 1).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    learner.cancel();
+    history.push(user("Remember: more text after the withdrawal."));
+    learner.observe(&history);
+    learner.flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(script.count(), 1, "the failed batch was not sent again");
+    assert!(learned(&store).await.is_empty());
+    assert_eq!(
+        learner.pending_turns(),
+        0,
+        "text offered after cancel is not read"
+    );
+}

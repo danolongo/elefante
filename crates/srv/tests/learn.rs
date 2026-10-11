@@ -74,6 +74,8 @@ struct Options {
     idle_timeout: Duration,
     extract: Value,
     extract_usage: Usage,
+    extract_delay: Duration,
+    extract_errors: usize,
     preconsent: Option<ConsentRecord>,
 }
 
@@ -86,6 +88,8 @@ impl Default for Options {
             idle_timeout: Duration::from_secs(60),
             extract: json!([]),
             extract_usage: Usage::default(),
+            extract_delay: Duration::ZERO,
+            extract_errors: 0,
             preconsent: None,
         }
     }
@@ -114,6 +118,8 @@ impl Harness {
             "rounds": [[{"TextDelta": "ok"}, {"Stop": "end_turn"}]],
             "extract": options.extract,
             "extract_usage": options.extract_usage,
+            "extract_delay_ms": u64::try_from(options.extract_delay.as_millis()).unwrap(),
+            "extract_errors": options.extract_errors,
             "record_requests": dir.path().join("requests.jsonl"),
         });
         fs::write(&script, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -988,4 +994,47 @@ async fn an_invented_quote_is_refused_and_a_real_one_is_kept() {
     .await;
     let notes = h.notes_appear(1).await;
     assert_eq!(notes[0].1, "active");
+}
+
+#[tokio::test]
+async fn withdrawing_consent_while_an_extraction_is_out_stores_and_reports_nothing() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        extract_delay: Duration::from_millis(600),
+        extract: json!([reply(
+            "Deploys use the private pipeline.",
+            "we deploy with the private pipeline"
+        )]),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    client
+        .rpc(2, "memory.consent", json!({"answer":"learn"}))
+        .await;
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: we deploy with the private pipeline.",
+    )
+    .await;
+    // The extractor has been asked (the request is recorded) but its reply is still held.
+    for _ in 0..200 {
+        if !h.extractions().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.extractions().len(), 1, "an extraction is out");
+
+    let revoked = client
+        .rpc(3, "memory.consent", json!({"answer":"off"}))
+        .await;
+    assert_eq!(revoked["result"]["consent"], "declined");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(h.notes().is_empty(), "the late reply was not stored");
+    assert_eq!(h.extractions().len(), 1, "and nothing was asked again");
 }

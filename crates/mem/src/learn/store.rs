@@ -281,8 +281,11 @@ pub(super) fn delete_node(tx: &Transaction<'_>, id: i64) -> Result<(), MemError>
 
 use std::collections::HashMap;
 
-/// Active learned notes with these ids that verify, in id order.
-pub(crate) fn load_active_by_ids(
+/// Learned notes with these ids that verify, in id order, regardless of status.
+///
+/// # Errors
+/// SQLite errors.
+pub fn load_by_ids(
     conn: &Connection,
     key: &MemKey,
     ids: &[i64],
@@ -294,7 +297,7 @@ pub(crate) fn load_active_by_ids(
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM node
          WHERE id IN ({list}) AND kind IN {KINDS_SQL} AND source LIKE '{SOURCE_PREFIX}%'
-           AND status = 'active' ORDER BY id"
+         ORDER BY id"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map([], |row| node_from_row(row, key))?;
@@ -303,6 +306,18 @@ pub(crate) fn load_active_by_ids(
         nodes.extend(row?);
     }
     Ok(nodes)
+}
+
+/// Active learned notes with these ids that verify, in id order.
+pub(crate) fn load_active_by_ids(
+    conn: &Connection,
+    key: &MemKey,
+    ids: &[i64],
+) -> Result<Vec<LearnedNode>, MemError> {
+    Ok(load_by_ids(conn, key, ids)?
+        .into_iter()
+        .filter(|node| node.status == Status::Active)
+        .collect())
 }
 
 /// The top `limit` active learned notes matching a full-text expression, best first.

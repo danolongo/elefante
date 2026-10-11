@@ -27,9 +27,12 @@ pub use compact::{
 };
 pub use ingest::{IngestInput, IngestReport, Rejection, ingest};
 pub use parse::{ParseOutcome, parse_output};
-pub use service::{ingest_async, nearest_async};
+pub use service::{
+    NoteCounts, approve_async, clear_async, counts_async, forget_async, ingest_async, list_async,
+    load_by_ids_async, nearest_async,
+};
 pub use sim::{is_duplicate, jaccard, overlap, tokens};
-pub use store::{LearnedNode, load_active_and_pending, nearest};
+pub use store::{LearnedNode, load_active_and_pending, load_by_ids, nearest};
 pub(crate) use store::{about_targets, anchor_paths, learned_about, load_active_by_ids, seed_ids};
 pub use verify::{has_explicit_cue, is_dangerous_token};
 

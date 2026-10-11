@@ -13,8 +13,8 @@ use std::{
 };
 
 use elefante_core::learn::{
-    EXTRACTOR_SYSTEM_PROMPT, LearnConfig, Learner, build_request, response_schema,
-    turns_from_messages,
+    ChangedNote, EXTRACTOR_SYSTEM_PROMPT, LearnChange, LearnConfig, LearnFailure, LearnHealth,
+    LearnSink, Learner, build_request, response_schema, turns_from_messages,
 };
 use elefante_guard::Scrubber;
 use elefante_mem::{
@@ -122,7 +122,10 @@ impl Provider for Handle {
                     Ok(Event::Usage(Usage {
                         input_tokens: 100,
                         output_tokens: 20,
-                        ..Usage::default()
+                        reasoning_tokens: 3,
+                        cached_input_tokens: 4,
+                        cache_write_tokens: 5,
+                        cost: Some(0.25),
                     })),
                     Ok(Event::Stop(StopReason::EndTurn)),
                 ],
@@ -195,6 +198,41 @@ fn learner(store: &Arc<Store>, script: &Arc<Script>, config: LearnConfig) -> Arc
         Arc::clone(store),
         Arc::new(Handle(Arc::clone(script))),
         config,
+    )
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    usage: Mutex<Vec<Usage>>,
+    health: Mutex<Vec<LearnHealth>>,
+    changes: Mutex<Vec<ChangedNote>>,
+}
+
+impl LearnSink for RecordingSink {
+    fn learned(&self, changes: &[ChangedNote]) {
+        self.changes.lock().unwrap().extend_from_slice(changes);
+    }
+
+    fn usage(&self, usage: Usage) {
+        self.usage.lock().unwrap().push(usage);
+    }
+
+    fn health(&self, health: LearnHealth) {
+        self.health.lock().unwrap().push(health);
+    }
+}
+
+fn learner_with_sink(
+    store: &Arc<Store>,
+    script: &Arc<Script>,
+    config: LearnConfig,
+    sink: Arc<RecordingSink>,
+) -> Arc<Learner> {
+    Learner::with_sink(
+        Arc::clone(store),
+        Arc::new(Handle(Arc::clone(script))),
+        config,
+        sink,
     )
 }
 
@@ -568,6 +606,69 @@ async fn a_failure_keeps_the_text_and_a_retry_that_succeeds_clears_it() {
 }
 
 #[tokio::test]
+async fn sink_reports_usage_health_recovery_and_one_normalized_note_change() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Text("not json".to_owned()),
+        reply(&json!([note(
+            "Branches are named after their ticket number.",
+            "name branches after the ticket number",
+        )])),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let learner = learner_with_sink(&store, &script, config(), Arc::clone(&sink));
+
+    learner.observe(&[user("Remember: name branches after the ticket number.")]);
+    settle(&learner).await;
+
+    assert_eq!(
+        *sink.usage.lock().unwrap(),
+        vec![
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: 3,
+                cached_input_tokens: 4,
+                cache_write_tokens: 5,
+                cost: Some(0.25),
+            },
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: 3,
+                cached_input_tokens: 4,
+                cache_write_tokens: 5,
+                cost: Some(0.25),
+            },
+        ]
+    );
+    assert_eq!(
+        *sink.health.lock().unwrap(),
+        vec![
+            LearnHealth {
+                consecutive_failures: 1,
+                failure: Some(LearnFailure::NoReply),
+            },
+            LearnHealth {
+                consecutive_failures: 2,
+                failure: Some(LearnFailure::UnreadableReply),
+            },
+            LearnHealth::default(),
+        ]
+    );
+    let changes = sink.changes.lock().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change, LearnChange::Added);
+    assert_eq!(
+        changes[0].note.statement,
+        "Branches are named after their ticket number."
+    );
+    assert!(changes[0].replaced.is_none());
+    assert_eq!(learner.health(), LearnHealth::default());
+}
+
+#[tokio::test]
 async fn three_failures_in_a_row_give_the_batch_up() {
     let (_tmp, store) = store();
     let script = Script::new(vec![Reply::Fail, Reply::Fail, Reply::Fail, Reply::Fail]);
@@ -584,6 +685,13 @@ async fn three_failures_in_a_row_give_the_batch_up() {
         "a poisoned slice is not retried for ever"
     );
     assert!(learned(&store).await.is_empty());
+    assert_eq!(
+        learner.health(),
+        LearnHealth {
+            consecutive_failures: 3,
+            failure: Some(LearnFailure::NoReply),
+        }
+    );
 }
 
 #[tokio::test]

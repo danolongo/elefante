@@ -12,6 +12,7 @@
 //! them restated it. Everything it reads passes the `Scrubber` first.
 
 use std::{
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -304,9 +305,48 @@ pub struct LearnDiagnostics {
     pub last_stop: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnFailure {
+    ProviderStatus(u16),
+    NoReply,
+    UnreadableReply,
+    Store,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LearnHealth {
+    pub consecutive_failures: u32,
+    pub failure: Option<LearnFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnChange {
+    Added,
+    Promoted,
+    Superseded,
+    Revived,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangedNote {
+    pub note: LearnedNode,
+    pub change: LearnChange,
+    pub replaced: Option<LearnedNode>,
+}
+
+/// Receives structured background-learning state. Implementations must return quickly; callbacks
+/// run on the learner task after provider/database work has completed.
+pub trait LearnSink: Send + Sync {
+    fn learned(&self, _changes: &[ChangedNote]) {}
+    fn usage(&self, _usage: Usage) {}
+    fn health(&self, _health: LearnHealth) {}
+}
+
 /// Why one call to the extractor model produced no reply.
 struct CallFailure {
     message: String,
+    class: LearnFailure,
+    usage: Usage,
     /// The provider refused a request that carried a response schema, which many endpoints do for
     /// reasons that have nothing to do with the request being wrong.
     schema_refused: bool,
@@ -346,6 +386,8 @@ pub struct Learner {
     /// continues without one, relying on the prompt and on validating the reply.
     schema_ok: AtomicBool,
     diagnostics: Mutex<LearnDiagnostics>,
+    health: Mutex<LearnHealth>,
+    sink: Option<Arc<dyn LearnSink>>,
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -360,6 +402,25 @@ enum Step {
 impl Learner {
     #[must_use]
     pub fn new(store: Arc<Store>, provider: Arc<dyn Provider>, config: LearnConfig) -> Arc<Self> {
+        Self::with_optional_sink(store, provider, config, None)
+    }
+
+    #[must_use]
+    pub fn with_sink(
+        store: Arc<Store>,
+        provider: Arc<dyn Provider>,
+        config: LearnConfig,
+        sink: Arc<dyn LearnSink>,
+    ) -> Arc<Self> {
+        Self::with_optional_sink(store, provider, config, Some(sink))
+    }
+
+    fn with_optional_sink(
+        store: Arc<Store>,
+        provider: Arc<dyn Provider>,
+        config: LearnConfig,
+        sink: Option<Arc<dyn LearnSink>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             provider,
@@ -370,6 +431,8 @@ impl Learner {
             stats: LearnStats::default(),
             schema_ok: AtomicBool::new(true),
             diagnostics: Mutex::new(LearnDiagnostics::default()),
+            health: Mutex::new(LearnHealth::default()),
+            sink,
         })
     }
 
@@ -387,6 +450,11 @@ impl Learner {
             .clone()
     }
 
+    #[must_use]
+    pub fn health(&self) -> LearnHealth {
+        *self.health.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Whether requests still carry a response schema.
     #[must_use]
     pub fn sends_schema(&self) -> bool {
@@ -400,6 +468,41 @@ impl Learner {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+    }
+
+    fn record_usage(&self, usage: Usage) {
+        if usage.is_empty() {
+            return;
+        }
+        add!(self.stats, input_tokens, usage.input_tokens);
+        add!(self.stats, output_tokens, usage.output_tokens);
+        if let Some(sink) = &self.sink {
+            sink.usage(usage);
+        }
+    }
+
+    fn record_failure(&self, class: LearnFailure) {
+        let health = {
+            let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+            health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+            health.failure = Some(class);
+            *health
+        };
+        if let Some(sink) = &self.sink {
+            sink.health(health);
+        }
+    }
+
+    fn record_success(&self) {
+        let changed = {
+            let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+            let changed = *health != LearnHealth::default();
+            *health = LearnHealth::default();
+            changed
+        };
+        if changed && let Some(sink) = &self.sink {
+            sink.health(LearnHealth::default());
+        }
     }
 
     #[must_use]
@@ -575,6 +678,12 @@ impl Learner {
                     Ok(Event::Stop(reason)) => stop = Some(format!("{reason:?}")),
                     Ok(_) => {}
                     Err(error) => {
+                        let class = match &error {
+                            ProviderError::HttpStatus { status, .. } => {
+                                LearnFailure::ProviderStatus(*status)
+                            }
+                            _ => LearnFailure::NoReply,
+                        };
                         failure = Some(CallFailure {
                             schema_refused: carried_schema
                                 && matches!(
@@ -585,6 +694,8 @@ impl Learner {
                                     }
                                 ),
                             message: cut(&error.to_string()),
+                            class,
+                            usage,
                         });
                         return;
                     }
@@ -598,6 +709,8 @@ impl Learner {
             return Err(CallFailure {
                 message: format!("no reply within {:?}", self.config.call_timeout),
                 schema_refused: false,
+                class: LearnFailure::NoReply,
+                usage,
             });
         }
         self.note(|d| d.last_stop = stop);
@@ -608,21 +721,33 @@ impl Learner {
     }
 
     /// One call, falling back to no schema once if the provider refuses the schema itself.
-    async fn ask(&self, shown: &[LearnedNode], batch: &[Turn]) -> Result<(String, Usage), String> {
+    async fn ask(&self, shown: &[LearnedNode], batch: &[Turn]) -> Result<String, CallFailure> {
         for attempt in 0..2 {
             let mut request = build_request(&self.config, shown, batch);
             if !self.schema_ok.load(Ordering::Relaxed) {
                 request.response_schema = None;
             }
             match self.complete(request).await {
-                Ok(reply) => return Ok(reply),
+                Ok((reply, usage)) => {
+                    self.record_usage(usage);
+                    return Ok(reply);
+                }
                 Err(failure) if failure.schema_refused && attempt == 0 => {
+                    self.record_usage(failure.usage);
                     self.schema_ok.store(false, Ordering::Relaxed);
                 }
-                Err(failure) => return Err(failure.message),
+                Err(failure) => {
+                    self.record_usage(failure.usage);
+                    return Err(failure);
+                }
             }
         }
-        Err("the provider refused the request".to_owned())
+        Err(CallFailure {
+            message: "the provider refused the request".to_owned(),
+            schema_refused: false,
+            class: LearnFailure::NoReply,
+            usage: Usage::default(),
+        })
     }
 
     async fn run_once(&self) -> Step {
@@ -644,23 +769,24 @@ impl Learner {
             .join("\n");
         let Ok(shown) = learn::nearest_async(&self.store, said, self.config.shown).await else {
             self.note(|d| d.last_error = Some("could not read the existing notes".to_owned()));
+            self.record_failure(LearnFailure::Store);
             self.fail(taken);
             return Step::Done;
         };
-        let (reply, usage) = match self.ask(&shown, &batch).await {
+        let reply = match self.ask(&shown, &batch).await {
             Ok(reply) => reply,
-            Err(message) => {
-                self.note(|d| d.last_error = Some(message));
+            Err(failure) => {
+                self.note(|d| d.last_error = Some(failure.message));
+                self.record_failure(failure.class);
                 self.fail(taken);
                 return Step::Done;
             }
         };
-        add!(self.stats, input_tokens, usage.input_tokens);
-        add!(self.stats, output_tokens, usage.output_tokens);
 
         let Some(outcome) = learn::parse_output(&reply) else {
             add!(self.stats, invalid_replies, 1);
             self.note(|d| d.last_unreadable_reply = Some(cut(&reply)));
+            self.record_failure(LearnFailure::UnreadableReply);
             self.fail(taken);
             return Step::Done;
         };
@@ -668,32 +794,82 @@ impl Learner {
         if outcome.candidates.is_empty() {
             add!(self.stats, empty, 1);
             self.clear_failure_diagnostics();
+            self.record_success();
             self.advance(taken);
             return Step::Done;
         }
         let ids: Vec<i64> = shown.iter().map(|n| n.id).collect();
-        match learn::ingest_async(&self.store, outcome.candidates, batch, ids).await {
-            Ok(report) => {
-                add!(self.stats, added, report.added.len());
-                add!(self.stats, reinforced, report.reinforced.len());
-                add!(self.stats, promoted, report.promoted.len());
-                add!(self.stats, superseded, report.superseded.len());
-                add!(self.stats, rejected, report.rejected.len());
-                add!(self.stats, mac_failures, report.mac_failures);
-                self.note(|d| {
-                    d.last_error = None;
-                    d.last_unreadable_reply = None;
-                    d.last_rejections = report
-                        .rejected
-                        .iter()
-                        .map(|(index, reason)| format!("candidate {index}: {reason:?}"))
-                        .collect();
-                });
-                self.advance(taken);
-            }
-            Err(_) => self.fail(taken),
+        let Ok(report) = learn::ingest_async(&self.store, outcome.candidates, batch, ids).await
+        else {
+            self.record_failure(LearnFailure::Store);
+            self.fail(taken);
+            return Step::Done;
+        };
+        add!(self.stats, added, report.added.len());
+        add!(self.stats, reinforced, report.reinforced.len());
+        add!(self.stats, promoted, report.promoted.len());
+        add!(self.stats, superseded, report.superseded.len());
+        add!(self.stats, rejected, report.rejected.len());
+        add!(self.stats, mac_failures, report.mac_failures);
+        self.note(|d| {
+            d.last_error = None;
+            d.last_unreadable_reply = None;
+            d.last_rejections = report
+                .rejected
+                .iter()
+                .map(|(index, reason)| format!("candidate {index}: {reason:?}"))
+                .collect();
+        });
+        // The ingest already committed. Learned events are hints, so a reporting read must not
+        // retain and re-extract the same conversation if it fails.
+        if let Ok(changes) = self.changed_notes(&report).await
+            && !changes.is_empty()
+            && let Some(sink) = &self.sink
+        {
+            sink.learned(&changes);
         }
+        self.record_success();
+        self.advance(taken);
         Step::Done
+    }
+
+    async fn changed_notes(
+        &self,
+        report: &learn::IngestReport,
+    ) -> Result<Vec<ChangedNote>, elefante_mem::MemError> {
+        let superseded: HashMap<i64, i64> = report.superseded.iter().copied().collect();
+        let promoted: HashSet<i64> = report.promoted.iter().copied().collect();
+        let revived: HashSet<i64> = report.revived.iter().copied().collect();
+        let mut changed = BTreeSet::new();
+        changed.extend(report.added.iter().copied());
+        changed.extend(report.promoted.iter().copied());
+        changed.extend(report.revived.iter().copied());
+        changed.extend(report.superseded.iter().map(|(new, _)| *new));
+        let mut ids = changed.clone();
+        ids.extend(report.superseded.iter().map(|(_, old)| *old));
+        let nodes = learn::load_by_ids_async(&self.store, ids.into_iter().collect()).await?;
+        let by_id: HashMap<i64, LearnedNode> =
+            nodes.into_iter().map(|node| (node.id, node)).collect();
+        Ok(changed
+            .into_iter()
+            .filter_map(|id| {
+                let note = by_id.get(&id)?.clone();
+                let (change, replaced) = if let Some(old) = superseded.get(&id) {
+                    (LearnChange::Superseded, by_id.get(old).cloned())
+                } else if promoted.contains(&id) {
+                    (LearnChange::Promoted, None)
+                } else if revived.contains(&id) {
+                    (LearnChange::Revived, None)
+                } else {
+                    (LearnChange::Added, None)
+                };
+                Some(ChangedNote {
+                    note,
+                    change,
+                    replaced,
+                })
+            })
+            .collect())
     }
 
     fn clear_failure_diagnostics(&self) {

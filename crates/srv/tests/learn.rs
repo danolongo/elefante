@@ -9,6 +9,7 @@ use elefante_mem::{
     consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
     trust::KEY_FILE,
 };
+use elefante_rpc::Usage;
 use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
@@ -72,6 +73,7 @@ struct Options {
     learn_idle: Duration,
     idle_timeout: Duration,
     extract: Value,
+    extract_usage: Usage,
     preconsent: Option<ConsentRecord>,
 }
 
@@ -83,6 +85,7 @@ impl Default for Options {
             learn_idle: Duration::from_secs(300),
             idle_timeout: Duration::from_secs(60),
             extract: json!([]),
+            extract_usage: Usage::default(),
             preconsent: None,
         }
     }
@@ -110,6 +113,7 @@ impl Harness {
         let value = json!({
             "rounds": [[{"TextDelta": "ok"}, {"Stop": "end_turn"}]],
             "extract": options.extract,
+            "extract_usage": options.extract_usage,
             "record_requests": dir.path().join("requests.jsonl"),
         });
         fs::write(&script, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -540,6 +544,68 @@ async fn revocation_discards_pending_text_before_idle_close_or_shutdown_flushes(
         .unwrap();
     assert!(h.extractions().is_empty());
     assert!(h.notes().is_empty());
+}
+
+#[tokio::test]
+async fn memory_status_and_events_restore_counts_health_and_background_spend() {
+    let h = Harness::start(Options {
+        learn: LearnMode::On,
+        extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),
+        extract_usage: Usage {
+            input_tokens: 90,
+            output_tokens: 10,
+            reasoning_tokens: 3,
+            cached_input_tokens: 4,
+            cache_write_tokens: 5,
+            cost: Some(0.0125),
+        },
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    let initial = &created["result"]["memory"];
+    assert_eq!(initial["enabled"], true);
+    assert_eq!(initial["consent"], "granted");
+    assert_eq!(initial["learning"], "working");
+    assert_eq!(initial["notes"], json!({"active":0,"pending":0}));
+    assert_eq!(initial["spend"]["cost"], Value::Null);
+
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: name branches after the ticket number.",
+    )
+    .await;
+    h.notes_appear(1).await;
+
+    let attached = client
+        .rpc(3, "session.attach", json!({"session_id":session}))
+        .await;
+    let status = &attached["result"]["memory"];
+    assert_eq!(status["notes"], json!({"active":1,"pending":0}));
+    assert_eq!(status["spend"]["input_tokens"], 90);
+    assert_eq!(status["spend"]["output_tokens"], 10);
+    assert_eq!(status["spend"]["reasoning_tokens"], 3);
+    assert_eq!(status["spend"]["cost"], 0.0125);
+
+    let replay = client
+        .rpc(4, "session.attach", json!({"session_id":session,"since":0}))
+        .await;
+    let events = replay["result"]["events"].as_array().unwrap();
+    let learned = events
+        .iter()
+        .find(|event| event["method"] == "memory.learned")
+        .expect("a learned-note hint is replayable");
+    assert_eq!(learned["turn_id"], Value::Null);
+    assert_eq!(learned["params"]["change"], "added");
+    assert_eq!(learned["params"]["note"]["statement"], BRANCHES);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"] == "memory.status")
+    );
 }
 
 #[tokio::test]

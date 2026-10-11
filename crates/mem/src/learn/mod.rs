@@ -20,7 +20,7 @@ mod verify;
 
 use std::fmt;
 
-pub use admin::{LearnedRow, approve, clear, forget, list, store_stamp_valid};
+pub use admin::{LearnedRow, NoteCounts, approve, clear, counts, forget, list, store_stamp_valid};
 pub use compact::{
     ACTIVE_CAP, COMPACT_INTERVAL_NS, CompactReport, SOFT_CAP, SUPERSEDED_RETENTION_DAYS, compact,
     compact_if_due,
@@ -28,7 +28,7 @@ pub use compact::{
 pub use ingest::{IngestInput, IngestReport, Rejection, ingest};
 pub use parse::{ParseOutcome, parse_output};
 pub use service::{
-    NoteCounts, approve_async, clear_async, counts_async, forget_async, ingest_async, list_async,
+    approve_async, clear_async, counts_async, forget_async, ingest_async, list_async,
     load_by_ids_async, nearest_async,
 };
 pub use sim::{is_duplicate, jaccard, overlap, tokens};

@@ -1,6 +1,6 @@
 //! The open pair of databases and the two actors that own them.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -78,6 +78,8 @@ pub struct Store {
     generation: AtomicI64,
     key: MemKey,
     reset_reason: Option<MemoryResetReason>,
+    active_notes: AtomicU64,
+    pending_notes: AtomicU64,
 }
 
 impl Store {
@@ -110,6 +112,7 @@ impl Store {
         let pairing = schema::pair(&memory, &mut cache)?;
         let reader = schema::open_memory_reader(&dir.memory_db())?;
         let generation = graph::generation(&memory)?;
+        let learned_counts = crate::learn::counts(&memory)?;
         let index_state = IndexState::default();
         index_state.set_complete(
             schema::get_meta(&memory, "meta", "index_complete")?.as_deref() == Some("1"),
@@ -121,6 +124,8 @@ impl Store {
             generation: AtomicI64::new(generation),
             key,
             reset_reason,
+            active_notes: AtomicU64::new(learned_counts.active),
+            pending_notes: AtomicU64::new(learned_counts.pending),
             writer: Actor::spawn("elefante-mem-writer", WriterState { memory, cache }),
             reader: Actor::spawn("elefante-mem-reader", ReaderState { memory: reader }),
         })
@@ -149,6 +154,15 @@ impl Store {
         self.reset_reason
     }
 
+    /// Active and pending learned-note counts as this process last committed them.
+    #[must_use]
+    pub fn learned_counts(&self) -> crate::learn::NoteCounts {
+        crate::learn::NoteCounts {
+            active: self.active_notes.load(Ordering::SeqCst),
+            pending: self.pending_notes.load(Ordering::SeqCst),
+        }
+    }
+
     #[must_use]
     pub fn index_state(&self) -> &IndexState {
         &self.index_state
@@ -165,6 +179,11 @@ impl Store {
 
     pub(crate) fn note_generation(&self, generation: i64) {
         self.generation.fetch_max(generation, Ordering::SeqCst);
+    }
+
+    pub(crate) fn note_learned_counts(&self, counts: crate::learn::NoteCounts) {
+        self.active_notes.store(counts.active, Ordering::SeqCst);
+        self.pending_notes.store(counts.pending, Ordering::SeqCst);
     }
 
     #[must_use]

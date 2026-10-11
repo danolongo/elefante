@@ -13,19 +13,25 @@ use std::{
 use anyhow::Context as _;
 use elefante_core::{
     ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate,
-    learn::{ENV_MODEL, LearnConfig, Learner},
+    learn::{
+        ChangedNote, ENV_MODEL, LearnChange, LearnConfig, LearnFailure, LearnHealth, LearnSink,
+        Learner,
+    },
     memory::{MemContext, MemSearchTool},
 };
 use elefante_mem::{
     Indexer, MemKey, RepoId, Store,
     consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
     indexer::IndexOptions,
+    learn,
     retrieve::Retriever,
     trust::KEY_FILE,
 };
 use elefante_provider::{Message, OpenRouterProvider, Provider};
 use elefante_rpc::{
-    MemoryConsentState, MemorySeed, Notification, NotificationEvent, truncate_preview,
+    MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState, MemoryNote,
+    MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent, Usage,
+    truncate_preview,
 };
 use elefante_tools::ToolExecutor;
 use futures_util::future::BoxFuture;
@@ -464,9 +470,17 @@ struct SessionEntry {
     memory: Option<Arc<RepoMemory>>,
     learn_config: Option<LearnConfig>,
     learning: Mutex<SessionLearning>,
+    memory_state: Mutex<SessionMemoryState>,
     tools: ToolExecutor,
     view: Mutex<View>,
     approvals: Arc<Approvals>,
+}
+
+#[derive(Default)]
+struct SessionMemoryState {
+    spend: Usage,
+    health: LearnHealth,
+    reset_pending: bool,
 }
 
 #[derive(Default)]
@@ -489,6 +503,7 @@ struct View {
     cancel: Option<CancellationToken>,
     ring: VecDeque<Value>,
     clients: Vec<Weak<ClientQueue>>,
+    memory: MemoryStatus,
 }
 
 impl View {
@@ -556,10 +571,23 @@ impl View {
                 _ => {},
             }
         }
+        self.publish(note);
+    }
+
+    fn emit_session(&mut self, event: NotificationEvent) {
+        if let NotificationEvent::MemoryStatus(status) = &event {
+            self.memory = status.clone();
+        }
+        self.seq += 1;
+        let note = serde_json::to_value(Notification::new(&self.id, self.seq, None, event))
+            .expect("notification serialization");
+        self.publish(note);
+    }
+
+    fn publish(&mut self, note: Value) {
         if self.ring.len() == RING_CAPACITY {
             self.ring.pop_front();
         }
-        self.ring.push_back(note.clone());
         self.clients.retain(|client| {
             if let Some(client) = client.upgrade() {
                 client.push(note.clone());
@@ -568,6 +596,7 @@ impl View {
                 false
             }
         });
+        self.ring.push_back(note);
     }
 }
 
@@ -775,6 +804,98 @@ fn string<'a>(params: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
         .ok_or_else(|| invalid(format!("{name} must be a string")))
 }
 
+fn note_counts(memory: Option<&Arc<RepoMemory>>) -> MemoryNoteCounts {
+    let Some(memory) = memory else {
+        return MemoryNoteCounts::default();
+    };
+    let counts = memory.store.learned_counts();
+    MemoryNoteCounts {
+        active: counts.active,
+        pending: counts.pending,
+    }
+}
+
+fn health_problem(health: LearnHealth, threshold: u32) -> Option<String> {
+    if health.consecutive_failures < threshold {
+        return None;
+    }
+    Some(match health.failure {
+        Some(LearnFailure::ProviderStatus(status)) => {
+            format!("the provider refused the request (HTTP {status})")
+        }
+        Some(LearnFailure::UnreadableReply) => "the reply could not be read".to_owned(),
+        Some(LearnFailure::NoReply) => "no reply from the provider".to_owned(),
+        Some(LearnFailure::Store) | None => "the memory key is unavailable".to_owned(),
+    })
+}
+
+fn build_memory_status(
+    state: &Shared,
+    memory: Option<&Arc<RepoMemory>>,
+    learn_config: Option<&LearnConfig>,
+    local: &SessionMemoryState,
+) -> MemoryStatus {
+    let seed = state
+        .consent
+        .lock()
+        .expect("consent poisoned")
+        .seed(learn_config.map(|config| config.model.as_str()));
+    let enabled = state.config.memory && memory.is_some();
+    let threshold = learn_config.map_or(3, |config| config.max_failures);
+    let failing = enabled
+        && seed.consent == MemoryConsentState::Granted
+        && local.health.consecutive_failures >= threshold;
+    let learning = if failing {
+        MemoryLearningState::Failing
+    } else if enabled && seed.consent == MemoryConsentState::Granted {
+        MemoryLearningState::Working
+    } else {
+        MemoryLearningState::Paused
+    };
+    let index = if !state.config.memory || memory.is_none() {
+        MemoryIndexState::Off
+    } else if memory.is_some_and(|memory| memory.store.index_state().is_complete()) {
+        MemoryIndexState::Ready
+    } else {
+        MemoryIndexState::Building
+    };
+    let problem = if state.config.memory && memory.is_none() {
+        Some("the memory key is unavailable".to_owned())
+    } else if local.reset_pending {
+        Some("memory was reset: it was not made by this installation".to_owned())
+    } else {
+        health_problem(local.health, threshold)
+    };
+    MemoryStatus {
+        enabled,
+        consent: seed.consent,
+        learning,
+        extractor: seed.extractor,
+        notes: note_counts(memory),
+        index,
+        spend: local.spend,
+        problem,
+    }
+}
+
+fn memory_status(state: &Shared, entry: &SessionEntry) -> MemoryStatus {
+    let local = entry.memory_state.lock().expect("memory state poisoned");
+    build_memory_status(
+        state,
+        entry.memory.as_ref(),
+        entry.learn_config.as_ref(),
+        &local,
+    )
+}
+
+fn refresh_memory_status(state: &Shared, entry: &SessionEntry) {
+    let status = memory_status(state, entry);
+    let mut view = entry.view.lock().expect("view poisoned");
+    if view.memory != status {
+        view.emit_session(NotificationEvent::MemoryStatus(status));
+    }
+}
+
 fn create_session(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
@@ -824,11 +945,19 @@ fn create_session(
         state.instance_id,
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
+    let memory_state = SessionMemoryState {
+        reset_pending: memory
+            .as_ref()
+            .is_some_and(|memory| memory.store.reset_reason().is_some()),
+        ..SessionMemoryState::default()
+    };
+    let status = build_memory_status(state, memory.as_ref(), learn_config.as_ref(), &memory_state);
     let entry = Arc::new(SessionEntry {
         session: tokio::sync::Mutex::new(session),
         memory,
         learn_config,
         learning: Mutex::new(SessionLearning::default()),
+        memory_state: Mutex::new(memory_state),
         tools,
         approvals: Arc::new(Approvals::default()),
         view: Mutex::new(View {
@@ -841,15 +970,10 @@ fn create_session(
             cancel: None,
             ring: VecDeque::new(),
             clients: vec![Arc::downgrade(queue)],
+            memory: status.clone(),
         }),
     });
-    let seed = state.consent.lock().expect("consent poisoned").seed(
-        entry
-            .learn_config
-            .as_ref()
-            .map(|config| config.model.as_str()),
-    );
-    consent_target.clone_from(&seed.extractor);
+    consent_target.clone_from(&status.extractor);
     state
         .sessions
         .lock()
@@ -857,7 +981,7 @@ fn create_session(
         .insert(session_id.clone(), entry);
     queue.push(response(
         id.clone(),
-        json!({"session_id":session_id,"seq":0,"memory":seed}),
+        json!({"session_id":session_id,"seq":0,"memory":status}),
     ));
     Ok(())
 }
@@ -963,6 +1087,7 @@ fn handle_memory_consent(
         .answer(answer, extractor)
         .map_err(invalid)?;
     discard_revoked_learning(state);
+    refresh_all_memory_status(state);
     queue.push(response(id.clone(), json!({"consent":consent})));
     Ok(())
 }
@@ -1065,11 +1190,11 @@ fn attach_session(
     params: &Value,
     consent_target: &mut Option<String>,
 ) -> RpcResult {
-    let seed = memory_seed(state, entry);
-    let target = seed.extractor.clone();
+    let status = memory_status(state, entry);
+    let target = status.extractor.clone();
     attach_session_with_result(queue, id, entry, params, move |view, since| {
         let mut result = attach_result(view, since);
-        result["memory"] = serde_json::to_value(seed).expect("memory seed serialization");
+        result["memory"] = serde_json::to_value(status).expect("memory status serialization");
         result
     })?;
     *consent_target = target;
@@ -1130,14 +1255,6 @@ fn extractor(entry: &SessionEntry) -> Option<&str> {
         .map(|config| config.model.as_str())
 }
 
-fn memory_seed(state: &Shared, entry: &SessionEntry) -> MemorySeed {
-    state
-        .consent
-        .lock()
-        .expect("consent poisoned")
-        .seed(extractor(entry))
-}
-
 fn discard_revoked_learning(state: &Shared) {
     let entries: Vec<_> = state
         .sessions
@@ -1154,6 +1271,92 @@ fn discard_revoked_learning(state: &Shared) {
             learning.learner = None;
             learning.idle_generation = learning.idle_generation.wrapping_add(1);
         }
+    }
+}
+
+fn refresh_all_memory_status(state: &Shared) {
+    let entries: Vec<_> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .values()
+        .cloned()
+        .collect();
+    for entry in entries {
+        refresh_memory_status(state, &entry);
+    }
+}
+
+struct ServerLearnSink {
+    state: Weak<Shared>,
+    entry: Weak<SessionEntry>,
+}
+
+fn wire_note(note: &learn::LearnedNode) -> MemoryNote {
+    MemoryNote {
+        id: note.id,
+        kind: learn::display_safe(note.kind.as_str()),
+        status: learn::display_safe(note.status.as_str()),
+        statement: learn::display_safe(&note.statement),
+        origin: learn::display_safe(
+            note.origin
+                .source()
+                .strip_prefix(learn::SOURCE_PREFIX)
+                .unwrap_or(note.origin.source()),
+        ),
+    }
+}
+
+fn wire_change(change: LearnChange) -> MemoryChange {
+    match change {
+        LearnChange::Added => MemoryChange::Added,
+        LearnChange::Promoted => MemoryChange::Promoted,
+        LearnChange::Superseded => MemoryChange::Superseded,
+        LearnChange::Revived => MemoryChange::Revived,
+    }
+}
+
+impl LearnSink for ServerLearnSink {
+    fn learned(&self, changes: &[ChangedNote]) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        {
+            let mut view = entry.view.lock().expect("view poisoned");
+            for change in changes {
+                view.emit_session(NotificationEvent::MemoryLearned {
+                    note: wire_note(&change.note),
+                    change: wire_change(change.change),
+                    replaced: change.replaced.as_ref().map(wire_note),
+                });
+            }
+        }
+        refresh_memory_status(&state, &entry);
+    }
+
+    fn usage(&self, usage: Usage) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .spend
+            .accumulate(usage);
+        refresh_memory_status(&state, &entry);
+    }
+
+    fn health(&self, health: LearnHealth) {
+        let (Some(state), Some(entry)) = (self.state.upgrade(), self.entry.upgrade()) else {
+            return;
+        };
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .health = health;
+        refresh_memory_status(&state, &entry);
     }
 }
 
@@ -1232,6 +1435,12 @@ fn prompt_session(
             session.messages(),
             consent_at_start,
         );
+        entry
+            .memory_state
+            .lock()
+            .expect("memory state poisoned")
+            .reset_pending = false;
+        refresh_memory_status(&state, &entry);
         state.turns.fetch_sub(1, Ordering::SeqCst);
     });
     Ok(())
@@ -1265,10 +1474,14 @@ fn observe_learning(
         return;
     };
     let learner = Arc::clone(learning.learner.get_or_insert_with(|| {
-        Learner::new(
+        Learner::with_sink(
             Arc::clone(&memory.store),
             Arc::clone(provider),
             config.clone(),
+            Arc::new(ServerLearnSink {
+                state: Arc::downgrade(state),
+                entry: Arc::downgrade(entry),
+            }),
         )
     }));
     learner.observe(&learning.history);

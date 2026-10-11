@@ -89,7 +89,11 @@ impl<W: Write> StreamRenderer<W> {
                 }
                 _ => Ok(()),
             },
-            E::TurnStarted {} | E::Unknown { .. } => Ok(()),
+            E::TurnStarted {}
+            | E::MemoryStatus(_)
+            | E::MemoryLearned { .. }
+            | E::MemoryContext { .. }
+            | E::Unknown { .. } => Ok(()),
         }
     }
 

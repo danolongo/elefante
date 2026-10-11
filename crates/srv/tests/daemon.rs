@@ -153,7 +153,7 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
         assert_eq!(note["session_id"], session);
         serde_json::from_value::<elefante_rpc::Notification>(note.clone()).unwrap();
     }
-    let seq = one.last().unwrap()["seq"].as_u64().unwrap();
+    let mut seq = one.last().unwrap()["seq"].as_u64().unwrap();
     drop(first);
     let mut first = daemon.client().await;
     let attached = first
@@ -167,7 +167,10 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
     assert_eq!(attached["result"]["memory"]["consent"], "off");
     assert_eq!(attached["result"]["memory"]["extractor"], Value::Null);
     assert_eq!(attached["result"]["from"], seq - 1);
-    assert_eq!(attached["result"]["events"], json!(one[one.len() - 2..]));
+    let replayed = attached["result"]["events"].as_array().unwrap();
+    assert_eq!(&replayed[..2], &one[one.len() - 2..]);
+    assert_eq!(replayed[2]["method"], "memory.status");
+    seq = replayed.last().unwrap()["seq"].as_u64().unwrap();
     first
         .rpc(
             5,

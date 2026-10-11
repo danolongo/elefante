@@ -32,6 +32,35 @@ pub struct LearnedRow {
     pub verified: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoteCounts {
+    pub active: u64,
+    pub pending: u64,
+}
+
+/// Counts active and pending learned notes.
+///
+/// # Errors
+/// SQLite errors.
+pub fn counts(conn: &Connection) -> Result<NoteCounts, MemError> {
+    let mut statement = conn.prepare(
+        "SELECT status, count(*) FROM node
+         WHERE source LIKE 'learned:%' AND status IN ('active','pending')
+         GROUP BY status",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut counts = NoteCounts::default();
+    while let Some(row) = rows.next()? {
+        let count = u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+        match row.get::<_, String>(0)?.as_str() {
+            "active" => counts.active = count,
+            "pending" => counts.pending = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
 /// Whether a read-only memory connection carries this installation's keyed store stamp.
 ///
 /// Administrative readers use this before displaying any database-supplied text. A missing table,

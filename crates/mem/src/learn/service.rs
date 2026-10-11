@@ -2,16 +2,10 @@
 //! the model call that precedes it never holds a database thread.
 
 use super::{
-    Candidate, IngestInput, IngestReport, LearnedNode, LearnedRow, Turn, approve, clear,
-    compact_if_due, forget, ingest, list, load_by_ids, nearest,
+    Candidate, IngestInput, IngestReport, LearnedNode, LearnedRow, NoteCounts, Turn, approve,
+    clear, compact_if_due, counts, forget, ingest, list, load_by_ids, nearest,
 };
 use crate::{error::MemError, graph, store::Store, util::now_ns};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NoteCounts {
-    pub active: u64,
-    pub pending: u64,
-}
 
 /// The notes closest to `text`, for showing a model what is already known.
 ///
@@ -46,27 +40,7 @@ pub async fn load_by_ids_async(store: &Store, ids: Vec<i64>) -> Result<Vec<Learn
 /// # Errors
 /// SQLite errors, or a reader thread that is gone.
 pub async fn counts_async(store: &Store) -> Result<NoteCounts, MemError> {
-    store
-        .reader()
-        .call(|state| {
-            let mut statement = state.memory.prepare(
-                "SELECT status, count(*) FROM node
-                 WHERE source LIKE 'learned:%' AND status IN ('active','pending')
-                 GROUP BY status",
-            )?;
-            let mut rows = statement.query([])?;
-            let mut counts = NoteCounts::default();
-            while let Some(row) = rows.next()? {
-                let count = u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
-                match row.get::<_, String>(0)?.as_str() {
-                    "active" => counts.active = count,
-                    "pending" => counts.pending = count,
-                    _ => {}
-                }
-            }
-            Ok::<_, MemError>(counts)
-        })
-        .await?
+    store.reader().call(|state| counts(&state.memory)).await?
 }
 
 /// Lists learned rows on the reader actor.
@@ -86,14 +60,19 @@ pub async fn list_async(store: &Store, all: bool) -> Result<Vec<LearnedRow>, Mem
 /// # Errors
 /// SQLite errors, or a writer thread that is gone.
 pub async fn forget_async(store: &Store, id: i64) -> Result<bool, MemError> {
-    let (changed, generation) = store
+    let (changed, generation, counts) = store
         .writer()
         .call(move |state| {
             let changed = forget(&mut state.memory, id)?;
-            Ok::<_, MemError>((changed, graph::generation(&state.memory)?))
+            Ok::<_, MemError>((
+                changed,
+                graph::generation(&state.memory)?,
+                counts(&state.memory)?,
+            ))
         })
         .await??;
     store.note_generation(generation);
+    store.note_learned_counts(counts);
     Ok(changed)
 }
 
@@ -103,14 +82,19 @@ pub async fn forget_async(store: &Store, id: i64) -> Result<bool, MemError> {
 /// SQLite errors, or a writer thread that is gone.
 pub async fn approve_async(store: &Store, id: i64) -> Result<bool, MemError> {
     let key = store.key().clone();
-    let (changed, generation) = store
+    let (changed, generation, counts) = store
         .writer()
         .call(move |state| {
             let changed = approve(&mut state.memory, &key, id, now_ns())?;
-            Ok::<_, MemError>((changed, graph::generation(&state.memory)?))
+            Ok::<_, MemError>((
+                changed,
+                graph::generation(&state.memory)?,
+                counts(&state.memory)?,
+            ))
         })
         .await??;
     store.note_generation(generation);
+    store.note_learned_counts(counts);
     Ok(changed)
 }
 
@@ -119,14 +103,19 @@ pub async fn approve_async(store: &Store, id: i64) -> Result<bool, MemError> {
 /// # Errors
 /// SQLite errors, or a writer thread that is gone.
 pub async fn clear_async(store: &Store) -> Result<usize, MemError> {
-    let (removed, generation) = store
+    let (removed, generation, counts) = store
         .writer()
         .call(|state| {
             let removed = clear(&mut state.memory)?;
-            Ok::<_, MemError>((removed, graph::generation(&state.memory)?))
+            Ok::<_, MemError>((
+                removed,
+                graph::generation(&state.memory)?,
+                counts(&state.memory)?,
+            ))
         })
         .await??;
     store.note_generation(generation);
+    store.note_learned_counts(counts);
     Ok(removed)
 }
 
@@ -142,7 +131,7 @@ pub async fn ingest_async(
     shown: Vec<i64>,
 ) -> Result<IngestReport, MemError> {
     let key = store.key().clone();
-    let (mut report, generation) = store
+    let (mut report, generation, counts) = store
         .writer()
         .call(move |s| {
             let now = now_ns();
@@ -158,10 +147,11 @@ pub async fn ingest_async(
             )?;
             let compacted = compact_if_due(&mut s.memory, &key, now)?;
             let generation = compacted.map_or(report.generation, |c| c.generation);
-            Ok::<_, MemError>((report, generation))
+            Ok::<_, MemError>((report, generation, counts(&s.memory)?))
         })
         .await??;
     store.note_generation(generation);
+    store.note_learned_counts(counts);
     report.generation = generation;
     Ok(report)
 }

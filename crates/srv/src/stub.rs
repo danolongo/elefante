@@ -59,6 +59,7 @@ pub(crate) struct StubProvider {
     /// repeating. They never consume `rounds`, so memory learning cannot disturb a scripted turn.
     extract: Vec<String>,
     next_extract: AtomicUsize,
+    extract_usage: Usage,
 }
 
 impl StubProvider {
@@ -78,6 +79,12 @@ impl StubProvider {
                     })
                     .collect()
             })
+            .unwrap_or_default();
+        let extract_usage = value
+            .get("extract_usage")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
             .unwrap_or_default();
         let rounds = if let Some(rounds) = value.get("rounds").and_then(Value::as_array) {
             rounds.clone()
@@ -110,6 +117,7 @@ impl StubProvider {
             record,
             extract,
             next_extract: AtomicUsize::new(0),
+            extract_usage,
         })
     }
 }
@@ -164,10 +172,12 @@ impl Provider for StubProvider {
                 .get(index.min(self.extract.len().saturating_sub(1)))
                 .cloned()
                 .unwrap_or_else(|| r#"{"memories":[]}"#.to_owned());
-            return Box::pin(futures_util::stream::iter(vec![
-                Ok(Event::TextDelta(text)),
-                Ok(Event::Stop(StopReason::EndTurn)),
-            ]));
+            let mut events = vec![Ok(Event::TextDelta(text))];
+            if !self.extract_usage.is_empty() {
+                events.push(Ok(Event::Usage(self.extract_usage)));
+            }
+            events.push(Ok(Event::Stop(StopReason::EndTurn)));
+            return Box::pin(futures_util::stream::iter(events));
         }
         let validation = validate_pairing(&request);
         let index = self.next_round.fetch_add(1, Ordering::Relaxed);

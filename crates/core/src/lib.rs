@@ -206,9 +206,28 @@ impl ToolGate {
 ///
 /// What it returns is **repository-derived data**. It is placed in a request as an ephemeral
 /// `user` message and never in `system`, and never stored in history: see [`Session::prompt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub statement: String,
+    pub origin: String,
+}
+
+/// Context injected into one turn and the learned notes that contributed to it.
+///
+/// Only [`Self::text`] is sent to the provider. The structured note metadata is retained alongside
+/// it for audit and presentation layers, and neither is added to conversation history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectedContext {
+    pub text: String,
+    pub notes: Vec<Note>,
+}
+
 pub trait ContextSource: Send + Sync {
     /// A block relevant to `prompt`, or `None` when nothing is. Called once per turn.
-    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>>;
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<InjectedContext>>;
 
     /// A standing summary, or `None` while there is not yet one to give. Once a session has
     /// adopted one it keeps it.
@@ -229,7 +248,7 @@ pub struct Session {
 struct TurnContext {
     /// Index in `Session::messages` of this turn's user message.
     user_index: usize,
-    block: Option<String>,
+    injected: Option<InjectedContext>,
 }
 
 impl Session {
@@ -283,7 +302,7 @@ impl Session {
             .push(Message::text(Role::User, prompt.clone()));
         let turn = TurnContext {
             user_index: self.messages.len() - 1,
-            block: self.gather_context(&prompt).await,
+            injected: self.gather_context(&prompt).await,
         };
         emit(OutputEvent::TurnStarted);
         let mut usage = Usage::default();
@@ -308,7 +327,7 @@ impl Session {
     ///
     /// Done once per turn rather than per round: every round re-sends the same block at the same
     /// position, so the cache holds across tool rounds.
-    async fn gather_context(&mut self, prompt: &str) -> Option<String> {
+    async fn gather_context(&mut self, prompt: &str) -> Option<InjectedContext> {
         let context = self.context.clone()?;
         if self.preamble.is_none() {
             self.preamble = context.preamble().await;
@@ -328,8 +347,8 @@ impl Session {
         }
         let split = (turn.user_index + 1).min(self.messages.len());
         messages.extend_from_slice(&self.messages[..split]);
-        if let Some(block) = &turn.block {
-            messages.push(Message::text(Role::User, block.clone()));
+        if let Some(injected) = &turn.injected {
+            messages.push(Message::text(Role::User, injected.text.clone()));
         }
         messages.extend_from_slice(&self.messages[split..]);
         messages

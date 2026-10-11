@@ -3,13 +3,28 @@
 use std::sync::Arc;
 
 use elefante_mem::{
-    Store, brief,
-    retrieve::{DEFAULT_BUDGET_TOKENS, Query, Retriever, SearchKind as MemSearchKind},
+    Store, brief, learn,
+    retrieve::{DEFAULT_BUDGET_TOKENS, LearnedHit, Query, Retriever, SearchKind as MemSearchKind},
 };
 use elefante_tools::{MemorySearch, MemorySearchRequest, SearchKind};
 use futures_util::future::BoxFuture;
 
-use crate::ContextSource;
+use crate::{ContextSource, InjectedContext, Note};
+
+fn public_note(hit: &LearnedHit) -> Note {
+    Note {
+        id: hit.id,
+        kind: learn::display_safe(hit.kind.as_str()),
+        status: learn::display_safe(hit.status.as_str()),
+        statement: learn::display_safe(&hit.statement),
+        origin: learn::display_safe(
+            hit.origin
+                .source()
+                .strip_prefix(learn::SOURCE_PREFIX)
+                .unwrap_or(hit.origin.source()),
+        ),
+    }
+}
 
 /// Context drawn from a repository's index.
 ///
@@ -35,7 +50,7 @@ impl MemContext {
 }
 
 impl ContextSource for MemContext {
-    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<InjectedContext>> {
         Box::pin(async move {
             let query = Query {
                 text: prompt.to_owned(),
@@ -44,7 +59,10 @@ impl ContextSource for MemContext {
                 budget_tokens: DEFAULT_BUDGET_TOKENS,
             };
             let block = self.retriever.retrieve(query).await.ok().flatten()?;
-            Some(block.rendered.clone())
+            Some(InjectedContext {
+                text: block.rendered.clone(),
+                notes: block.learned.iter().map(public_note).collect(),
+            })
         })
     }
 
@@ -85,5 +103,35 @@ impl MemorySearch for MemSearchTool {
                 .await
                 .map_err(|error| format!("repository search failed: {error}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use elefante_mem::{
+        learn::{Kind, Origin, Status},
+        retrieve::LearnedHit,
+    };
+
+    use super::public_note;
+
+    #[test]
+    fn public_notes_are_display_safe() {
+        let note = public_note(&LearnedHit {
+            id: 17,
+            kind: Kind::Preference,
+            status: Status::Active,
+            origin: Origin::Stated,
+            label: "unused".to_owned(),
+            statement: "use\u{1b}[31mpnpm\u{202e}\u{200b}\n here".to_owned(),
+            score: 1.0,
+            anchors: Vec::new(),
+        });
+
+        assert_eq!(note.id, 17);
+        assert_eq!(note.kind, "preference");
+        assert_eq!(note.status, "active");
+        assert_eq!(note.origin, "stated");
+        assert_eq!(note.statement, "use[31mpnpm here");
     }
 }

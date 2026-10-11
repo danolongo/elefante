@@ -8,7 +8,9 @@ use std::{
     },
 };
 
-use elefante_core::{CancellationToken, ContextSource, RunConfig, Session, ToolGate};
+use elefante_core::{
+    CancellationToken, ContextSource, InjectedContext, Note, RunConfig, Session, ToolGate,
+};
 use elefante_provider::{
     Capabilities, ContentBlock, Event, Message, ModelId, Provider, ProviderError, Request, Role,
     StopReason, Usage,
@@ -84,7 +86,7 @@ fn end(text: &str) -> Vec<Event> {
 /// Hands out scripted blocks and preambles, and counts how often it is asked.
 #[derive(Default)]
 struct Source {
-    blocks: Mutex<VecDeque<Option<String>>>,
+    blocks: Mutex<VecDeque<Option<InjectedContext>>>,
     preambles: Mutex<VecDeque<Option<String>>>,
     block_calls: AtomicUsize,
     preamble_calls: AtomicUsize,
@@ -93,17 +95,31 @@ struct Source {
 
 impl Source {
     fn new(blocks: &[Option<&str>], preambles: &[Option<&str>]) -> Arc<Self> {
-        let owned = |list: &[Option<&str>]| list.iter().map(|b| b.map(str::to_owned)).collect();
         Arc::new(Self {
-            blocks: Mutex::new(owned(blocks)),
-            preambles: Mutex::new(owned(preambles)),
+            blocks: Mutex::new(
+                blocks
+                    .iter()
+                    .map(|block| {
+                        block.map(|text| InjectedContext {
+                            text: text.to_owned(),
+                            notes: Vec::new(),
+                        })
+                    })
+                    .collect(),
+            ),
+            preambles: Mutex::new(
+                preambles
+                    .iter()
+                    .map(|preamble| preamble.map(str::to_owned))
+                    .collect(),
+            ),
             ..Self::default()
         })
     }
 }
 
 impl ContextSource for Source {
-    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn turn_block<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<InjectedContext>> {
         self.block_calls.fetch_add(1, Ordering::SeqCst);
         self.prompts.lock().unwrap().push(prompt.to_owned());
         let next = self.blocks.lock().unwrap().pop_front().flatten();
@@ -115,6 +131,44 @@ impl ContextSource for Source {
         let next = self.preambles.lock().unwrap().pop_front().flatten();
         Box::pin(async move { next })
     }
+}
+
+#[tokio::test]
+async fn only_context_text_reaches_the_provider_and_note_metadata_is_not_history() {
+    let repo = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(repo.path()).unwrap();
+    let provider = Script::new(vec![end("done")]);
+    let source = Arc::new(Source {
+        blocks: Mutex::new(
+            [Some(InjectedContext {
+                text: "RENDERED-CONTEXT".to_owned(),
+                notes: vec![Note {
+                    id: 42,
+                    kind: "convention".to_owned(),
+                    status: "active".to_owned(),
+                    statement: "NOTE-METADATA-ONLY".to_owned(),
+                    origin: "explicit".to_owned(),
+                }],
+            })]
+            .into(),
+        ),
+        ..Source::default()
+    });
+    let mut session = Session::new(RunConfig::new("test")).with_context(source);
+
+    ask(&mut session, &provider, &executor, "hello").await;
+
+    assert_eq!(
+        texts(&provider.requests()[0].messages),
+        ["hello", "RENDERED-CONTEXT"]
+    );
+    let history = texts(session.messages());
+    assert!(!history.iter().any(|text| text.contains("RENDERED-CONTEXT")));
+    assert!(
+        !history
+            .iter()
+            .any(|text| text.contains("NOTE-METADATA-ONLY"))
+    );
 }
 
 async fn ask(session: &mut Session, provider: &Script, executor: &ToolExecutor, text: &str) {

@@ -129,6 +129,8 @@ impl Hit {
 pub struct LearnedHit {
     pub id: i64,
     pub kind: LearnKind,
+    pub status: learn::Status,
+    pub origin: learn::Origin,
     pub label: String,
     pub statement: String,
     /// Retrieval score already multiplied by the note's effective confidence.
@@ -640,6 +642,8 @@ fn load_learned(
         out.push(LearnedHit {
             id: node.id,
             kind: node.kind,
+            status: node.status,
+            origin: node.origin,
             label: node.label,
             statement: node.statement,
             score: scores[&node.id] * effective,

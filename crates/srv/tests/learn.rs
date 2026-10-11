@@ -1093,6 +1093,29 @@ async fn a_failing_learner_is_forgotten_with_its_failures_when_consent_is_withdr
     assert_eq!(after["problem"], Value::Null, "{after}");
 }
 
+/// Like `Client::rpc`, but remembers whether the turn's end went by while waiting, so a test that
+/// sends several requests in a row can tell whether it still has a `turn.finished` to wait for.
+async fn rpc_noting_turn_end(
+    client: &mut Client,
+    id: u64,
+    method: &str,
+    params: Value,
+    turn_ended: &mut bool,
+) -> Value {
+    let mut bytes = serde_json::to_vec(&json!({"id":id,"method":method,"params":params})).unwrap();
+    bytes.push(b'\n');
+    client.write.write_all(&bytes).await.unwrap();
+    loop {
+        let value = client.next().await;
+        if value["method"] == "turn.finished" {
+            *turn_ended = true;
+        }
+        if value["id"] == id {
+            return value;
+        }
+    }
+}
+
 #[tokio::test]
 async fn no_extraction_starts_once_a_withdrawal_has_been_answered() {
     let h = Harness::start(Options {
@@ -1104,21 +1127,28 @@ async fn no_extraction_starts_once_a_withdrawal_has_been_answered() {
     let created = h.create(&mut client, 1, None).await;
     let session = created["result"]["session_id"].as_str().unwrap();
     for round in 0..15_u64 {
+        let mut turn_ended = false;
         client
             .rpc(100 + round * 3, "memory.consent", json!({"answer":"learn"}))
             .await;
         // The turn ends and the daemon's own follow-up (reading the turn into the learner) races the
         // withdrawal that arrives straight after.
-        client
-            .rpc(
-                101 + round * 3,
-                "session.prompt",
-                json!({"session_id": session, "text": format!("Remember: rule number {round} applies.")}),
-            )
-            .await;
-        client
-            .rpc(102 + round * 3, "memory.consent", json!({"answer":"off"}))
-            .await;
+        rpc_noting_turn_end(
+            &mut client,
+            101 + round * 3,
+            "session.prompt",
+            json!({"session_id": session, "text": format!("Remember: rule number {round} applies.")}),
+            &mut turn_ended,
+        )
+        .await;
+        rpc_noting_turn_end(
+            &mut client,
+            102 + round * 3,
+            "memory.consent",
+            json!({"answer":"off"}),
+            &mut turn_ended,
+        )
+        .await;
         let answered = h.extractions().len();
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(
@@ -1126,7 +1156,9 @@ async fn no_extraction_starts_once_a_withdrawal_has_been_answered() {
             answered,
             "round {round}: a request started after the withdrawal was answered"
         );
-        client.finish().await;
+        if !turn_ended {
+            client.finish().await;
+        }
     }
 }
 

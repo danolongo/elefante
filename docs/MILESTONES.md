@@ -350,11 +350,15 @@ one-line stderr notice from a headless terminal client while consent is unset.
 construction in `tui/src/main.tsx` (the modal needs `consent === "unset"` and a non-null extractor),
 but nothing drives that code. (2) "The modal never opens with text in the input" holds because it is
 raised once at launch only; no test asserts it. (3) "Byte-identical screen when healthy" is asserted
-only as the absence of the `memory:` suffix, not as a frame comparison. (4) The credentialed live test
-was not re-run for this record. "M0–M3 gates still green" rests on the whole hermetic suite: on the
+only as the absence of the `memory:` suffix, not as a frame comparison. (4) "M0–M3 gates still green" rests on the whole hermetic suite and on the credentialed run below. On the
 final tree `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (516 passed, 0 failed)
 and `cargo +1.90.0 check` pass, as do the TUI `tsc`, `bun test` (89 passed), `bun build --compile` and
 the CI smoke test.
+
+**Credentialed run** (2026-10-11, tree `42b0205`, run by the maintainer with a real key): the provider
+prompt-cache check, `live_edit_lands_in_a_scratch_repository`, `live_memory_context_reaches_the_model`
+and `live_learned_memory_is_extracted_stored_and_used` all passed (3 passed in 35 s for the CLI suite).
+The learned-memory test is unaffected by the ask default.
 
 **Deferred.** Consent per repository (design § 13, question 2). A stronger or second confirmation when
 `ELEFANTE_EXTRACT_MODEL` names another vendor (question 3): the modal names the extractor and says when

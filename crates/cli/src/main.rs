@@ -340,7 +340,8 @@ fn resume(client: &mut Client, path: &Path, session: &str, since: u64) -> anyhow
 fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Result<()> {
     let color = env::var_os("NO_COLOR").is_none();
     let mut out = StreamRenderer::new(io::stdout(), color && io::stdout().is_terminal());
-    let mut err = StreamRenderer::new(io::stderr(), color && io::stderr().is_terminal());
+    let mut err = StreamRenderer::new(io::stderr(), color && io::stderr().is_terminal())
+        .with_memory_notices(io::stderr().is_terminal());
     let mut seen = BTreeSet::new();
     let mut cursor = 0;
     let mut failures = 0;

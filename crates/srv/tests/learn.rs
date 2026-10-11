@@ -1362,3 +1362,76 @@ async fn listed_notes_carry_the_origin_without_the_stores_prefix() {
         "{origin}"
     );
 }
+
+fn first_tools(h: &Harness) -> Vec<String> {
+    let request = h
+        .requests()
+        .into_iter()
+        .find(|request| request["response_schema"].is_null())
+        .expect("a turn request was recorded");
+    request["tools"]
+        .as_array()
+        .expect("tools are recorded")
+        .iter()
+        .filter_map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["function"]["name"].as_str())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn first_system(h: &Harness) -> String {
+    h.requests()
+        .iter()
+        .find(|request| request["response_schema"].is_null())
+        .map(|request| request["system"][0].as_str().unwrap().to_owned())
+        .expect("a turn request was recorded")
+}
+
+#[tokio::test]
+async fn the_learning_sentence_is_sent_only_where_learning_can_run() {
+    for (mode, memory, learning, index) in [
+        (LearnMode::On, true, true, true),
+        (LearnMode::Ask, true, true, true),
+        (LearnMode::Off, true, false, true),
+        (LearnMode::On, false, false, false),
+    ] {
+        let h = Harness::start(Options {
+            memory,
+            learn: mode,
+            ..Options::default()
+        })
+        .await;
+        let mut client = Client::connect(&h.config.socket).await;
+        let created = h.create(&mut client, 1, None).await;
+        let session = created["result"]["session_id"].as_str().unwrap();
+        h.prompt(&mut client, session, "hello").await;
+        let system = first_system(&h);
+        assert_eq!(
+            system.contains(elefante_core::LEARNING_HINT),
+            learning,
+            "{mode:?} memory={memory}: {system}"
+        );
+        assert_eq!(
+            system.contains(elefante_core::MEMORY_USE_HINT),
+            index,
+            "{mode:?} memory={memory}: {system}"
+        );
+        let tools = first_tools(&h);
+        assert!(
+            tools.len() >= 6,
+            "the other tools are always offered: {tools:?}"
+        );
+        assert_eq!(
+            tools.contains(&"memory_search".to_owned()),
+            index,
+            "{mode:?} memory={memory}: {tools:?}"
+        );
+        assert!(
+            system.contains("Never read or edit `.elefante/`"),
+            "the always-true sentence is always there"
+        );
+    }
+}

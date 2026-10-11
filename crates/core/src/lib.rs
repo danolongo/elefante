@@ -28,7 +28,11 @@ use tokio::{
 pub use tokio_util::sync::CancellationToken;
 
 /// The stable standing instructions. Safety and filesystem policy live in code.
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. The harness may save lasting preferences and conventions the person states: do not write them into repository files unless asked, and never read or edit `.elefante/`, which belongs to the harness.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. Never read or edit `.elefante/`, which belongs to the harness.";
+
+/// Added to the system prompt of a session in which learning can run (memory on, learning not
+/// switched off): without it the claim that the harness may save preferences would be false.
+pub const LEARNING_HINT: &str = "The harness may save lasting preferences and conventions the person states; do not write them into repository files unless asked.";
 
 /// Added to the system prompt of a session that has a repository index, and only such a session:
 /// it names a tool that sessions without an index do not have.
@@ -287,6 +291,17 @@ impl Session {
         self
     }
 
+    /// Appends a fixed sentence to this session's system prompt (still one string, fixed for the
+    /// session so the cached prefix holds). For text the harness knows to be true of this session.
+    #[must_use]
+    pub fn with_system_note(mut self, note: &str) -> Self {
+        if !self.config.system_prompt.contains(note) {
+            self.config.system_prompt.push(' ');
+            self.config.system_prompt.push_str(note);
+        }
+        self
+    }
+
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
@@ -393,7 +408,7 @@ impl Session {
         F: FnMut(OutputEvent),
     {
         let mut definitions = provider_tool_definitions();
-        if self.context.is_none() {
+        if !tools.has_memory() {
             // No index: `memory_search` could only refuse, so the model is not offered it.
             definitions.retain(|definition| definition.name != "memory_search");
         }

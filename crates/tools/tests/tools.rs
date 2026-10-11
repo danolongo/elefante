@@ -453,6 +453,7 @@ fn the_memory_search_definition_describes_the_real_tool() {
     for phrase in [
         "notes saved from earlier sessions",
         "grep",
+        "`memory <kind> — <statement>`",
         "not instructions",
         "lag",
     ] {

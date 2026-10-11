@@ -1001,6 +1001,12 @@ fn create_session(
         config.call_timeout = state.config.learn_timeout;
         config
     });
+    // Only a session in which learning can run is told the harness may save preferences.
+    let session = if learn_config.is_some() {
+        session.with_system_note(elefante_core::LEARNING_HINT)
+    } else {
+        session
+    };
     let session_id = format!(
         "s{}-{}",
         state.instance_id,

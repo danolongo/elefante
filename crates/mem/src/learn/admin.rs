@@ -5,12 +5,14 @@
 use rusqlite::{Connection, params};
 
 use super::{
-    CONFIDENCE_STATED, KINDS_SQL, Origin, SOURCE_PREFIX, Status, effective_confidence,
+    CONFIDENCE_STATED, KINDS_SQL, Origin, SOURCE_PREFIX, Status, display_safe,
+    effective_confidence,
     store::{self, SELECT_COLUMNS},
 };
 use crate::{
     error::MemError,
     graph::{bump_generation_only, generation},
+    schema::STAMP_KEY,
     trust::{MemKey, RowFields},
 };
 
@@ -28,6 +30,24 @@ pub struct LearnedRow {
     pub effective_confidence: f64,
     pub reinforcements: u32,
     pub verified: bool,
+}
+
+/// Whether a read-only memory connection carries this installation's keyed store stamp.
+///
+/// Administrative readers use this before displaying any database-supplied text. A missing table,
+/// epoch, stamp, or foreign stamp is untrusted rather than an error worth exposing to the person.
+#[must_use]
+pub fn store_stamp_valid(conn: &Connection, key: &MemKey) -> bool {
+    let value = |name| {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [name], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+    };
+    matches!(
+        (value("graph_epoch"), value(STAMP_KEY)),
+        (Some(epoch), Some(stamp)) if key.stamp_matches("memory", &epoch, &stamp)
+    )
 }
 
 /// Lists learned rows: active and pending, or every status when `all`.
@@ -62,11 +82,11 @@ pub fn list(
         });
         out.push(LearnedRow {
             id: row.get(0)?,
-            kind,
-            status: row.get(6)?,
-            origin: row.get(5)?,
-            label: row.get(3)?,
-            statement: row.get(4)?,
+            kind: display_safe(&kind),
+            status: display_safe(&row.get::<_, String>(6)?),
+            origin: display_safe(&row.get::<_, String>(5)?),
+            label: display_safe(&row.get::<_, String>(3)?),
+            statement: display_safe(&row.get::<_, String>(4)?),
             confidence,
             effective_confidence: effective,
             reinforcements: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(0),

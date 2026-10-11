@@ -44,7 +44,11 @@ fn render(rows: &[LearnedRow], out: &mut dyn Write) -> anyhow::Result<()> {
         "id", "status", "kind", "conf", "origin"
     )?;
     for row in rows {
-        let origin = row.origin.strip_prefix("learned:").unwrap_or(&row.origin);
+        let status = learn::display_safe(&row.status);
+        let kind = learn::display_safe(&row.kind);
+        let origin =
+            learn::display_safe(row.origin.strip_prefix("learned:").unwrap_or(&row.origin));
+        let statement = learn::display_safe(&row.statement);
         let flag = if row.verified {
             ""
         } else {
@@ -53,15 +57,7 @@ fn render(rows: &[LearnedRow], out: &mut dyn Write) -> anyhow::Result<()> {
         writeln!(
             out,
             "{:>5}  {:<10}  {:<10}  {:>4.2}  {:<9}  {}{flag}",
-            row.id,
-            row.status,
-            row.kind,
-            row.effective_confidence,
-            origin,
-            row.statement
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
+            row.id, status, kind, row.effective_confidence, origin, statement
         )?;
     }
     Ok(())
@@ -107,6 +103,13 @@ pub fn run(
                 _ => bail!("`memory list` takes only --all\n\n{USAGE}"),
             };
             let conn = open_memory_reader(&memory_db).context("cannot open the store")?;
+            if !learn::store_stamp_valid(&conn, &key) {
+                writeln!(
+                    out,
+                    "memory store is not from this Elefante installation; no notes shown"
+                )?;
+                return Ok(0);
+            }
             let rows = learn::list(&conn, &key, all, now_ns())?;
             render(&rows, out)?;
             Ok(0)

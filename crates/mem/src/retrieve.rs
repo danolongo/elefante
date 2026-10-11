@@ -711,14 +711,10 @@ pub fn rank_ctx(conn: &Connection, query: &Query, ctx: &RenderCtx<'_>) -> Result
 // ----- packing and rendering -----
 
 fn escape_capped(raw: &str, max_chars: usize) -> String {
+    let safe = learn::display_safe(raw);
     let mut out = String::new();
     let mut count = 0;
-    let mut pending_space = false;
-    for c in raw.chars() {
-        if c.is_control() || c.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
+    for c in safe.chars() {
         let piece: &str = match c {
             '&' => "&amp;",
             '<' => "&lt;",
@@ -730,15 +726,9 @@ fn escape_capped(raw: &str, max_chars: usize) -> String {
         } else {
             piece.chars().count()
         };
-        let space = usize::from(pending_space);
-        if count + space + width > max_chars.saturating_sub(1) {
+        if count + width > max_chars.saturating_sub(1) {
             out.push('…');
             return out;
-        }
-        if pending_space {
-            out.push(' ');
-            count += 1;
-            pending_space = false;
         }
         if piece.is_empty() {
             out.push(c);
@@ -998,11 +988,7 @@ pub const MAX_SEARCH_LIMIT: usize = 20;
 /// Unlike [`escape_capped`] this does no entity escaping: a tool result is not wrapped in an
 /// envelope, so there is nothing for repository text to close.
 fn flatten_capped(raw: &str, max_chars: usize) -> String {
-    let text = raw
-        .split(|c: char| c.is_control() || c.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = learn::display_safe(raw);
     truncate_chars(&text, max_chars)
 }
 

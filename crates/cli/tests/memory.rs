@@ -6,6 +6,7 @@ use elefante_cli::memory;
 use elefante_mem::{
     MemKey, RepoId, Store,
     learn::{self, Candidate, IngestInput, Kind, Relation, Speaker, Turn},
+    trust::RowFields,
 };
 
 struct Fixture {
@@ -185,6 +186,84 @@ fn a_tampered_note_is_listed_flagged_so_it_can_be_removed() {
     let listed = cmd(&f, &["list"]).1;
     assert!(listed.contains("fails verification"), "{listed}");
     assert_eq!(cmd(&f, &["forget", &active.to_string()]).0, 0);
+}
+
+#[test]
+fn every_database_supplied_column_is_sanitized_before_display() {
+    let f = fixture();
+    let (active, _) = teach(&f);
+    let key = MemKey::load_or_create(&f.key_path).unwrap();
+    let db = f.repo.join(".elefante/memory.db");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let (kind, node_key, created): (String, String, i64) = conn
+        .query_row(
+            "SELECT kind, key, created_at_ns FROM node WHERE id = ?1",
+            [active],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let label = "Branch\u{202e}\u{200b} naming";
+    let body = "Branches\u{1b}[31m are\t named\u{2066} after tickets.";
+    let source = "learned:explicit\u{202e}";
+    let mac = key.row_mac(&RowFields {
+        kind: &kind,
+        key: &node_key,
+        name: label,
+        body,
+        source,
+        created_at_ns: created,
+    });
+    conn.execute(
+        "UPDATE node SET name = ?1, body = ?2, source = ?3, status = ?4, mac = ?5 WHERE id = ?6",
+        rusqlite::params![
+            label,
+            body,
+            source,
+            "active\u{200b}",
+            mac.as_slice(),
+            active
+        ],
+    )
+    .unwrap();
+
+    let (code, listed) = cmd(&f, &["list", "--all"]);
+    assert_eq!(code, 0);
+    assert!(listed.contains("active"), "{listed}");
+    assert!(listed.contains("explicit"), "{listed}");
+    assert!(
+        listed.contains("Branches[31m are named after tickets."),
+        "{listed}"
+    );
+    for unsafe_char in ['\u{1b}', '\u{202e}', '\u{2066}', '\u{200b}'] {
+        assert!(!listed.contains(unsafe_char), "{listed:?}");
+    }
+}
+
+#[test]
+fn an_unstamped_store_prints_only_an_explanation() {
+    let f = fixture();
+    let dir = f.repo.join(".elefante");
+    fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('graph_epoch', 'foreign');
+         CREATE TABLE node(kind TEXT, status TEXT, source TEXT, body TEXT);
+         INSERT INTO node VALUES (
+           'fact' || char(27), 'active' || char(27),
+           'learned:explicit' || char(27), 'hostile row' || char(27)
+         );",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        cmd(&f, &["list"]),
+        (
+            0,
+            "memory store is not from this Elefante installation; no notes shown\n".to_owned()
+        )
+    );
 }
 
 /// Alters a learned row without access to the key.

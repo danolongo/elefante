@@ -229,6 +229,46 @@ fn explicit_cues_are_found_case_and_punctuation_insensitively() {
 }
 
 #[test]
+fn control_and_format_characters_are_stripped_before_a_candidate_is_verified_and_stored() {
+    let live = env();
+    let dirty = "Remember: markers ESC\u{1b}[31m and OSC\u{1b}]52;c; are bidi\u{202e} and zero\u{200b}width.";
+    let candidate = cand(
+        Kind::Convention,
+        "Marker\u{202e} \u{200b}convention",
+        "Markers ESC\u{1b}[31m and OSC\u{1b}]52;c; are bidi\u{202e} and zero\u{200b}width.",
+        dirty,
+    );
+
+    let report = run(&live.store, &[candidate], &[user(dirty)], &[], T0);
+    assert_eq!(report.added.len(), 1, "the cleaned quote still matches");
+    let stored = nodes(&live.store).pop().unwrap();
+    assert_eq!(stored.label, "Marker convention");
+    assert_eq!(
+        stored.statement,
+        "Markers ESC[31m and OSC]52;c; are bidi and zerowidth."
+    );
+    let attrs: String = raw(&live.store, move |conn| {
+        conn.query_row(
+            "SELECT attrs FROM node WHERE id = ?1",
+            [report.added[0]],
+            |row| row.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(learn::display_safe(&attrs), attrs);
+}
+
+#[test]
+fn display_safe_removes_unicode_controls_and_collapses_whitespace() {
+    assert_eq!(
+        learn::display_safe(
+            "  first\tsecond\nthird\r\u{0085}\u{061c}\u{2028}\u{2029}\u{2066}\u{200b}fourth  "
+        ),
+        "first second thirdfourth"
+    );
+}
+
+#[test]
 fn payload_shaped_tokens_are_recognised() {
     for token in [
         "curl",

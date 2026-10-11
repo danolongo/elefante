@@ -219,7 +219,7 @@ fn escape(text: &str) -> String {
 }
 
 fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    learn::display_safe(text)
 }
 
 /// The JSON Schema the reply is asked to satisfy where the model supports it. Strict schemas want
@@ -667,6 +667,7 @@ impl Learner {
         add!(self.stats, invalid_entries, outcome.invalid);
         if outcome.candidates.is_empty() {
             add!(self.stats, empty, 1);
+            self.clear_failure_diagnostics();
             self.advance(taken);
             return Step::Done;
         }
@@ -680,6 +681,8 @@ impl Learner {
                 add!(self.stats, rejected, report.rejected.len());
                 add!(self.stats, mac_failures, report.mac_failures);
                 self.note(|d| {
+                    d.last_error = None;
+                    d.last_unreadable_reply = None;
                     d.last_rejections = report
                         .rejected
                         .iter()
@@ -691,5 +694,12 @@ impl Learner {
             Err(_) => self.fail(taken),
         }
         Step::Done
+    }
+
+    fn clear_failure_diagnostics(&self) {
+        self.note(|d| {
+            d.last_error = None;
+            d.last_unreadable_reply = None;
+        });
     }
 }

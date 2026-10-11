@@ -836,6 +836,50 @@ async fn the_learner_says_why_a_call_failed_a_reply_was_unreadable_or_a_note_was
     );
 }
 
+#[tokio::test]
+async fn a_successful_extraction_clears_prior_failure_diagnostics() {
+    let (_tmp, store) = store();
+    let script = Script::new(vec![
+        Reply::Fail,
+        Reply::Fail,
+        Reply::Fail,
+        reply(&json!([])),
+    ]);
+    let learner_a = learner(&store, &script, config());
+
+    learner_a.observe(&[user("Remember something that will fail.")]);
+    settle(&learner_a).await;
+    assert!(learner_a.diagnostics().last_error.is_some());
+
+    learner_a.observe(&[
+        user("Remember something that will fail."),
+        user("Remember something that will succeed."),
+    ]);
+    settle(&learner_a).await;
+    let diagnostics = learner_a.diagnostics();
+    assert_eq!(diagnostics.last_error, None, "{diagnostics:?}");
+    assert_eq!(diagnostics.last_unreadable_reply, None, "{diagnostics:?}");
+
+    let unreadable = "not a memories document".to_owned();
+    let script = Script::new(vec![
+        Reply::Text(unreadable.clone()),
+        Reply::Text(unreadable.clone()),
+        Reply::Text(unreadable),
+        reply(&json!([])),
+    ]);
+    let learner_b = learner(&store, &script, config());
+    learner_b.observe(&[user("Remember another thing that will fail.")]);
+    settle(&learner_b).await;
+    assert!(learner_b.diagnostics().last_unreadable_reply.is_some());
+
+    learner_b.observe(&[
+        user("Remember another thing that will fail."),
+        user("Remember another thing that will succeed."),
+    ]);
+    settle(&learner_b).await;
+    assert_eq!(learner_b.diagnostics().last_unreadable_reply, None);
+}
+
 #[test]
 fn the_schema_asks_for_nothing_a_strict_provider_commonly_rejects() {
     let text = response_schema().schema.to_string();

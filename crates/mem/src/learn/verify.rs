@@ -11,6 +11,7 @@ use elefante_guard::Scrubber;
 
 use super::{
     Candidate, MAX_LABEL_CHARS, MAX_QUOTE_CHARS, MAX_STATEMENT_CHARS, Origin, Speaker, Turn,
+    display_safe,
 };
 
 /// Phrases that address an agent rather than describe a repository or a person's preference.
@@ -97,20 +98,17 @@ fn scrubber() -> &'static Scrubber {
     SCRUBBER.get_or_init(Scrubber::new)
 }
 
-fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Case- and whitespace-insensitive form used to compare a quote with the conversation.
 fn fold(text: &str) -> String {
-    collapse(&text.replace(['\u{2019}', '\u{2018}'], "'").to_lowercase())
+    display_safe(&text.replace(['\u{2019}', '\u{2018}'], "'").to_lowercase())
 }
 
 /// Words only: lower-cased, every non-alphanumeric character a space. Two texts that differ only in
 /// punctuation, quoting, backticks or an ellipsis compare equal, which is what a model copying a
 /// quote will get subtly wrong, while the words and their order must still match.
 fn loose(text: &str) -> String {
-    text.chars()
+    display_safe(text)
+        .chars()
         .map(|c| {
             if c.is_alphanumeric() {
                 c.to_lowercase().next().unwrap_or(c)
@@ -231,9 +229,9 @@ fn evidence(quote: &str, excerpt: &[Turn]) -> Option<Evidence> {
 pub fn verify(candidate: &Candidate, excerpt: &[Turn]) -> Result<Verified, Reject> {
     // A label is for search and for a person scanning a list; it is never shown to a model, so one
     // that runs long is cut rather than costing the whole note.
-    let label = cap_chars(&collapse(&candidate.label), MAX_LABEL_CHARS);
-    let statement = collapse(&candidate.statement);
-    let quote = cap_chars(&collapse(&candidate.quote), MAX_QUOTE_CHARS);
+    let label = cap_chars(&display_safe(&candidate.label), MAX_LABEL_CHARS);
+    let statement = display_safe(&candidate.statement);
+    let quote = cap_chars(&display_safe(&candidate.quote), MAX_QUOTE_CHARS);
     if label.is_empty() || statement.is_empty() || quote.is_empty() {
         return Err(Reject::Empty);
     }

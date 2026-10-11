@@ -1,5 +1,7 @@
+use crate::path::{built_in_secret_rule, credential_rule, home_harness_dirs, normalize};
+use globset::Glob;
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 /// Severity-ordered action for a shell command.
@@ -44,6 +46,7 @@ pub struct BashDecision {
 /// subshells, and command substitutions. The maximum severity wins. This is a safety gate,
 /// not a sandbox: aliases, runtime-generated command names, unusual quoting, and arbitrary
 /// interpreter programs can evade static classification and remain documented known gaps.
+/// It reduces accidental reads of secrets and harness state; it is not a sandbox.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BashClassifier;
 
@@ -109,6 +112,10 @@ impl BashClassifier {
             "commands assembled through variable expansion or eval",
             "obfuscated command names and interpreter payloads",
             "filesystem races after classification",
+            "shell variables naming a path (`D=.elefante; cat $D/memory.db`)",
+            "`cd` into a protected directory, then a relative path",
+            "interpreters and `sqlite3` reading a path assembled at runtime",
+            "`xargs` or command substitution producing a path",
         ]
     }
 }
@@ -179,11 +186,7 @@ fn classify_command(command: &str, root: &Path) -> BashDecision {
     }
     // Every program can transform or forward secrets; restricting this check to `cat`
     // allows `sed`, `head`, or an interpreter to evade output scrubbing.
-    if tokens
-        .iter()
-        .skip(1)
-        .any(|arg| looks_like_secret_path(arg, root))
-    {
+    if checked_arguments(basename, &tokens).any(|arg| looks_like_secret_path(arg, root)) {
         return BashDecision {
             verdict: Verdict::Deny,
             rule: "secret-path",
@@ -219,6 +222,12 @@ fn classify_command(command: &str, root: &Path) -> BashDecision {
         return BashDecision {
             verdict: Verdict::Escalate,
             rule: "in-place-sed",
+        };
+    }
+    if searches_harness_state(basename, &tokens, root) {
+        return BashDecision {
+            verdict: Verdict::Escalate,
+            rule: "recursive-search-includes-harness-state",
         };
     }
     if is_read_only_program(basename) {
@@ -370,21 +379,285 @@ fn static_tokens(command: &str) -> Vec<String> {
     tokens
 }
 
+/// The arguments to test for secret paths. `grep --exclude-dir=.elefante` names the directory
+/// only to keep a recursive search out of it, which is the safe form, so that value is skipped.
+fn checked_arguments<'a>(
+    basename: &str,
+    tokens: &'a [String],
+) -> impl Iterator<Item = &'a String> + use<'a> {
+    let grep = matches!(basename, "grep" | "egrep" | "fgrep");
+    let mut skip_next = false;
+    tokens.iter().skip(1).filter(move |token| {
+        if std::mem::take(&mut skip_next) {
+            return false;
+        }
+        if grep && token.as_str() == "--exclude-dir" {
+            skip_next = true;
+            return false;
+        }
+        !(grep && token.starts_with("--exclude-dir="))
+    })
+}
+
+fn expand_home(value: &str) -> Option<PathBuf> {
+    let suffix = ["~", "$HOME", "${HOME}"].into_iter().find_map(|prefix| {
+        let rest = value.strip_prefix(prefix)?;
+        if rest.is_empty() {
+            Some("")
+        } else {
+            rest.strip_prefix('/')
+        }
+    })?;
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(suffix))
+}
+
+fn absolute_root(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
 fn looks_like_secret_path(value: &str, root: &Path) -> bool {
     // Check both a raw argument and the value of an option such as `--file=path`.
     let value = value.split_once('=').map_or(value, |(_, value)| value);
-    let path = Path::new(value);
-    if crate::path::built_in_secret_rule(path).is_some() {
+    if names_harness_dir_by_glob(value) {
         return true;
     }
-    let expanded = ["~/", "$HOME/", "${HOME}/"]
-        .into_iter()
-        .find_map(|prefix| value.strip_prefix(prefix))
-        .and_then(|suffix| std::env::var_os("HOME").map(|home| Path::new(&home).join(suffix)))
-        .unwrap_or_else(|| root.join(path));
-    crate::path::built_in_secret_rule(&expanded).is_some()
-        || expanded.canonicalize().is_ok_and(|canonical| {
-            crate::path::built_in_secret_rule(&canonical).is_some()
+    let path = Path::new(value);
+    let home_expanded = expand_home(value);
+    // As typed, a relative argument is relative to the workspace root, so the component rule
+    // applies to it directly.
+    if home_expanded.is_none() && !path.is_absolute() && built_in_secret_rule(path).is_some() {
+        return true;
+    }
+    let root = absolute_root(root);
+    let target = normalize(&home_expanded.unwrap_or_else(|| root.join(path)));
+    is_secret_target(&target, &root)
+        || target.canonicalize().is_ok_and(|canonical| {
+            is_secret_target(&canonical, &root)
                 || crate::path::canonical_credentials().as_ref() == Some(&canonical)
         })
+}
+
+/// `target` is absolute. The harness-state rule applies to the part below the workspace root, so
+/// a workspace under some `.elefante/` still works; the user-level directory is denied by prefix.
+fn is_secret_target(target: &Path, root: &Path) -> bool {
+    credential_rule(target).is_some()
+        || home_harness_dirs()
+            .iter()
+            .any(|dir| target.starts_with(dir))
+        || target
+            .strip_prefix(root)
+            .is_ok_and(|relative| built_in_secret_rule(relative).is_some())
+}
+
+/// Whether an argument containing glob characters can expand to `.elefante`.
+///
+/// Every leading-dot component with a literal character after the dot is tested
+/// (`.elef*`, `.[e]lefante`). A bare `.*` is only tested as the argument's first component and
+/// only when more components follow (`.*/memory.db`), because `.*` as a regex or a `sed`
+/// script is common and would otherwise deny ordinary commands.
+fn names_harness_dir_by_glob(value: &str) -> bool {
+    if !value.contains(['*', '?', '[']) {
+        return false;
+    }
+    let components = Path::new(value)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components.iter().enumerate().any(|(index, component)| {
+        let Some(rest) = component.strip_prefix('.') else {
+            return false;
+        };
+        if !component.contains(['*', '?', '[']) {
+            return false;
+        }
+        let bare = rest.chars().all(|c| matches!(c, '*' | '?' | '.'));
+        if bare && (index != 0 || components.len() < 2) {
+            return false;
+        }
+        Glob::new(component).is_ok_and(|glob| glob.compile_matcher().is_match(".elefante"))
+    })
+}
+
+#[derive(Default)]
+struct ScannedArgs {
+    short: Vec<(char, Option<String>)>,
+    long: Vec<(String, Option<String>)>,
+    positionals: Vec<String>,
+}
+
+impl ScannedArgs {
+    fn has_short(&self, flag: char) -> bool {
+        self.short.iter().any(|(c, _)| *c == flag)
+    }
+
+    fn has_long(&self, name: &str) -> bool {
+        self.long.iter().any(|(n, _)| n == name)
+    }
+
+    fn long_value(&self, name: &str) -> Option<&str> {
+        self.long
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, value)| value.as_deref())
+    }
+}
+
+/// Splits arguments into short flags, long flags and positionals. `short_with_arg` lists the
+/// short options that take a value; `long_with_arg` the long ones that take it as the next token.
+fn scan_args(tokens: &[String], short_with_arg: &str, long_with_arg: &[&str]) -> ScannedArgs {
+    let mut scanned = ScannedArgs::default();
+    let mut iter = tokens.iter().skip(1);
+    while let Some(token) = iter.next() {
+        if token == "--" {
+            scanned.positionals.extend(iter.by_ref().cloned());
+        } else if let Some(long) = token.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None if long_with_arg.contains(&long) => (long, iter.next().cloned()),
+                None => (long, None),
+            };
+            scanned.long.push((name.to_owned(), value));
+        } else if token.len() > 1 && token.starts_with('-') {
+            let mut chars = token[1..].chars();
+            while let Some(flag) = chars.next() {
+                if short_with_arg.contains(flag) {
+                    let rest = chars.as_str();
+                    let value = if rest.is_empty() {
+                        iter.next().cloned()
+                    } else {
+                        Some(rest.to_owned())
+                    };
+                    scanned.short.push((flag, value));
+                    break;
+                }
+                scanned.short.push((flag, None));
+            }
+        } else {
+            scanned.positionals.push(token.clone());
+        }
+    }
+    scanned
+}
+
+const GREP_SHORT_WITH_ARG: &str = "efmABCdD";
+const GREP_LONG_WITH_ARG: &[&str] = &[
+    "regexp",
+    "file",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "directories",
+    "devices",
+    "exclude",
+    "exclude-dir",
+    "exclude-from",
+    "include",
+    "label",
+    "binary-files",
+];
+const RG_SHORT_WITH_ARG: &str = "efgtTmABCjMrE";
+const RG_LONG_WITH_ARG: &[&str] = &[
+    "regexp",
+    "file",
+    "glob",
+    "iglob",
+    "type",
+    "type-not",
+    "type-add",
+    "max-depth",
+    "max-count",
+    "max-filesize",
+    "max-columns",
+    "replace",
+    "after-context",
+    "before-context",
+    "context",
+    "threads",
+    "ignore-file",
+    "pre",
+    "pre-glob",
+    "engine",
+    "encoding",
+    "sort",
+    "sortr",
+    "colors",
+];
+
+/// A grep that recurses and was not told to leave `.elefante` out.
+fn grep_recurses_into_state(scanned: &ScannedArgs) -> bool {
+    let recursive = scanned.has_short('r')
+        || scanned.has_short('R')
+        || scanned
+            .short
+            .iter()
+            .any(|(c, value)| *c == 'd' && value.as_deref() == Some("recurse"))
+        || scanned.has_long("recursive")
+        || scanned.has_long("dereference-recursive")
+        || scanned.long_value("directories") == Some("recurse");
+    let excluded = scanned.long.iter().any(|(name, value)| {
+        name == "exclude-dir"
+            && value
+                .as_deref()
+                .is_some_and(|v| v.trim_end_matches('/') == ".elefante")
+    });
+    recursive && !excluded
+}
+
+/// A ripgrep-style search that turned off the ignore rules that hide `.elefante`.
+fn rg_ignores_state_rules(scanned: &ScannedArgs) -> bool {
+    scanned.has_short('u')
+        || scanned.has_short('.')
+        || scanned.has_long("hidden")
+        || scanned.has_long("unrestricted")
+        || scanned
+            .long
+            .iter()
+            .any(|(name, _)| name.starts_with("no-ignore"))
+}
+
+/// Recursive content readers over the workspace root also read `.elefante/`, whose name never
+/// appears in the command. Held for approval rather than denied, like other indeterminate commands.
+fn searches_harness_state(basename: &str, tokens: &[String], root: &Path) -> bool {
+    let (scanned, reaches_state) = match basename {
+        "grep" | "egrep" | "fgrep" => {
+            let scanned = scan_args(tokens, GREP_SHORT_WITH_ARG, GREP_LONG_WITH_ARG);
+            let reaches = grep_recurses_into_state(&scanned);
+            (scanned, reaches)
+        }
+        "rg" | "ag" | "ack" => {
+            let scanned = scan_args(tokens, RG_SHORT_WITH_ARG, RG_LONG_WITH_ARG);
+            let reaches = rg_ignores_state_rules(&scanned);
+            (scanned, reaches)
+        }
+        _ => return false,
+    };
+    if !reaches_state {
+        return false;
+    }
+    let pattern_by_option = scanned.has_short('e')
+        || scanned.has_short('f')
+        || scanned.has_long("regexp")
+        || scanned.has_long("file");
+    let paths = if pattern_by_option {
+        &scanned.positionals[..]
+    } else {
+        scanned.positionals.get(1..).unwrap_or_default()
+    };
+    paths.is_empty() || {
+        let root = absolute_root(root);
+        paths.iter().any(|path| {
+            let target = normalize(&expand_home(path).unwrap_or_else(|| root.join(path)));
+            let target = target.canonicalize().unwrap_or(target);
+            // The root itself, or any directory above it (or above the user-level harness
+            // directory), contains `.elefante`.
+            root.starts_with(&target)
+                || home_harness_dirs()
+                    .iter()
+                    .any(|dir| dir.starts_with(&target))
+        })
+    }
 }

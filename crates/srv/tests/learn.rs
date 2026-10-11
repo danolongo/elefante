@@ -4,7 +4,12 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, run};
+use elefante_mem::{
+    MemKey,
+    consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
+    trust::KEY_FILE,
+};
+use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -63,20 +68,22 @@ impl Client {
 
 struct Options {
     memory: bool,
-    learn: bool,
+    learn: LearnMode,
     learn_idle: Duration,
     idle_timeout: Duration,
     extract: Value,
+    preconsent: Option<ConsentRecord>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             memory: true,
-            learn: true,
+            learn: LearnMode::On,
             learn_idle: Duration::from_secs(300),
             idle_timeout: Duration::from_secs(60),
             extract: json!([]),
+            preconsent: None,
         }
     }
 }
@@ -118,6 +125,11 @@ impl Harness {
             learn_idle: options.learn_idle,
             learn_timeout: Duration::from_secs(5),
         };
+        if let Some(record) = options.preconsent {
+            let parent = config.credentials.parent().unwrap();
+            let key = MemKey::load_or_create(&parent.join(KEY_FILE)).unwrap();
+            consent::write(&parent.join(CONSENT_FILE), &key, &record).unwrap();
+        }
         let task = tokio::spawn(run(config.clone()));
         for _ in 0..200 {
             if UnixStream::connect(&config.socket).await.is_ok() {
@@ -135,10 +147,33 @@ impl Harness {
     }
 
     async fn session(&self, client: &mut Client) -> String {
-        let result = client
-            .rpc(1, "session.create", json!({"cwd": self.repo.path()}))
-            .await;
+        let result = self.create(client, 1, None).await;
         result["result"]["session_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn create(&self, client: &mut Client, id: u64, model: Option<&str>) -> Value {
+        let mut params = json!({"cwd": self.repo.path()});
+        if let Some(model) = model {
+            params["model"] = model.into();
+        }
+        client.rpc(id, "session.create", params).await
+    }
+
+    async fn restart(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let task = tokio::spawn(run(self.config.clone()));
+        for _ in 0..200 {
+            if UnixStream::connect(&self.config.socket).await.is_ok() {
+                self.task = Some(task);
+                return;
+            }
+            assert!(!task.is_finished(), "daemon failed on restart");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("daemon did not restart");
     }
 
     async fn prompt(&self, client: &mut Client, session: &str, text: &str) {
@@ -258,6 +293,253 @@ fn all_text(request: &Value) -> String {
         .filter_map(|b| b["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn consent_record(answer: ConsentAnswer, extractor: &str) -> ConsentRecord {
+    ConsentRecord {
+        answer,
+        extractor: extractor.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn standalone_consent_targets_the_configured_default_extractor() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    assert_eq!(
+        client
+            .rpc(1, "memory.consent", json!({"answer":"learn"}))
+            .await["result"]["consent"],
+        "granted"
+    );
+    let created = h.create(&mut client, 2, None).await;
+    assert_eq!(created["result"]["memory"]["consent"], "granted");
+    assert_eq!(
+        created["result"]["memory"]["extractor"],
+        "anthropic/claude-sonnet-5"
+    );
+}
+
+#[tokio::test]
+async fn unset_consent_reads_no_text_and_grant_is_not_retroactive() {
+    let h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        extract: json!([reply(
+            "Branches are named from the post-consent ticket.",
+            "post-consent ticket names branches"
+        )]),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    assert_eq!(created["result"]["memory"]["consent"], "unset");
+    assert_eq!(
+        created["result"]["memory"]["extractor"],
+        "anthropic/claude-sonnet-5"
+    );
+    let session = created["result"]["session_id"].as_str().unwrap();
+
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: this pre-consent phrase must never be extracted.",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(h.extractions().is_empty());
+    assert!(h.notes().is_empty());
+
+    assert_eq!(
+        client
+            .rpc(3, "memory.consent", json!({"answer":"learn"}))
+            .await["result"]["consent"],
+        "granted"
+    );
+    h.prompt(
+        &mut client,
+        session,
+        "Remember: post-consent ticket names branches.",
+    )
+    .await;
+    h.notes_appear(1).await;
+    let requests = h.extractions();
+    assert_eq!(requests.len(), 1);
+    assert!(!all_text(&requests[0]).contains("pre-consent phrase"));
+    assert!(all_text(&requests[0]).contains("post-consent ticket"));
+}
+
+#[tokio::test]
+async fn answers_are_shared_persisted_extractor_bound_and_connection_local() {
+    let mut h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        ..Options::default()
+    })
+    .await;
+    let mut first = Client::connect(&h.config.socket).await;
+    let mut second = Client::connect(&h.config.socket).await;
+    let one = h.create(&mut first, 1, Some("provider/one")).await;
+    let two = h.create(&mut second, 1, Some("provider/one")).await;
+    assert_eq!(one["result"]["memory"]["consent"], "unset");
+    assert_eq!(two["result"]["memory"]["consent"], "unset");
+    assert_eq!(
+        first
+            .rpc(2, "memory.consent", json!({"answer":"learn"}))
+            .await["result"]["consent"],
+        "granted"
+    );
+    let session_two = two["result"]["session_id"].as_str().unwrap();
+    let attached = second
+        .rpc(2, "session.attach", json!({"session_id":session_two}))
+        .await;
+    assert_eq!(attached["result"]["memory"]["consent"], "granted");
+    drop(first);
+    drop(second);
+
+    h.restart().await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let matching = h.create(&mut client, 3, Some("provider/one")).await;
+    assert_eq!(matching["result"]["memory"]["consent"], "granted");
+    let changed = h.create(&mut client, 4, Some("provider/two")).await;
+    assert_eq!(changed["result"]["memory"]["consent"], "unset");
+    assert_eq!(changed["result"]["memory"]["extractor"], "provider/two");
+    assert_eq!(
+        client
+            .rpc(5, "memory.consent", json!({"answer":"off"}))
+            .await["result"]["consent"],
+        "declined"
+    );
+    drop(client);
+
+    h.restart().await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let declined = h.create(&mut client, 6, Some("provider/two")).await;
+    assert_eq!(declined["result"]["memory"]["consent"], "declined");
+    let old_extractor = h.create(&mut client, 7, Some("provider/one")).await;
+    assert_eq!(old_extractor["result"]["memory"]["consent"], "unset");
+}
+
+#[tokio::test]
+async fn operator_modes_override_files_and_tampering_returns_to_unset() {
+    let on = Harness::start(Options {
+        learn: LearnMode::On,
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&on.config.socket).await;
+    let created = on.create(&mut client, 1, None).await;
+    assert_eq!(created["result"]["memory"]["consent"], "granted");
+    assert!(
+        !on.config
+            .credentials
+            .parent()
+            .unwrap()
+            .join(CONSENT_FILE)
+            .exists()
+    );
+    assert_eq!(
+        client
+            .rpc(2, "memory.consent", json!({"answer":"off"}))
+            .await["result"]["consent"],
+        "granted"
+    );
+    assert!(
+        !on.config
+            .credentials
+            .parent()
+            .unwrap()
+            .join(CONSENT_FILE)
+            .exists()
+    );
+
+    let off = Harness::start(Options {
+        learn: LearnMode::Off,
+        preconsent: Some(consent_record(
+            ConsentAnswer::Learn,
+            "anthropic/claude-sonnet-5",
+        )),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&off.config.socket).await;
+    let created = off.create(&mut client, 1, None).await;
+    assert_eq!(created["result"]["memory"]["consent"], "off");
+    assert_eq!(created["result"]["memory"]["extractor"], Value::Null);
+    assert_eq!(
+        client
+            .rpc(2, "memory.consent", json!({"answer":"learn"}))
+            .await["result"]["consent"],
+        "off"
+    );
+
+    let mut tampered = Harness::start(Options {
+        learn: LearnMode::Ask,
+        preconsent: Some(consent_record(
+            ConsentAnswer::Learn,
+            "anthropic/claude-sonnet-5",
+        )),
+        ..Options::default()
+    })
+    .await;
+    let path = tampered
+        .config
+        .credentials
+        .parent()
+        .unwrap()
+        .join(CONSENT_FILE);
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["answer"] = "off".into();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    tampered.restart().await;
+    let mut client = Client::connect(&tampered.config.socket).await;
+    let created = tampered.create(&mut client, 1, None).await;
+    assert_eq!(created["result"]["memory"]["consent"], "unset");
+}
+
+#[tokio::test]
+async fn revocation_discards_pending_text_before_idle_close_or_shutdown_flushes() {
+    let mut h = Harness::start(Options {
+        learn: LearnMode::Ask,
+        learn_idle: Duration::from_millis(150),
+        idle_timeout: Duration::from_millis(300),
+        extract: json!([reply(
+            "Deploys use the private pipeline.",
+            "we deploy with the private pipeline"
+        )]),
+        ..Options::default()
+    })
+    .await;
+    let mut client = Client::connect(&h.config.socket).await;
+    let created = h.create(&mut client, 1, None).await;
+    let session = created["result"]["session_id"].as_str().unwrap();
+    client
+        .rpc(2, "memory.consent", json!({"answer":"learn"}))
+        .await;
+    h.prompt(
+        &mut client,
+        session,
+        "FYI we deploy with the private pipeline.",
+    )
+    .await;
+    client
+        .rpc(3, "memory.consent", json!({"answer":"off"}))
+        .await;
+    client
+        .rpc(4, "session.close", json!({"session_id":session}))
+        .await;
+    drop(client);
+    let task = h.task.take().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(h.extractions().is_empty());
+    assert!(h.notes().is_empty());
 }
 
 #[tokio::test]
@@ -444,7 +726,7 @@ async fn a_session_that_never_closed_is_extracted_as_the_daemon_exits() {
 #[tokio::test]
 async fn learning_off_asks_nothing_but_memory_still_works() {
     let h = Harness::start(Options {
-        learn: false,
+        learn: LearnMode::Off,
         extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),
         ..Options::default()
     })
@@ -477,7 +759,7 @@ async fn learning_off_asks_nothing_but_memory_still_works() {
 async fn memory_off_creates_nothing_and_asks_nothing() {
     let h = Harness::start(Options {
         memory: false,
-        learn: false,
+        learn: LearnMode::Off,
         extract: json!([reply(BRANCHES, BRANCHES_QUOTE)]),
         ..Options::default()
     })

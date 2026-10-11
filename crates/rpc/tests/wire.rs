@@ -51,6 +51,8 @@ fn every_request_method_round_trips_with_fixed_members() {
             json!({"session_id":"s1", "approval_id":"a", "decision":"deny"}),
         ),
         ("key.set", json!({"api_key":"secret"})),
+        ("memory.consent", json!({"answer":"learn"})),
+        ("memory.consent", json!({"answer":"off"})),
     ] {
         round_trip::<Request>(json!({"id":17,"method":method,"params":params}));
     }
@@ -184,6 +186,11 @@ fn method_results_and_all_application_errors_round_trip() {
     assert!(serde_json::from_value::<Response>(json!({"result":{}})).is_err());
     assert!(serde_json::from_value::<Response>(json!({"id":1})).is_err());
     round_trip::<CreateResult>(json!({"session_id":"s1","seq":0}));
+    round_trip::<CreateResult>(json!({
+        "session_id":"s1", "seq":0,
+        "memory":{"consent":"unset","extractor":"provider/model"}
+    }));
+    round_trip::<MemoryConsentResult>(json!({"consent":"granted"}));
     round_trip::<PromptResult>(json!({"turn_id":"t1"}));
     round_trip::<EmptyResult>(json!({}));
     round_trip::<Response>(json!({"id":"r1","result":{"session_id":"s1","seq":0}}));
@@ -221,6 +228,9 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
     round_trip::<AttachResult>(
         json!({"kind":"resumed","from":413,"events":[note(413,"text.delta",json!({"text":"continued"}))]}),
     );
+    round_trip::<AttachResult>(
+        json!({"kind":"resumed","from":413,"events":[],"memory":{"consent":"declined","extractor":"provider/model"}}),
+    );
     let tools = json!([
         {"tool_call_id":"c1","name":"read","state":"running","is_error":false},
         {"tool_call_id":"c2","name":"grep","state":"ok","is_error":false},
@@ -234,6 +244,10 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
         "pending_approval":{"approval_id":"a1","command":"echo x","rule":"shell"}
     }});
     round_trip::<AttachResult>(json!({"kind":"snapshot","seq":981,"snapshot":snapshot}));
+    round_trip::<AttachResult>(json!({
+        "kind":"snapshot", "seq":981, "snapshot":snapshot,
+        "memory":{"consent":"off","extractor":null}
+    }));
     snapshot["active_turn"]["pending_approval"] = Value::Null;
     round_trip::<SessionSnapshot>(snapshot.clone());
     snapshot["active_turn"] = Value::Null;

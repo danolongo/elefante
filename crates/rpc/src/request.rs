@@ -56,6 +56,8 @@ pub enum Method {
     SessionResolveApproval(ResolveApprovalParams),
     #[serde(rename = "key.set")]
     KeySet(KeySetParams),
+    #[serde(rename = "memory.consent")]
+    MemoryConsent(MemoryConsentParams),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +116,18 @@ impl fmt::Debug for KeySetParams {
             .field("api_key", &"[REDACTED]")
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryConsentAnswer {
+    Learn,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryConsentParams {
+    pub answer: MemoryConsentAnswer,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -196,6 +210,28 @@ pub struct RpcError {
 pub struct CreateResult {
     pub session_id: String,
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySeed>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryConsentState {
+    Unset,
+    Granted,
+    Declined,
+    Off,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySeed {
+    pub consent: MemoryConsentState,
+    pub extractor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryConsentResult {
+    pub consent: MemoryConsentState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

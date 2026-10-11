@@ -1,4 +1,4 @@
-use crate::{Notification, StopReason, Usage};
+use crate::{MemorySeed, Notification, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -7,10 +7,14 @@ pub enum AttachResult {
     Resumed {
         from: u64,
         events: Vec<Notification>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<MemorySeed>,
     },
     Snapshot {
         seq: u64,
         snapshot: Box<SessionSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<MemorySeed>,
     },
 }
 

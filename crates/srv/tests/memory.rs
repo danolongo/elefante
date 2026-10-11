@@ -3,7 +3,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, run};
+use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -92,7 +92,7 @@ impl Harness {
             stub_provider: Some(script),
             idle_timeout: Duration::from_secs(60),
             memory,
-            learn: false,
+            learn: LearnMode::Off,
             learn_idle: Duration::from_secs(300),
             learn_timeout: Duration::from_secs(60),
         };

@@ -524,10 +524,15 @@ first, then fixed. Plan: `docs/PR15-REVIEW-FIXES-PLAN.md`.
   assistant has shown to be wrong rather than to keep it. `ELEFANTE_LEARN_LOG` heads are made
   display-safe.
 
+**Credentialed run** (2026-10-11, tree `e0799ce`, run by the maintainer with a real key): the provider
+prompt-cache check and all three CLI live tests passed, including
+`live_learned_memory_is_extracted_stored_and_used` against the reworded extractor prompt, the split
+`LEARNING_HINT`, and per-extractor consent.
+
 **Still not covered by a test:** the `.elefante` bypass classes in the known-gaps list (asserted as
-`Allow` precisely so the limit is documented); the bun-built binary against a real older daemon; the
-credentialed suite on this tree (run it from a shell with a key; `live_learned_memory_is_extracted_
-stored_and_used` must run against the new extractor prompt).
+`Allow` precisely so the limit is documented), and the bun-built binary against a real older daemon.
+The agent-behaviour change still has no before/after measurement on real models (plan § 5 of
+`AGENT-MEMORY-USE-PLAN.md`).
 
 **Deferred, with reasons.** The learner's held history grows for the whole session (needs the
 watermark/history ownership reworked); both parsers reject a *new value* of a known enum (a protocol

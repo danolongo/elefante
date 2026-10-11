@@ -1,4 +1,4 @@
-import { range, type Approval, type CompletedTurn, type MemoryStatus, type Notification, type Snapshot, type Tool, type Usage } from "./protocol";
+import { range, safeMemoryNote, type Approval, type CompletedTurn, type MemoryChange, type MemoryNote, type MemoryStatus, type Notification, type Snapshot, type Tool, type Usage } from "./protocol";
 
 export const emptyUsage = (): Usage => ({ input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, cost: null });
 /** Display-only estimate: one token per four UTF-16 code units, rounded up. */
@@ -20,13 +20,14 @@ function appendText(segments: Segment[], kind: "reasoning" | "text", text: strin
 /** reasoning_tokens is a local estimate; exact usage arrives with turn.finished. */
 export type LiveTurn = { turn_id: string; prompt: string; text: string; reasoning: string; tools: Tool[]; segments: Segment[]; pending_approvals: Approval[]; memory_note_ids: number[]; thinking_since: number | null; reasoning_tokens: number; error: string | null };
 export type StoredTurn = CompletedTurn & { segments?: Segment[] };
-export type SessionState = { session_id: string; seq: number; cwd: string; model: string; effort: string; turns: StoredTurn[]; active_turn: LiveTurn | null; usage: Usage; memory: MemoryStatus | null; pending_prompt: string; error: string | null };
+export type MemoryLine = { after_turn: string | null; change: MemoryChange; note: MemoryNote; replaced?: MemoryNote };
+export type SessionState = { session_id: string; seq: number; cwd: string; model: string; effort: string; turns: StoredTurn[]; active_turn: LiveTurn | null; usage: Usage; memory: MemoryStatus | null; memory_lines: MemoryLine[]; pending_prompt: string; error: string | null };
 export function initialSession(session_id: string, cwd = "", model = "", effort = ""): SessionState {
-  return { session_id, seq: 0, cwd, model, effort, turns: [], active_turn: null, usage: emptyUsage(), memory: null, pending_prompt: "", error: null };
+  return { session_id, seq: 0, cwd, model, effort, turns: [], active_turn: null, usage: emptyUsage(), memory: null, memory_lines: [], pending_prompt: "", error: null };
 }
-export function restoreSnapshot(snapshot: Snapshot, now = 0, effort = "", memory: MemoryStatus | null = null): SessionState {
+export function restoreSnapshot(snapshot: Snapshot, now = 0, effort = "", memory: MemoryStatus | null = null, memory_lines: MemoryLine[] = []): SessionState {
   const a = snapshot.active_turn;
-  return { ...initialSession(snapshot.session_id, snapshot.cwd, snapshot.model, effort), seq: snapshot.seq, turns: snapshot.turns.map(t => ({ ...t, tools: t.tools.map(tool => ({ ...tool })) })), usage: snapshot.turns.reduce((u, t) => addUsage(u, t.usage), emptyUsage()), memory, active_turn: a ? { turn_id: a.turn_id, prompt: "", text: a.text_so_far, reasoning: a.reasoning_so_far, tools: a.tools.map(t => ({ ...t })), segments: flatSegments(a.reasoning_so_far, a.text_so_far, a.tools), pending_approvals: a.pending_approval ? [{ ...a.pending_approval }] : [], memory_note_ids: a.memory_note_ids ?? [], thinking_since: a.text_so_far ? null : now, reasoning_tokens: estimateReasoningTokens(a.reasoning_so_far), error: null } : null };
+  return { ...initialSession(snapshot.session_id, snapshot.cwd, snapshot.model, effort), seq: snapshot.seq, turns: snapshot.turns.map(t => ({ ...t, tools: t.tools.map(tool => ({ ...tool })) })), usage: snapshot.turns.reduce((u, t) => addUsage(u, t.usage), emptyUsage()), memory, memory_lines, active_turn: a ? { turn_id: a.turn_id, prompt: "", text: a.text_so_far, reasoning: a.reasoning_so_far, tools: a.tools.map(t => ({ ...t })), segments: flatSegments(a.reasoning_so_far, a.text_so_far, a.tools), pending_approvals: a.pending_approval ? [{ ...a.pending_approval }] : [], memory_note_ids: a.memory_note_ids ?? [], thinking_since: a.text_so_far ? null : now, reasoning_tokens: estimateReasoningTokens(a.reasoning_so_far), error: null } : null };
 }
 /** Time is passed by the caller; this reducer performs no I/O and reads no clock. */
 export function reduceSession(state: SessionState, note: Notification, now = 0): SessionState {
@@ -34,6 +35,11 @@ export function reduceSession(state: SessionState, note: Notification, now = 0):
   const [, seq] = range(note);
   const next = { ...state, seq };
   if (note.method === "memory.status") return { ...next, memory: note.params };
+  if (note.method === "memory.learned") {
+    if (note.params.note.status === "pending") return next;
+    const after_turn = state.active_turn?.turn_id ?? state.turns.at(-1)?.turn_id ?? null;
+    return { ...next, memory_lines: [...state.memory_lines, { after_turn, change: note.params.change, note: safeMemoryNote(note.params.note), ...(note.params.replaced ? { replaced: safeMemoryNote(note.params.replaced) } : {}) }] };
+  }
   if (note.method === "turn.started") return { ...next, pending_prompt: "", error: null, active_turn: { turn_id: note.turn_id!, prompt: state.pending_prompt, text: "", reasoning: "", tools: [], segments: [], pending_approvals: [], memory_note_ids: [], thinking_since: now, reasoning_tokens: 0, error: null } };
   const active = state.active_turn;
   if (!active || active.turn_id !== note.turn_id) return next;

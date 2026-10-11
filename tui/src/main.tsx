@@ -105,7 +105,7 @@ try {
   const existing = option("--session");
   const created: CreateResult = existing ? { session_id: existing, seq: 0 } : parseCreate(await rpc.request("session.create", { cwd: state.cwd, ...(state.model ? { model: state.model } : {}), ...(state.effort ? { effort: state.effort } : {}), ...(setting("max-rounds") ? { max_rounds: Number(setting("max-rounds")) } : {}), ...(setting("max-tokens") ? { max_tokens: Number(setting("max-tokens")) } : {}) }));
   state = { ...state, session_id: created.session_id, seq: created.seq };
-  const attached = await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort, state.memory); draw(); });
+  const attached = await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort, state.memory, state.memory_lines); draw(); });
   const memory = attached.memory ?? created.memory;
   if (isMemoryStatus(memory)) state = { ...state, memory };
   if (memory?.consent === "unset" && memory.extractor !== null) consentPrompt = memory;

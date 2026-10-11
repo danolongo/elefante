@@ -111,3 +111,33 @@ test("memory context belongs to its turn and snapshot note ids restore the audit
   const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "next", text_so_far: "", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [21] } });
   expect(restored.active_turn?.memory_note_ids).toEqual([21]);
 });
+
+const learned = (seq: number, change: string, id: number, statement: string, status = "active", replaced?: { id: number; statement: string }) => note(seq, "memory.learned", {
+  change,
+  note: { id, kind: "convention", status, statement, origin: "stated" },
+  ...(replaced ? { replaced: { id: replaced.id, kind: "convention", status: "superseded", statement: replaced.statement, origin: "stated" } } : {}),
+}, null);
+
+test("a learned note becomes one persistent line placed after the turn on screen, without a turn id", () => {
+  const finished = stream().reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  const state = reduceSession(finished, learned(11, "added", 14, "This repo uses pnpm."));
+  expect(state.seq).toBe(11);
+  expect(state.memory_lines).toEqual([{ after_turn: "t", change: "added", note: { id: 14, kind: "convention", status: "active", statement: "This repo uses pnpm.", origin: "stated" } }]);
+  expect(reduceSession(initialSession("s"), learned(1, "added", 1, "Before any turn.")).memory_lines[0]?.after_turn).toBeNull();
+});
+
+test("an update carries what it replaced, a pending note makes no line, and text is sanitised", () => {
+  const updated = reduceSession(initialSession("s"), learned(1, "superseded", 15, "Uses pnpm.", "active", { id: 12, statement: "Uses npm." }));
+  expect(updated.memory_lines[0]?.replaced?.statement).toBe("Uses npm.");
+  const pending = reduceSession(initialSession("s"), learned(1, "added", 16, "Assistant claim.", "pending"));
+  expect(pending.memory_lines).toEqual([]);
+  expect(pending.seq).toBe(1);
+  const hostile = reduceSession(initialSession("s"), learned(1, "added", 17, "Use\u001b[31m red‮ and​ zero\nwidth."));
+  expect(hostile.memory_lines[0]?.note.statement).toBe("Use[31m red and zero width.");
+});
+
+test("memory lines survive a snapshot restore and are not replayed from it", () => {
+  const line = reduceSession(initialSession("s"), learned(1, "added", 14, "Kept.")).memory_lines;
+  expect(restoreSnapshot(snapshot(), 0, "high", null, line).memory_lines).toBe(line);
+  expect(restoreSnapshot(snapshot()).memory_lines).toEqual([]);
+});

@@ -109,6 +109,24 @@ test("a turn that used learned context shows one persistent audit line", async (
     expect(setup.captureCharFrame()).toContain("◇ used 2 saved notes");
   } finally { await act(async () => setup.renderer.destroy()); }
 });
+test("learned notes are persistent transcript lines under their turn, with the id to undo them", async () => {
+  const base = answered("Understood.");
+  const state = { ...base, memory_lines: [
+    { after_turn: "t", change: "added" as const, note: { id: 14, kind: "convention", status: "active", statement: "This repo uses pnpm.", origin: "stated" } },
+    { after_turn: "t", change: "superseded" as const, note: { id: 15, kind: "convention", status: "active", statement: "Uses pnpm.", origin: "stated" }, replaced: { id: 12, kind: "convention", status: "superseded", statement: "Uses npm.", origin: "stated" } },
+    { after_turn: "gone", change: "added" as const, note: { id: 16, kind: "fact", status: "active", statement: "Orphaned but kept.", origin: "stated" } },
+  ] };
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 100, height: 16 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "Understood.");
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("◇ remembered: This repo uses pnpm.  /forget 14");
+    expect(frame).toContain("◇ updated: “Uses npm.” → “Uses pnpm.”  /forget 15");
+    expect(frame).toContain("◇ remembered: Orphaned but kept.  /forget 16");
+    expect(frame.indexOf("Understood.")).toBeLessThan(frame.indexOf("/forget 14"));
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
+});
 test("reasoning-only status remains visible at five seconds with a nonzero labeled estimate", async () => {
   const started = reduceSession(initialSession("s"), note(1, "turn.started"), 1000);
   const state = reduceSession(started, note(2, "reasoning.delta", { text: "still thinking" }), 6000);

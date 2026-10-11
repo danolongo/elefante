@@ -20,6 +20,7 @@ export type MemoryStatus = MemorySeed & {
 };
 export type MemoryInfo = MemorySeed | MemoryStatus;
 export type MemoryNote = { id: number; kind: string; status: string; statement: string; origin: string };
+export type MemoryChange = "added" | "promoted" | "superseded" | "revived";
 export type CreateResult = { session_id: string; seq: number; memory?: MemoryInfo };
 type EventParams = {
   "turn.started": Record<string, never>;
@@ -32,7 +33,7 @@ type EventParams = {
   "turn.finished": { stop_reason: StopReason; usage: Usage };
   "session.error": { message: string };
   "memory.status": MemoryStatus;
-  "memory.learned": { note: MemoryNote; change: "added" | "promoted" | "superseded" | "revived"; replaced?: MemoryNote };
+  "memory.learned": { note: MemoryNote; change: MemoryChange; replaced?: MemoryNote };
   "memory.context": { notes: MemoryNote[] };
 };
 export type Notification = { [K in keyof EventParams]: { session_id: string; turn_id: string | null; method: K; params: EventParams[K] } & ({ seq: number; seq_from?: never; seq_to?: never } | { seq?: never; seq_from: number; seq_to: number }) }[keyof EventParams];
@@ -45,6 +46,12 @@ const strings = (v: Record<string, unknown>, ...keys: string[]) => keys.every(k 
 const usage = (v: unknown): v is Usage => object(v) && ["input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "cache_write_tokens"].every(k => integer(v[k])) && (v.cost === null || typeof v.cost === "number" && Number.isFinite(v.cost) && v.cost >= 0);
 const stopReason = (v: unknown): v is StopReason => typeof v === "string" ? ["end_turn", "tool_use", "max_tokens", "refusal", "stop_sequence", "interrupted"].includes(v) : object(v) && typeof v.other === "string";
 const consents: Consent[] = ["unset", "granted", "declined", "off"];
+export function displaySafe(text: string): string {
+  return text.replace(/[\t\n]/g, " ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "").split(/\s+/u).filter(Boolean).join(" ");
+}
+export function safeMemoryNote(note: MemoryNote): MemoryNote {
+  return { ...note, kind: displaySafe(note.kind), status: displaySafe(note.status), statement: displaySafe(note.statement), origin: displaySafe(note.origin) };
+}
 const memoryNote = (v: unknown): v is MemoryNote => object(v) && integer(v.id) && strings(v, "kind", "status", "statement", "origin");
 function parseMemory(value: unknown): MemoryInfo | undefined {
   if (value === undefined) return undefined;

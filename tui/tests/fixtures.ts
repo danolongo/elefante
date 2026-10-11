@@ -12,7 +12,7 @@ export const memoryStatus = (overrides: Partial<MemoryStatus> = {}): MemoryStatu
   problem: null,
   ...overrides,
 });
-export function note(seq: number, method: Notification["method"], params: unknown = {}, turn_id = "t"): Notification {
+export function note(seq: number, method: Notification["method"], params: unknown = {}, turn_id: string | null = "t"): Notification {
   return { session_id: "s", seq, turn_id, method, params } as Notification;
 }
 export const stream = (): Notification[] => [

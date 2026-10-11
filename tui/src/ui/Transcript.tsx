@@ -1,4 +1,4 @@
-import { flatSegments, type SessionState } from "../session";
+import { flatSegments, type MemoryLine, type SessionState } from "../session";
 import type { Tool } from "../protocol";
 import { MARKDOWN_STYLE } from "./markdown";
 import { toolView } from "./toolView";
@@ -13,6 +13,15 @@ function ToolCall({ tool }: { tool: Tool }) {
     </box>}
   </box>;
 }
+const quoted = (text: string) => `“${text}”`;
+/** One persistent, plain-words line for a change to what is remembered, ending with how to undo it. */
+export function memoryLineText({ change, note, replaced }: MemoryLine): string {
+  const forget = `/forget ${note.id}`;
+  return change === "superseded" && replaced ? `◇ updated: ${quoted(replaced.statement)} → ${quoted(note.statement)}  ${forget}` : `◇ remembered: ${note.statement}  ${forget}`;
+}
+function MemoryLines({ lines }: { lines: MemoryLine[] }) {
+  return <>{lines.map((line, index) => <text key={index} fg="#777777">{memoryLineText(line)}</text>)}</>;
+}
 /**
  * A turn's output is drawn in the order it happened, so a tool call sits between the text before
  * and after it. Separate renderables, shading and indent preserve the channel distinction at the
@@ -21,6 +30,11 @@ function ToolCall({ tool }: { tool: Tool }) {
  */
 export function Transcript({ state, showReasoning }: { state: SessionState; showReasoning: boolean }) {
   const turns = [...state.turns, ...(state.active_turn ? [state.active_turn] : [])];
+  // A line belongs under the turn that was last on screen when it arrived; one whose turn is gone
+  // (or that arrived before any turn) is drawn at the end rather than lost.
+  const known = new Set(turns.map(turn => turn.turn_id));
+  const linesAfter = (id: string) => state.memory_lines.filter(line => line.after_turn === id);
+  const loose = state.memory_lines.filter(line => line.after_turn === null || !known.has(line.after_turn));
   // flexBasis 0: the content's own height is the whole conversation, and as the flex basis it would
   // shrink the status and input rows below until the transcript painted over them.
   return <scrollbox flexGrow={1} flexBasis={0} minHeight={0} stickyScroll stickyStart="bottom" scrollX={false} contentOptions={{ flexDirection: "column", minHeight: 0 }}>
@@ -44,7 +58,9 @@ export function Transcript({ state, showReasoning }: { state: SessionState; show
           return tool && <box key={index} flexDirection="column" marginBottom={gap}><ToolCall tool={tool} /></box>;
         })}
         {(turn.memory_note_ids?.length ?? 0) > 0 && <text fg="#777777">◇ used {turn.memory_note_ids!.length} saved {turn.memory_note_ids!.length === 1 ? "note" : "notes"}</text>}
+        <MemoryLines lines={linesAfter(turn.turn_id)} />
       </box>;
     })}
+    {loose.length > 0 && <box flexDirection="column" marginBottom={1}><MemoryLines lines={loose} /></box>}
   </scrollbox>;
 }

@@ -35,6 +35,12 @@ impl StoreDir {
         Ok(Self { dir })
     }
 
+    /// Where a repository rooted at `root` keeps its store, without creating anything.
+    #[must_use]
+    pub fn path_for(root: &Path) -> PathBuf {
+        root.join(DIR_NAME)
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.dir
@@ -52,7 +58,7 @@ impl StoreDir {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> Result<(), MemError> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), MemError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     fs::DirBuilder::new()
         .recursive(true)
@@ -65,7 +71,7 @@ fn create_private_dir(dir: &Path) -> Result<(), MemError> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> Result<(), MemError> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), MemError> {
     fs::create_dir_all(dir).map_err(|e| MemError::io(dir, e))
 }
 

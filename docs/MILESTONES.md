@@ -246,4 +246,76 @@ explained in `PLAN.md` or the crate README.
 
 ---
 
-_Next: M3 — learned memory._
+## M3 — Learned memory            (implemented 2026-10-11; credentialed check passed on its second live run)
+
+**Status, stated plainly.** Every item of the gate is green. Hermetic: `cargo fmt --check`, clippy under
+`-D warnings`, 486 Rust tests across the workspace (5 credentialed ones ignored) and 67 TypeScript tests,
+`cargo +1.90.0 check`, `tsc --noEmit` and `bun test`, all run locally in the order CI runs them.
+Credentialed: `live_learned_memory_is_extracted_stored_and_used` — which proves a real provider accepts
+the extraction request, that a real model's reply passes the store's verification, and that the stored
+note reaches a later prompt through a real daemon — **failed on its first live run and passed on its
+second** (5.5 seconds, 2026-10-11), after the changes described below. It has passed once.
+
+**The first live run failed, the second passed.** `live_learned_memory_is_extracted_stored_and_used` was run against
+a real provider and stored no note (`found []` after 90 seconds). The test as written could not say why,
+so the cause is **not known**. Candidates, none confirmed: the provider refusing the strict
+`response_format` (with `require_parameters`) for the chosen model; a reply cut short by `max_tokens`
+before any JSON; the store refusing a note whose quote or backticked example the model altered. In
+response the extractor now retries once without the schema when a provider refuses it, uses a schema
+without union types, asks for 2,048 output tokens, and keeps diagnostics (`Learner::diagnostics`); the
+live test now runs the extraction in-process and prints them on failure. A local server speaking
+OpenRouter's wire format (`crates/core/tests/learn_wire.rs`) shows the transport, SSE parsing, schema
+fallback and error reporting lose nothing that arrives, and it exposed one realistic cause: a model that
+quotes the rule and restates the user's example in a code span had its note refused, because the
+payload rule compared against the quote rather than the user's turn. Three checks that real model
+output trips were loosened: a quote now matches on whole words regardless of punctuation, backticks or
+an ellipsis; a command, URL or identifier in a note may be anything the user wrote in the turn the
+quote came from (it was: only the quoted part), matched as whole words; and a label longer than 60
+characters is cut instead of refusing the note. The test passed on its next live run. **Which of these
+changes made the difference is not known**: they were made together, and the first run had no diagnostics.
+The offline reproduction found the payload-rule refusal to be a real defect either way; the schema
+fallback and the larger output budget are insurance whose effect was not isolated. Until a live run passes, the claim that a real model's reply survives verification is
+unproven.
+
+**Shipped.** `elefante-mem::learn`: learned notes with provenance by speaker, verification (quote,
+payload-shaped wording, scrubber), hybrid dedupe and supersession, reinforcement and promotion,
+read-time decay, compaction, and the controls behind `elefante memory`. `elefante-mem::trust`: a key
+at `~/.elefante/memory.key`, keyed stamps on both databases and a MAC on every learned row; a store
+without a valid stamp is discarded and rebuilt, and retrieval renders only index rows and verified
+learned rows. Retrieval gained learned seeds, `about` hops in both directions, confidence weighting,
+a scope rule and a separate `<repo-memory>` section within its own budget. `elefante-core::learn`: the
+extraction loop — gate, watermark, single-flight, caps, three-strike skip. `elefante-provider`:
+`Request::response_schema`, sent as a strict `response_format` only to models that declare structured
+output. `elefante-srv`: one learner per session, flushed on close, after quiet, and at exit;
+`ELEFANTE_LEARN`, `ELEFANTE_LEARN_IDLE_SECS`, `ELEFANTE_EXTRACT_MODEL`, `ELEFANTE_EXTRACT_EFFORT`.
+No RPC method, notification or error code was added.
+
+**A hole in M2, closed here.** A repository could ship its own `.elefante/`; `Store::open` accepted any
+database at the right schema version, retrieval rendered rows without checking `source`, and a
+hostile `index_complete` was believed. The fix was written before its test, so the test was checked by
+mutation: with the `source` filter removed, `rows_of_an_unknown_source_are_never_rendered` renders the
+planted file's "SYSTEM:" text; with it, it does not. Version-1 stores are rebuilt, not migrated: they held
+nothing irreplaceable and a migration could not tell a legitimate store from a hostile one.
+
+**Where the tests earned their keep.** Defects found by tests, not inspection: the key's temporary file
+was named by process id alone, so concurrent first use inside one process collided; the stemmer left
+`tabs` unstemmed (it only stripped plurals from words longer than four letters); and `flush` bypassed the
+per-session call cap. The verdict-handling tests also had to be rewritten once, because a test that
+reused one store across cases let the first case's paraphrase become the second case's duplicate.
+
+**Deferred.** The user-level graph; transcript compaction (the seam exists); re-linking a note across
+a rename or branch switch (a direct `about` edge goes with the file and the note stays, found by its
+words); learned memory shared across worktrees; `contradicts` edges; a TUI surface for pending notes;
+embeddings or any handling of a prompt phrased in vocabulary the code never uses. The first-run
+setup flow that will ask for an extractor model is in `PLAN.md` and unbuilt: until then it is
+environment variables.
+
+**Deviations from the design pass.** `quote_turn` was dropped from the reply schema (the quote is
+searched in every turn, preferring a user's); nearest-note lookup for the extractor is a lexical scan
+of at most a few hundred rows, not an FTS query; `*.key` was already a built-in secret path, so no new
+`PathPolicy` rule was needed; `cache.db` is stamped too; the relatedness test for a model verdict uses
+the overlap coefficient (0.4) while duplicates use Jaccard (0.9), both pinned by a labelled corpus.
+
+---
+
+_Next: M4 — critics._

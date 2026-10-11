@@ -74,6 +74,15 @@ pub enum Effort {
     Max,
 }
 
+/// A JSON Schema the reply must satisfy. Sent only to models that declare
+/// [`Capabilities::structured_output`]; for the rest the caller's prompt must ask for JSON and the
+/// reply must be validated regardless, since a schema is a request and not a guarantee.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResponseSchema {
+    pub name: String,
+    pub schema: Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub model: ModelId,
@@ -82,6 +91,8 @@ pub struct Request {
     pub tools: Vec<ToolDefinition>,
     pub messages: Vec<Message>,
     pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<ResponseSchema>,
 }
 
 impl Request {
@@ -94,6 +105,7 @@ impl Request {
             tools: Vec::new(),
             messages,
             effort: None,
+            response_schema: None,
         }
     }
 }

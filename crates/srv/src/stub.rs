@@ -55,6 +55,10 @@ pub(crate) struct StubProvider {
     /// When set, every request is appended to this file as one JSON line, so a test can see
     /// exactly what the model would have been sent.
     record: Option<PathBuf>,
+    /// Replies for extraction requests (those carrying a response schema), in order, the last one
+    /// repeating. They never consume `rounds`, so memory learning cannot disturb a scripted turn.
+    extract: Vec<String>,
+    next_extract: AtomicUsize,
 }
 
 impl StubProvider {
@@ -62,6 +66,19 @@ impl StubProvider {
         let value: Value = serde_json::from_slice(&fs::read(path)?)?;
         let delay = Duration::from_millis(value["delay_ms"].as_u64().unwrap_or(0));
         let record = value["record_requests"].as_str().map(PathBuf::from);
+        let extract = value
+            .get("extract")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map_or_else(|| item.to_string(), str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let rounds = if let Some(rounds) = value.get("rounds").and_then(Value::as_array) {
             rounds.clone()
         } else {
@@ -91,6 +108,8 @@ impl StubProvider {
             next_round: AtomicUsize::new(0),
             delay,
             record,
+            extract,
+            next_extract: AtomicUsize::new(0),
         })
     }
 }
@@ -138,6 +157,18 @@ impl Provider for StubProvider {
         {
             let _ = writeln!(file, "{line}");
         }
+        if request.response_schema.is_some() {
+            let index = self.next_extract.fetch_add(1, Ordering::Relaxed);
+            let text = self
+                .extract
+                .get(index.min(self.extract.len().saturating_sub(1)))
+                .cloned()
+                .unwrap_or_else(|| r#"{"memories":[]}"#.to_owned());
+            return Box::pin(futures_util::stream::iter(vec![
+                Ok(Event::TextDelta(text)),
+                Ok(Event::Stop(StopReason::EndTurn)),
+            ]));
+        }
         let validation = validate_pairing(&request);
         let index = self.next_round.fetch_add(1, Ordering::Relaxed);
         let steps = self.rounds[index.min(self.rounds.len() - 1)].clone();
@@ -178,6 +209,7 @@ mod tests {
                 }],
             }],
             effort: None,
+            response_schema: None,
         };
         assert!(validate_pairing(&request).is_err());
         let result = Message {

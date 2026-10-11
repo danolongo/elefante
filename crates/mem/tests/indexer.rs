@@ -410,7 +410,11 @@ fn git_status_is_clean_after_a_full_refresh() {
     git.write("src/lib.rs", "pub fn run() {}\n");
     git.write("README.md", "# Title\n");
     git.commit("c1");
-    let store = Store::open(&RepoId::resolve_with_home(git.path(), None).unwrap()).unwrap();
+    let store = Store::open_with_key(
+        &RepoId::resolve_with_home(git.path(), None).unwrap(),
+        elefante_mem::MemKey::from_bytes([7; 32]),
+    )
+    .unwrap();
     let root = RepoId::resolve_with_home(git.path(), None)
         .unwrap()
         .root()

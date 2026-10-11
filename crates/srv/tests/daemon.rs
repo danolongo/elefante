@@ -88,6 +88,9 @@ impl Daemon {
             base_url: Some("http://127.0.0.1:9".into()),
             stub_provider: stub,
             memory: true,
+            learn: false,
+            learn_idle: Duration::from_secs(300),
+            learn_timeout: Duration::from_secs(60),
             idle_timeout: idle,
         };
         let task = tokio::spawn(run(config.clone()));
@@ -364,12 +367,29 @@ async fn idle_exit_waits_for_detached_turn_and_private_socket_is_removed() {
     assert!(!daemon.config.socket.exists());
 }
 
+/// Leaves a socket file at `path` with nobody listening on it.
+///
+/// On macOS a listening socket can keep accepting connections for a moment after its descriptor is
+/// closed, so a daemon that probed immediately would find a "live" daemon that was never there and
+/// every starter would exit. Waiting until the path refuses connections makes the setup mean what
+/// the test says it means.
+fn leave_stale_socket(path: &Path) {
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    for _ in 0..400 {
+        if std::os::unix::net::UnixStream::connect(path).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("a closed listener kept accepting connections");
+}
+
 #[tokio::test]
 async fn stale_socket_recovers_and_concurrent_start_converges() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.path().join("elefante.sock");
-    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    leave_stale_socket(&path);
     let config = DaemonConfig {
         socket: path.clone(),
         credentials: dir.path().join("credentials.toml"),
@@ -377,6 +397,9 @@ async fn stale_socket_recovers_and_concurrent_start_converges() {
         base_url: None,
         stub_provider: None,
         memory: true,
+        learn: false,
+        learn_idle: Duration::from_secs(300),
+        learn_timeout: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(1),
     };
     let mut first = tokio::spawn(run(config.clone()));
@@ -405,7 +428,7 @@ async fn directory_ownership_serializes_stale_reclamation_and_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("elefante.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    leave_stale_socket(&socket);
     let ownership = fs::File::open(dir.path()).unwrap();
     ownership.lock().unwrap();
     let config = DaemonConfig {
@@ -415,6 +438,9 @@ async fn directory_ownership_serializes_stale_reclamation_and_shutdown() {
         base_url: None,
         stub_provider: None,
         memory: true,
+        learn: false,
+        learn_idle: Duration::from_secs(300),
+        learn_timeout: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(20),
     };
     let first = tokio::spawn(run(config.clone()));
@@ -468,7 +494,7 @@ async fn invalid_cold_start_finishes_validation_before_socket_publication() {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("socket");
         if stale {
-            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            leave_stale_socket(&socket);
         }
         // Holding ownership makes the ordering deterministic: validation must
         // return its named failure without reaching reclamation or bind at all.
@@ -481,6 +507,9 @@ async fn invalid_cold_start_finishes_validation_before_socket_publication() {
             base_url: Some("not-a-url".into()),
             stub_provider: None,
             memory: true,
+            learn: false,
+            learn_idle: Duration::from_secs(300),
+            learn_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(20),
         };
         let error = tokio::time::timeout(Duration::from_secs(1), run(config))
@@ -780,6 +809,9 @@ async fn key_set_rebuilds_provider_and_environment_key_wins() {
             base_url: Some(format!("http://{address}")),
             stub_provider: None,
             memory: true,
+            learn: false,
+            learn_idle: Duration::from_secs(300),
+            learn_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(20),
         };
         let task = tokio::spawn(run(config.clone()));

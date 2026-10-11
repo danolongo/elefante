@@ -64,6 +64,36 @@ A `ContextSource` supplies two things: a **block** relevant to this turn's promp
   one exists, costing one cache miss.
 - A source that returns `None` adds nothing — no empty envelope.
 
+### Learning (`learn.rs`)
+
+```rust
+let learner = Learner::new(store, provider, LearnConfig::from_env(&author_model, &|n| env::var(n).ok()));
+learner.observe(session.messages());   // after a turn; returns at once
+learner.flush().await;                 // on close, after a quiet spell, and as the daemon exits
+```
+
+A `Learner` is one session's loop for asking a model what is worth remembering and handing the
+answer to `elefante-mem`, which decides what is kept. The model's reply is a *proposal*.
+
+- **What it reads.** Only the `Text` blocks of user and assistant messages, scrubbed. A tool result
+  lives inside a `User` message but is not something the user said; tool calls and reasoning are not
+  conversation. Repository text therefore reaches the extractor only if one of them restated it.
+- **When it asks.** A *gate* decides when, never whether: an explicit cue ("remember", "from now
+  on", …) in unprocessed user text, or ~600 characters of it, or 6 user messages. Skipped turns stay
+  pending and are read by the next run, so nothing is lost by waiting. `flush` asks regardless.
+  One call at a time per session, at most 20 calls, and three consecutive failures give a batch up
+  (`skipped`), so a poisoned slice is not retried for ever.
+- **The watermark** is what is still pending: it shrinks only after a batch has been committed.
+  Anything a future compactor drops from the history has therefore already been read, provided it
+  calls `flush` first.
+- **The role.** `ELEFANTE_EXTRACT_MODEL` and `ELEFANTE_EXTRACT_EFFORT` (default low); with no model
+  set, the session's own. The request carries no tools and a response schema, which the provider
+  sends only to models that declare structured output; the reply is validated either way. If a
+  provider refuses a request *because of* the schema (HTTP 400, 404 or 422), the learner drops the
+  schema for the rest of the session and asks again without it, which is not counted as a failure.
+  `Learner::diagnostics()` says why the last call failed, what an unreadable reply began with, and what
+  the store refused.
+
 ## Invariants
 
 **Every `tool_use` must keep exactly one matching `tool_result`.** An unpaired id makes the next

@@ -90,6 +90,17 @@ fn bump_generation(tx: &Transaction<'_>, now_ns: i64) -> Result<i64, MemError> {
     generation(tx)
 }
 
+/// Advances `repo_generation` without touching the indexing timestamp. Learned writes use this: they
+/// change what retrieval returns, so cached blocks must expire, but they are not an index refresh.
+pub(crate) fn bump_generation_only(tx: &Transaction<'_>) -> Result<i64, MemError> {
+    tx.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+         WHERE key = 'repo_generation'",
+        [],
+    )?;
+    generation(tx)
+}
+
 /// The current `repo_generation`.
 ///
 /// # Errors

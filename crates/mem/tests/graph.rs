@@ -10,7 +10,11 @@ use serde_json::Value;
 fn store() -> (tempfile::TempDir, Store) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join(".git")).unwrap();
-    let store = Store::open(&RepoId::resolve_with_home(tmp.path(), None).unwrap()).unwrap();
+    let store = Store::open_with_key(
+        &RepoId::resolve_with_home(tmp.path(), None).unwrap(),
+        elefante_mem::MemKey::from_bytes([7; 32]),
+    )
+    .unwrap();
     (tmp, store)
 }
 

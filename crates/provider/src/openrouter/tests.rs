@@ -32,6 +32,7 @@ fn request_is_cached_sorted_and_carries_reasoning_effort() {
         ],
         messages: vec![Message::text(Role::User, "hello")],
         effort: Some(Effort::XHigh),
+        response_schema: None,
     };
     let body = provider.request_body(&request);
 
@@ -89,6 +90,7 @@ fn auto_router_gets_reasoning_but_not_caching_and_covers_the_beta_slug() {
         )],
         messages: vec![Message::text(Role::User, "hello")],
         effort: Some(Effort::High),
+        response_schema: None,
     };
     let body = provider.request_body(&request);
 
@@ -153,11 +155,69 @@ fn require_parameters_is_sent_only_alongside_tools() {
         tools: Vec::new(),
         messages: vec![Message::text(Role::User, "hello")],
         effort: None,
+        response_schema: None,
     };
 
     assert!(
         provider.request_body(&request).get("provider").is_none(),
         "a request with no tools has no parameter to be dropped"
+    );
+}
+
+fn schema_request(model: &str) -> Request {
+    Request {
+        model: ModelId::from(model),
+        max_tokens: 1024,
+        system: Vec::new(),
+        tools: Vec::new(),
+        messages: vec![Message::text(Role::User, "hello")],
+        effort: None,
+        response_schema: Some(crate::ResponseSchema {
+            name: "memories".to_owned(),
+            schema: json!({ "type": "object", "properties": {} }),
+        }),
+    }
+}
+
+#[test]
+fn a_response_schema_is_sent_strictly_to_a_model_that_declares_structured_output() {
+    let provider = OpenRouterProvider::new("test-key");
+    let body = provider.request_body(&schema_request("anthropic/claude-opus-5"));
+
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["name"], "memories");
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["type"],
+        "object"
+    );
+    assert_eq!(body["provider"]["require_parameters"], true);
+}
+
+#[test]
+fn a_response_schema_is_withheld_from_a_model_that_does_not_declare_support() {
+    let provider = OpenRouterProvider::new("test-key");
+    let body = provider.request_body(&schema_request("some-vendor/experimental-42b"));
+
+    assert!(body.get("response_format").is_none());
+    assert!(
+        body.get("provider").is_none(),
+        "nothing was withheld from routing, so routing is not constrained"
+    );
+}
+
+#[test]
+fn a_request_without_a_schema_serialises_exactly_as_before() {
+    let provider = OpenRouterProvider::new("test-key");
+    let mut request = schema_request("anthropic/claude-opus-5");
+    request.response_schema = None;
+    let body = provider.request_body(&request);
+    assert!(body.get("response_format").is_none());
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert!(
+        json.get("response_schema").is_none(),
+        "recorded requests and fixtures gain no field when it is unused"
     );
 }
 

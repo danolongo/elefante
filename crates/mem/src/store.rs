@@ -11,6 +11,7 @@ use crate::{
     layout::StoreDir,
     repo::RepoId,
     schema::{self, Pairing},
+    trust::MemKey,
 };
 
 /// What retrieval needs to know about the index, readable without a database round trip.
@@ -75,20 +76,36 @@ pub struct Store {
     reader: Actor<ReaderState>,
     index_state: IndexState,
     generation: AtomicI64,
+    key: MemKey,
 }
 
 impl Store {
+    /// Opens (creating if needed) the store for `repo`, authenticating it with the user's key at
+    /// `~/.elefante/memory.key` (created on first use).
+    ///
+    /// # Errors
+    /// Fails when there is no home directory to keep the key in, or for any reason
+    /// [`Store::open_with_key`] fails.
+    pub fn open(repo: &RepoId) -> Result<Self, MemError> {
+        let path = MemKey::default_path().ok_or_else(|| MemError::Refused {
+            path: repo.root().to_path_buf(),
+            reason: "HOME is not set, so there is nowhere to keep the memory key",
+        })?;
+        Self::open_with_key(repo, MemKey::load_or_create(&path)?)
+    }
+
     /// Opens (creating if needed) the store for `repo`.
     ///
     /// Order matters: the self-ignoring `.gitignore` first, then `memory.db`, then `cache.db`,
-    /// then the pairing check, and only then the read connection and the threads.
+    /// then the pairing check, and only then the read connection and the threads. A database that
+    /// does not carry a stamp made with `key` is discarded and rebuilt (see [`crate::trust`]).
     ///
     /// # Errors
     /// Fails on any I/O or SQLite error, or an unsupported or corrupt `memory.db`.
-    pub fn open(repo: &RepoId) -> Result<Self, MemError> {
+    pub fn open_with_key(repo: &RepoId, key: MemKey) -> Result<Self, MemError> {
         let dir = StoreDir::create(repo)?;
-        let memory = schema::open_memory(&dir.memory_db())?;
-        let mut cache = schema::open_cache(&dir.cache_db())?;
+        let memory = schema::open_memory(&dir.memory_db(), &key)?;
+        let mut cache = schema::open_cache(&dir.cache_db(), &key)?;
         let pairing = schema::pair(&memory, &mut cache)?;
         let reader = schema::open_memory_reader(&dir.memory_db())?;
         let generation = graph::generation(&memory)?;
@@ -101,9 +118,16 @@ impl Store {
             pairing,
             index_state,
             generation: AtomicI64::new(generation),
+            key,
             writer: Actor::spawn("elefante-mem-writer", WriterState { memory, cache }),
             reader: Actor::spawn("elefante-mem-reader", ReaderState { memory: reader }),
         })
+    }
+
+    /// The key this store's rows are authenticated with.
+    #[must_use]
+    pub fn key(&self) -> &MemKey {
+        &self.key
     }
 
     #[must_use]

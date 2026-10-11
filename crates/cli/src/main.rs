@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
 
 struct Options {
     prompt: Option<String>,
@@ -412,6 +412,13 @@ fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Resul
     result
 }
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("memory") {
+        let cwd = env::current_dir().context("failed to determine current directory")?;
+        let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
+        let code = elefante_cli::memory::run(&args[1..], &cwd, &key_path, &mut io::stdout())?;
+        std::process::exit(code);
+    }
     let options = Options::parse()?;
     let path = socket_path()?;
     let mut client = Client::new(connect(&path)?);

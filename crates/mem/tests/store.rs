@@ -54,7 +54,7 @@ fn meta(store: &Store, key: &'static str) -> String {
 #[test]
 fn open_creates_both_databases_with_the_documented_schema() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
 
     for table in ["meta", "node", "edge", "import_ref", "node_fts"] {
         assert_eq!(
@@ -105,7 +105,7 @@ fn open_creates_both_databases_with_the_documented_schema() {
 #[test]
 fn both_databases_run_in_wal_mode() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     for path in [store.dir().memory_db(), store.dir().cache_db()] {
         let conn = Connection::open(&path).unwrap();
         let mode: String = conn
@@ -136,7 +136,7 @@ fn git_status_stays_clean_with_the_store_open_and_written() {
     git.write("src/a.rs", "fn a() {}\n");
     git.commit("c1");
     let repo = repo_for(git.path());
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -161,7 +161,7 @@ fn git_status_stays_clean_with_the_store_open_and_written() {
 #[test]
 fn directory_is_private_and_every_database_file_is_owner_only() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     // Force WAL traffic so the sidecar files exist, then check each by name.
     store
         .writer()
@@ -210,10 +210,10 @@ fn a_looser_preexisting_directory_is_tightened() {
 fn reopening_preserves_the_epoch_and_the_pairing() {
     let (_tmp, repo) = fresh();
     let epoch = {
-        let store = Store::open(&repo).unwrap();
+        let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
         meta(&store, "graph_epoch")
     };
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     assert_eq!(meta(&store, "graph_epoch"), epoch);
     assert_eq!(store.pairing(), Pairing::Matched);
 }
@@ -222,7 +222,7 @@ fn reopening_preserves_the_epoch_and_the_pairing() {
 fn a_deleted_graph_clears_file_state_but_keeps_extractions() {
     let (_tmp, repo) = fresh();
     let (dir, old_epoch) = {
-        let store = Store::open(&repo).unwrap();
+        let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
         store
             .writer()
             .call_blocking(|s| {
@@ -239,7 +239,7 @@ fn a_deleted_graph_clears_file_state_but_keeps_extractions() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(dir.path().join(format!("memory.db{suffix}")));
     }
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     assert_eq!(store.pairing(), Pairing::Reset);
     assert_ne!(meta(&store, "graph_epoch"), old_epoch);
     assert_eq!(cache_scalar(&store, "SELECT count(*) FROM file_state"), 0);
@@ -254,7 +254,7 @@ fn a_deleted_graph_clears_file_state_but_keeps_extractions() {
 fn a_matched_reopen_keeps_file_state() {
     let (_tmp, repo) = fresh();
     {
-        let store = Store::open(&repo).unwrap();
+        let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
         store
             .writer()
             .call_blocking(|s| {
@@ -264,7 +264,7 @@ fn a_matched_reopen_keeps_file_state() {
             })
             .unwrap();
     }
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     assert_eq!(cache_scalar(&store, "SELECT count(*) FROM file_state"), 1);
 }
 
@@ -272,7 +272,7 @@ fn a_matched_reopen_keeps_file_state() {
 fn a_cache_at_another_schema_version_is_recreated_not_migrated() {
     let (_tmp, repo) = fresh();
     let dir = {
-        let store = Store::open(&repo).unwrap();
+        let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
         store
             .writer()
             .call_blocking(|s| {
@@ -290,7 +290,7 @@ fn a_cache_at_another_schema_version_is_recreated_not_migrated() {
         .unwrap()
         .pragma_update(None, "user_version", 99)
         .unwrap();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     assert_eq!(cache_scalar(&store, "SELECT count(*) FROM extraction"), 0);
     assert_eq!(
         cache_scalar(&store, "PRAGMA user_version"),
@@ -302,7 +302,7 @@ fn a_cache_at_another_schema_version_is_recreated_not_migrated() {
 fn a_graph_from_a_newer_build_is_refused_and_left_untouched() {
     let (_tmp, repo) = fresh();
     let dir = {
-        let store = Store::open(&repo).unwrap();
+        let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
         store.dir().clone()
     };
     Connection::open(dir.memory_db())
@@ -311,7 +311,7 @@ fn a_graph_from_a_newer_build_is_refused_and_left_untouched() {
         .unwrap();
     let before = fs::read(dir.memory_db()).unwrap();
     assert!(matches!(
-        Store::open(&repo),
+        Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])),
         Err(MemError::UnsupportedSchema { found: 99, .. })
     ));
     assert_eq!(fs::read(dir.memory_db()).unwrap(), before);
@@ -325,13 +325,16 @@ fn a_graph_with_tables_but_no_version_is_corrupt_not_recreated() {
         .unwrap()
         .execute_batch("CREATE TABLE meta(key TEXT, value TEXT);")
         .unwrap();
-    assert!(matches!(Store::open(&repo), Err(MemError::Corrupt { .. })));
+    assert!(matches!(
+        Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])),
+        Err(MemError::Corrupt { .. })
+    ));
 }
 
 #[test]
 fn co_change_edges_must_be_stored_in_canonical_order() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -363,7 +366,7 @@ fn co_change_edges_must_be_stored_in_canonical_order() {
 #[test]
 fn deleting_a_file_cascades_to_its_symbols_imports_and_edges() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -390,7 +393,7 @@ fn deleting_a_file_cascades_to_its_symbols_imports_and_edges() {
 #[test]
 fn a_node_key_is_unique_per_kind() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -411,7 +414,7 @@ fn a_node_key_is_unique_per_kind() {
 #[test]
 fn split_terms_make_camel_and_snake_identifiers_searchable_by_their_words() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -443,7 +446,7 @@ fn split_terms_make_camel_and_snake_identifiers_searchable_by_their_words() {
 #[test]
 fn the_reader_sees_committed_writes_and_cannot_write() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     store
         .writer()
         .call_blocking(|s| {
@@ -478,7 +481,7 @@ fn the_reader_sees_committed_writes_and_cannot_write() {
 #[test]
 fn a_reader_is_not_blocked_by_an_open_write_transaction() {
     let (_tmp, repo) = fresh();
-    let store = Store::open(&repo).unwrap();
+    let store = Store::open_with_key(&repo, elefante_mem::MemKey::from_bytes([7; 32])).unwrap();
     let path = store.dir().memory_db();
     let (before, after) = store
         .writer()

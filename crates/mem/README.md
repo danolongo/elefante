@@ -31,6 +31,8 @@ the graph.
 | `src/retrieve.rs` | 897 | Query processing, seeds, expansion, packing, rendering, `Retriever`. |
 | `src/brief.rs` | 259 | The repository brief and its Merkle-root cache. |
 | `src/terms.rs` | 109 | Identifier and path splitting for the search index. |
+| `src/trust.rs` | 190 | `MemKey` — the keyed `blake3` stamps and row MACs that say which rows this harness wrote. |
+| `src/learn/` | 1,900 | Learned memory: verify, dedupe, supersede, decay, compact, and the person's controls. |
 | `src/stats.rs` | 64 | `Counters` and `IndexStats` — what the gates assert on. |
 | `src/error.rs`, `src/util.rs` | 85 | `MemError`; `now_ns` and `par_map`. |
 
@@ -116,6 +118,57 @@ The result is *data*: escaped, framed as reference material, never instructions,
 an empty envelope — when nothing matches. `partial` means the first full index has not finished; an
 incremental refresh on a complete index is not partial.
 
+## Learned memory
+
+`learn/` holds durable notes distilled from conversations: `preference`, `convention`, `decision`
+and `fact` nodes in `memory.db`, `source = 'learned:*'`, which the indexer never touches. **This
+crate still never runs a model.** A caller (`elefante-core`) hands it *candidates* — what a model
+proposed — and the excerpt they were drawn from; every decision is made here, by code with tests.
+
+```
+verify (per candidate)       quote is in the excerpt (whole words, punctuation ignored) · wording carries no
+                             command/URL/path/identifier the speaker did not write in that turn ·
+                             survives the Scrubber unchanged · evidence's speaker sets origin
+dedupe (against live notes)  Jaccard over stemmed content words, negations kept as tokens:
+                             ≥ 0.9 and the same negations → duplicate, whatever the model said
+                             otherwise a model verdict (same_as / replaces) is honoured only if it names
+                             a note it was shown, of the same kind, lexically related or sharing an anchor
+commit (one transaction)     add · reinforce · promote · supersede · revive, then one generation bump
+```
+
+| Origin | Evidence | Status | Starts at |
+|---|---|---|---|
+| `learned:explicit` | a user message with a cue ("remember", "from now on"…) | `active` | 0.9 |
+| `learned:stated` | a user message | `active` | 0.6 |
+| `learned:assistant` | assistant text only | `pending` — never searched, never shown | 0.4 |
+
+Only the user's own words can reinforce, promote or replace a note, so the assistant restating a
+note it was shown cannot raise it. A `replaces` verdict retires the old note (`status =
+'superseded'`, a `supersedes` edge, its FTS row deleted); history stays inspectable until the
+retention window ends.
+
+**Integrity.** `memory.db` and `cache.db` each carry a keyed stamp, and every learned row a keyed
+MAC over the fields that decide what the model reads (`trust.rs`). The key lives in
+`~/.elefante/memory.key` (`0600`, created on first use), never in a working tree. A database that
+is not at the current schema or lacks a valid stamp — a version-1 store, a `.elefante/` a repository
+shipped, one made under another key — is **discarded and rebuilt**; a row that fails its MAC is
+treated as absent; retrieval renders only `source = 'index'` rows and verified learned rows. This is
+integrity and origin, not truth, and it does not stop a process that can read the key.
+
+**Decay.** `effective = confidence × 0.5^(age ÷ half-life)` since the note was last reinforced
+(preference and convention 180 days, decision 90, fact 30), computed on read so nothing is written as
+time passes. Below 0.1 a note is no longer retrieved; `compact` deletes it, expired superseded
+notes (90 days), rows that fail their MAC, and the weakest beyond 300.
+
+**Retrieval.** Learned notes are seeded by their own full-text query (6), joined by notes anchored
+at the best code hits, weighted by effective confidence, and in turn lift the code they are about
+(`about` edges, written when the note is). They render in a separate `<repo-memory>` section of at
+most 400 estimated tokens after the `<repo-index>`; the index gets the rest, so a query with no
+notes renders exactly what it did before notes existed. A note with no anchors belongs to the whole
+repository; an anchored one is shown only when something it is about is within the session's scope.
+
+**Controls.** `learn::list`, `forget`, `approve` and `clear` back `elefante memory …`.
+
 ## Invariants
 
 **Stable ids across edits.** The indexer upserts. A file node is updated in place and a symbol
@@ -148,12 +201,15 @@ reader-actor call counts. Timing is reported once, not asserted anywhere.
 
 No call graph or identifier references, no languages beyond Rust, TypeScript/TSX and Markdown
 headings, no cross-crate or `tsconfig` import resolution, no embeddings, no file watcher, no
-model-written summary. `.js`/`.jsx` get file nodes only. Learned memory is M3.
+model-written summary. `.js`/`.jsx` get file nodes only. Learned notes are not shared across
+worktrees (each working tree keeps its own store), have no user-level graph, and are not re-linked
+when an anchored file is renamed or deleted: the link goes with the file and the note stays,
+searchable by its words.
 
 ## Testing
 
 ```sh
-cargo test -p elefante-mem                                  # 210 hermetic tests, no network
+cargo test -p elefante-mem                                  # hermetic tests, no network
 ELEFANTE_DOGFOOD=/path/to/a/copy cargo test -p elefante-mem --test dogfood -- --ignored --nocapture
 ```
 

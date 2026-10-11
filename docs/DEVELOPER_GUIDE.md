@@ -6,9 +6,10 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M2: a provider-backed coding loop behind a daemon, driven by either a
+The repository is at M3: a provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
-relevant context and gives the model a search tool. The implemented vertical slice can:
+relevant context and gives the model a search tool, and durable notes learned from conversations.
+The implemented vertical slice can:
 
 - send a prompt and stable tool catalog to OpenRouter;
 - stream reasoning and text, separated end to end;
@@ -19,15 +20,21 @@ relevant context and gives the model a search tool. The implemented vertical sli
 - serve many clients per session and many sessions per client, with resume after disconnect;
 - index the repository in the background — files, symbols, imports, and files that change
   together — and keep that index current as turns edit it;
-- add an ephemeral block of relevant files to each turn, and a short repository brief to each
-  session, neither of which enters history; and
+- add an ephemeral block of relevant files, and of notes learned in earlier sessions, to each turn,
+  and a short repository brief to each session, none of which enters history;
+- ask a model, in the background, what is worth remembering from a conversation, and keep only what
+  survives verification (quote present, wording safe, evidence from the right speaker); and
 - continue the conversation until the provider ends the turn, refuses, is interrupted, or
   reaches a configured round limit.
 
-All three milestone gates are green, including the credentialed tests: the OpenRouter cache hit, the
-live repository edit, and `live_memory_context_reaches_the_model`, which proves a real provider accepts
-the injected message shape and that a real model uses the index it is sent. CI runs the hermetic gates
-on every push and the credentialed tests behind `workflow_dispatch`; see `.github/workflows/`.
+Every gate through M3 is green, hermetic and credentialed. The credentialed tests for M0–M2 have been run: the
+OpenRouter cache hit, the live repository edit, and `live_memory_context_reaches_the_model`, which
+proves a real provider accepts the injected message shape and that a real model uses the index it is
+sent. M3's, `live_learned_memory_is_extracted_stored_and_used`, which proves a real provider accepts
+the extraction request, that a real model's reply passes the store's verification, and that the note
+reaches a later prompt, passes against a live provider (it failed once first; see `MILESTONES.md`). CI runs
+the hermetic gates on every push and the credentialed tests behind `workflow_dispatch`; see
+`.github/workflows/`.
 
 ## 2. Design principles
 
@@ -255,8 +262,8 @@ itself; `/` and `$HOME` are refused.
 
 **Identity.** `node` is keyed by `(kind, key)`: a file by its repository-relative path, a symbol
 by `path::qualified_name` (`#2`, `#3` for duplicates). The indexer upserts, so ids are stable
-across edits, and it touches only rows whose `source = 'index'` — learned rows arriving in M3 are
-never read, changed, or swept by it.
+across edits, and it touches only rows whose `source = 'index'` — learned rows (`source =
+'learned:*'`) are never read, changed, or swept by it.
 
 **Consistency between the two files.** They cannot share a commit. A random *pairing epoch* ties
 `cache.db` to the `memory.db` it was written against (a mismatch clears `file_state` but keeps the
@@ -293,6 +300,33 @@ the reader thread.
   `refresh()` returns immediately and coalesces; N triggers become at most two runs.
 - *Switch:* `ELEFANTE_MEMORY=0` (`DaemonConfig::memory`) — nothing opened, nothing written, no
   context added, `memory_search` refuses.
+
+**Learned memory.** `preference`, `convention`, `decision` and `fact` nodes in `memory.db`
+(`source = 'learned:explicit' | 'learned:stated' | 'learned:assistant'`, plus `status`,
+`last_reinforced_ns` and a `mac`). A model proposes; `mem::learn` disposes. The crate README has the
+detail; the contract is:
+
+- *Input.* `core::learn::Learner` reads only the text of what the user and the assistant said —
+  never tool results, tool calls or reasoning — scrubbed, behind a gate (a cue, enough text, or
+  enough turns) with a watermark that advances only after a commit. It runs at turn end, on session
+  close, after `ELEFANTE_LEARN_IDLE_SECS` of quiet, and as the daemon exits.
+- *Verification.* Each candidate's quote must be in the excerpt; its wording may contain no command,
+  URL, path or identifier the user did not write; it must survive the `Scrubber` unchanged; and the
+  speaker of the evidence assigns its origin. Assistant-only claims are stored `pending` and never
+  shown until the user confirms them. Only the user's words reinforce, promote or replace a note.
+- *Dedupe.* Near-identical wording (Jaccard ≥ 0.9, same negations) is a duplicate whatever the model
+  said; a model verdict is honoured only if verified; a contradiction supersedes, it does not merge.
+- *Integrity.* Both databases are stamped and every learned row carries a MAC, keyed by
+  `~/.elefante/memory.key`. An unstamped or foreign store is discarded and rebuilt; a failing row
+  is treated as absent; retrieval renders only `source = 'index'` rows and verified learned rows.
+- *Decay.* Confidence halves every half-life since last reinforcement, computed on read; below 0.1 a
+  note is no longer retrieved and compaction removes it.
+- *Presentation.* A separate `<repo-memory>` section, at most 400 estimated tokens, framed as
+  unverified notes. A query with no notes renders exactly what it did before they existed.
+- *Controls.* `elefante memory list | forget | approve | clear`.
+- *Switches.* `ELEFANTE_LEARN=0` stops extraction alone; `ELEFANTE_MEMORY=0` stops everything.
+  `ELEFANTE_EXTRACT_MODEL` and `ELEFANTE_EXTRACT_EFFORT` choose the extractor, defaulting to the
+  session's model at low effort.
 
 ## 5. Runtime interaction
 
@@ -858,6 +892,10 @@ Configuration precedence and defaults:
 | Max tokens | `--max-tokens` | — | `16,384` |
 | API origin | — | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
 | API key | — | `OPENROUTER_API_KEY` | required |
+| Extractor model | — | `ELEFANTE_EXTRACT_MODEL` | the session's model |
+| Extractor effort | — | `ELEFANTE_EXTRACT_EFFORT` | `low` |
+| Learning | — | `ELEFANTE_LEARN=0` turns it off | on (with memory) |
+| Idle flush | — | `ELEFANTE_LEARN_IDLE_SECS` | `300` |
 
 Models are named by OpenRouter slug, not by vendor model name. The default routes to Claude
 through OpenRouter; a different vendor's model is a different slug, not a different transport.
@@ -1001,7 +1039,12 @@ When behavior changes, update:
 - The index understands Rust, TypeScript/TSX and Markdown headings. Import edges resolve Rust
   `mod`/`crate::`/`self::`/`super::` and TypeScript relative specifiers; cross-crate paths, `tsconfig`
   aliases and bare packages are not resolved. There is no call graph, and `.js`/`.jsx` files are
-  indexed by path only. Learned memory is M3.
+  indexed by path only.
+- Learned memory is per working tree (a worktree keeps its own store and its own notes), has no
+  user-level graph, and does not follow a file across a rename or a branch switch: the note's link
+  to the file goes with it and the note stays, found by its words. Retrieval is lexical, so a note
+  phrased in vocabulary the prompt never uses is not found. There is no transcript compaction;
+  one added later must call `Learner::flush` before dropping history.
 - Usage is parsed but not accumulated into cost/staleness reporting until M5.
 - There is no model-backed critic.
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and

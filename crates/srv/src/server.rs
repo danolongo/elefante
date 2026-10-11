@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -13,10 +13,13 @@ use std::{
 use anyhow::Context as _;
 use elefante_core::{
     ApprovalOutcome, ApprovalSink, OutputEvent, RunConfig, Session, ToolGate,
+    learn::{LearnConfig, Learner},
     memory::{MemContext, MemSearchTool},
 };
-use elefante_mem::{Indexer, RepoId, Store, indexer::IndexOptions, retrieve::Retriever};
-use elefante_provider::{OpenRouterProvider, Provider};
+use elefante_mem::{
+    Indexer, MemKey, RepoId, Store, indexer::IndexOptions, retrieve::Retriever, trust::KEY_FILE,
+};
+use elefante_provider::{ModelId, OpenRouterProvider, Provider};
 use elefante_rpc::{Notification, NotificationEvent, truncate_preview};
 use elefante_tools::ToolExecutor;
 use futures_util::future::BoxFuture;
@@ -43,6 +46,13 @@ pub struct DaemonConfig {
     /// Index repositories and give sessions context from them. `ELEFANTE_MEMORY=0` turns it all
     /// off: no store is opened, nothing is written under `.elefante/`, no context is added.
     pub memory: bool,
+    /// Learn from conversations: ask a model, after turns, what is worth remembering.
+    /// `ELEFANTE_LEARN=0` turns this off alone; `ELEFANTE_MEMORY=0` turns it off with the rest.
+    pub learn: bool,
+    /// How long after a session's last turn anything the learner is still holding is extracted.
+    pub learn_idle: Duration,
+    /// How long one extraction call may take before it counts as a failure.
+    pub learn_timeout: Duration,
 }
 
 /// Resolve the test override, runtime directory, then the home-directory fallback.
@@ -65,6 +75,11 @@ fn home() -> anyhow::Result<PathBuf> {
         .context("HOME is not set")
 }
 
+/// An on/off environment switch: on unless explicitly `0`.
+fn switch(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
+}
+
 impl DaemonConfig {
     /// Capture and validate daemon environment settings.
     ///
@@ -76,6 +91,7 @@ impl DaemonConfig {
             stub_provider.is_none() || env::var_os("ELEFANTE_SOCKET").is_some(),
             "ELEFANTE_STUB_PROVIDER requires ELEFANTE_SOCKET"
         );
+        let memory = switch(env::var("ELEFANTE_MEMORY").ok().as_deref());
         Ok(Self {
             socket: socket_path()?,
             credentials: home()?.join(".elefante/credentials.toml"),
@@ -89,7 +105,14 @@ impl DaemonConfig {
                     .map_or(Ok(900), |value| value.parse())
                     .context("invalid ELEFANTE_IDLE_SECS")?,
             ),
-            memory: env::var("ELEFANTE_MEMORY").map_or(true, |value| value.trim() != "0"),
+            memory,
+            learn: memory && switch(env::var("ELEFANTE_LEARN").ok().as_deref()),
+            learn_idle: Duration::from_secs(
+                env::var("ELEFANTE_LEARN_IDLE_SECS")
+                    .map_or(Ok(300), |value| value.parse())
+                    .context("invalid ELEFANTE_LEARN_IDLE_SECS")?,
+            ),
+            learn_timeout: Duration::from_secs(60),
         })
     }
 }
@@ -191,8 +214,8 @@ struct RepoMemory {
 }
 
 impl RepoMemory {
-    fn open(repo: &RepoId) -> Result<Self, elefante_mem::MemError> {
-        let store = Arc::new(Store::open(repo)?);
+    fn open(repo: &RepoId, key: MemKey) -> Result<Self, elefante_mem::MemError> {
+        let store = Arc::new(Store::open_with_key(repo, key)?);
         Ok(Self {
             indexer: Indexer::new(
                 Arc::clone(&store),
@@ -295,12 +318,19 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             }
         }
     }
+    flush_all(&state).await;
     Ok(())
 }
 
 struct SessionEntry {
     session: tokio::sync::Mutex<Session>,
     memory: Option<Arc<RepoMemory>>,
+    /// The session's own model: the extractor falls back to it when none is configured.
+    author: ModelId,
+    /// Created at the first finished turn, once there is a provider to ask.
+    learner: OnceLock<Arc<Learner>>,
+    /// Counts finished turns, so an idle flush can tell whether anything happened since.
+    turns_done: AtomicU64,
     tools: ToolExecutor,
     view: Mutex<View>,
     approvals: Arc<Approvals>,
@@ -631,6 +661,7 @@ fn create_session(
             .ok_or_else(|| invalid("max_rounds must be positive"))?;
     }
     let tools = ToolExecutor::new(&cwd).map_err(invalid)?;
+    let author = config.model.clone();
     let (session, tools, memory) = attach_memory(state, &cwd, Session::new(config), tools);
     let session_id = format!(
         "s{}-{}",
@@ -640,6 +671,9 @@ fn create_session(
     let entry = Arc::new(SessionEntry {
         session: tokio::sync::Mutex::new(session),
         memory,
+        author,
+        learner: OnceLock::new(),
+        turns_done: AtomicU64::new(0),
         tools,
         approvals: Arc::new(Approvals::default()),
         view: Mutex::new(View {
@@ -664,6 +698,19 @@ fn create_session(
         json!({"session_id":session_id,"seq":0}),
     ));
     Ok(())
+}
+
+/// The key that authenticates this user's memory stores: beside the credentials, outside any
+/// working tree. Created on first use.
+fn memory_key(config: &DaemonConfig) -> Result<MemKey, elefante_mem::MemError> {
+    let directory = config
+        .credentials
+        .parent()
+        .ok_or_else(|| elefante_mem::MemError::Refused {
+            path: config.credentials.clone(),
+            reason: "there is no directory to keep the memory key in",
+        })?;
+    MemKey::load_or_create(&directory.join(KEY_FILE))
 }
 
 /// Gives a new session the repository index beneath its working directory, if there is one.
@@ -691,7 +738,7 @@ fn attach_memory(
         if let Some(existing) = memories.get(repo.root()) {
             Arc::clone(existing)
         } else {
-            match RepoMemory::open(&repo) {
+            match memory_key(&state.config).and_then(|key| RepoMemory::open(&repo, key)) {
                 Ok(opened) => {
                     let opened = Arc::new(opened);
                     memories.insert(repo.root().to_path_buf(), Arc::clone(&opened));
@@ -755,14 +802,19 @@ fn handle_method(
     }
     let session_id = string(params, "session_id")?;
     if method == "session.close" {
-        if let Some(entry) = state
+        let removed = state
             .sessions
             .lock()
             .expect("registry poisoned")
-            .remove(session_id)
-            && let Some(cancel) = &entry.view.lock().expect("view poisoned").cancel
-        {
-            cancel.cancel();
+            .remove(session_id);
+        if let Some(entry) = removed {
+            if let Some(cancel) = &entry.view.lock().expect("view poisoned").cancel {
+                cancel.cancel();
+            }
+            // Extract what the gate was holding; the response does not wait for it.
+            if let Some(learner) = entry.learner.get().cloned() {
+                tokio::spawn(async move { learner.flush().await });
+            }
         }
         queue.push(response(id.clone(), json!({})));
         return Ok(());
@@ -923,13 +975,74 @@ fn prompt_session(
         if let Some(memory) = &entry.memory {
             memory.indexer.refresh();
         }
+        if state.config.learn
+            && let Some(learner) = entry_learner(&state, &entry, &provider)
+        {
+            learner.observe(session.messages());
+            schedule_idle_flush(&state, &entry, learner);
+        }
         state.turns.fetch_sub(1, Ordering::SeqCst);
     });
     Ok(())
 }
 
+/// The session's learner, created on first use. `None` when the session has no index to learn into.
+fn entry_learner(
+    state: &Arc<Shared>,
+    entry: &Arc<SessionEntry>,
+    provider: &Arc<dyn Provider>,
+) -> Option<Arc<Learner>> {
+    let memory = entry.memory.as_ref()?;
+    let learner = entry.learner.get_or_init(|| {
+        let config = LearnConfig::from_env(&entry.author, &|name| env::var(name).ok());
+        let mut config = config;
+        config.call_timeout = state.config.learn_timeout;
+        Learner::new(Arc::clone(&memory.store), Arc::clone(provider), config)
+    });
+    Some(Arc::clone(learner))
+}
+
+/// After a quiet spell, extract whatever the gate was holding. A turn in between restarts the wait.
+fn schedule_idle_flush(state: &Arc<Shared>, entry: &Arc<SessionEntry>, learner: Arc<Learner>) {
+    let seen = entry.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
+    let wait = state.config.learn_idle;
+    let entry = Arc::clone(entry);
+    tokio::spawn(async move {
+        tokio::time::sleep(wait).await;
+        if entry.turns_done.load(Ordering::SeqCst) == seen {
+            learner.flush().await;
+        }
+    });
+}
+
+/// Extracts what every session is still holding, waiting a bounded time for each. Called as the
+/// daemon exits, because a session that never closed cleanly would otherwise lose its last turns.
+async fn flush_all(state: &Arc<Shared>) {
+    let learners: Vec<Arc<Learner>> = state
+        .sessions
+        .lock()
+        .expect("registry poisoned")
+        .values()
+        .filter_map(|entry| entry.learner.get().cloned())
+        .collect();
+    for learner in learners {
+        let _ = tokio::time::timeout(Duration::from_secs(10), learner.flush()).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn switches_are_on_unless_exactly_zero() {
+        use super::switch;
+        assert!(switch(None));
+        assert!(switch(Some("1")));
+        assert!(switch(Some("yes")));
+        assert!(switch(Some("")));
+        assert!(!switch(Some("0")));
+        assert!(!switch(Some(" 0 ")));
+    }
+
     use super::*;
     use std::{
         pin::Pin,
@@ -982,6 +1095,9 @@ mod tests {
                 stub_provider: None,
                 idle_timeout: Duration::from_secs(20),
                 memory: false,
+                learn: false,
+                learn_idle: Duration::from_secs(300),
+                learn_timeout: Duration::from_secs(60),
             },
             provider: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),

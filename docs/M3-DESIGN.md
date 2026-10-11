@@ -1,6 +1,11 @@
 # M3 design — learned memory
 
-> **Status: draft for review. Nothing here is implemented.** This is the design pass `PLAN.md`
+> **Status: implemented; the credentialed check has passed.** What shipped, and where it differs from
+> this draft, is recorded in `MILESTONES.md` (§ M3) and in the crate READMEs; this file can now be retired into
+> them as `M2-DESIGN.md` was. The rest of this
+> paragraph is the original text.
+>
+> ~~**Status: draft for review. Nothing here is implemented.**~~ This is the design pass `PLAN.md`
 > requires before M3 ships. Like `M2-DESIGN.md` it is a working contract: it is retired into
 > `DEVELOPER_GUIDE.md`, `PLAN.md` and the crate READMEs when M3's gate is green, and `PLAN.md` is
 > amended in the same change that implements each decision (§ 13 lists the amendments).

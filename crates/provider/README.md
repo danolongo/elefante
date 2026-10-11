@@ -32,6 +32,12 @@ request.effort = Some(Effort::Low);
 let mut events = provider.stream(request);                // BoxStream<Result<Event, _>>
 ```
 
+`Request::response_schema` asks for a JSON reply matching a schema. The OpenRouter transport sends it
+as a strict `response_format` — with `provider.require_parameters`, so an endpoint that cannot honour
+it is not used — only to a model that declares `structured_output`; for any other it is omitted and
+the caller's prompt must ask for JSON. A schema is a request, not a guarantee: callers validate the
+reply either way. A request without one serialises exactly as it did before the field existed.
+
 `Provider` is deliberately two methods — `capabilities` and `stream`. It is object-safe and
 `Send + Sync`, so `core` holds it behind a trait object and the daemon can swap in a stub.
 

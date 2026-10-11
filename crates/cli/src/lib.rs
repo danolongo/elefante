@@ -1,4 +1,6 @@
 //! Rendering for the daemon client. Each output stream owns its renderer.
+pub mod memory;
+
 use elefante_rpc::{Notification, NotificationEvent};
 use std::io::{self, Write};
 

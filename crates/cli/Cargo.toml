@@ -11,15 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+elefante-mem = { path = "../mem" }
 elefante-rpc = { path = "../rpc" }
 serde_json.workspace = true
 
 [dev-dependencies]
 elefante-core = { path = "../core" }
-elefante-mem = { path = "../mem" }
 elefante-provider = { path = "../provider" }
-tempfile.workspace = true
+rusqlite.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

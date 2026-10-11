@@ -982,6 +982,8 @@ pub fn run_ctx(
 pub enum SearchKind {
     File,
     Symbol,
+    /// Saved notes only.
+    Note,
 }
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 8;
@@ -1024,9 +1026,11 @@ fn search_line(hit: &Hit) -> String {
 }
 
 fn learned_search_line(hit: &LearnedHit) -> String {
+    // A note may be as long as the injected block allows, so the cut is the block's, not a code
+    // line's.
     flatten_capped(
         &format!("memory {} — {}", hit.kind, hit.statement),
-        MAX_LINE_CHARS,
+        MEMORY_LINE_CHARS,
     )
 }
 
@@ -1045,7 +1049,8 @@ pub fn search(
 }
 
 /// As [`search`], also returning learned notes (as `memory kind — statement`) when no kind
-/// filter is given, interleaved with code by score.
+/// filter is given, interleaved with code by score, or alone for [`SearchKind::Note`]. Output that
+/// includes a note starts with the same notice the injected block carries.
 ///
 /// # Errors
 /// SQLite errors.
@@ -1068,36 +1073,48 @@ pub fn search_ctx(
                 | (Some(SearchKind::Symbol), HitKind::Symbol)
         )
     };
-    let mut scored: Vec<(f64, String)> = ranked
+    let mut scored: Vec<(f64, bool, String)> = ranked
         .code
         .iter()
         .filter(|hit| wanted(hit))
-        .map(|hit| (hit.score, search_line(hit)))
+        .map(|hit| (hit.score, false, search_line(hit)))
         .collect();
-    if kind.is_none() {
+    if matches!(kind, None | Some(SearchKind::Note)) {
         scored.extend(
             ranked
                 .learned
                 .iter()
-                .map(|hit| (hit.score, learned_search_line(hit))),
+                .map(|hit| (hit.score, true, learned_search_line(hit))),
         );
         // Stable: equal scores keep code before notes, then input order.
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     }
-    let lines: Vec<String> = scored
+    let taken: Vec<(f64, bool, String)> = scored
         .into_iter()
         .take(limit.clamp(1, MAX_SEARCH_LIMIT))
-        .map(|(_, line)| line)
         .collect();
-    let note = if partial {
+    let has_note = taken.iter().any(|(_, is_note, _)| *is_note);
+    let lines: Vec<String> = taken.into_iter().map(|(_, _, line)| line).collect();
+    // Notes are not built by the indexer, so its progress says nothing about them.
+    let note = if partial && kind != Some(SearchKind::Note) {
         "\n(the index is still being built; results may be incomplete)"
     } else {
         ""
     };
     if lines.is_empty() {
-        return Ok(format!("no matches{note}"));
+        let empty = if kind == Some(SearchKind::Note) {
+            "no saved notes match"
+        } else {
+            "no matches"
+        };
+        return Ok(format!("{empty}{note}"));
     }
-    Ok(format!("{}{note}", lines.join("\n")))
+    let notice = if has_note {
+        format!("{MEMORY_NOTICE}\n")
+    } else {
+        String::new()
+    };
+    Ok(format!("{notice}{}{note}", lines.join("\n")))
 }
 
 // ----- the cached entry point -----

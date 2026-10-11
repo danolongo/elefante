@@ -449,7 +449,15 @@ fn the_memory_search_definition_describes_the_real_tool() {
     let props = &definition.input_schema["properties"];
     assert_eq!(props["limit"]["minimum"], 1);
     assert_eq!(props["limit"]["maximum"], 20);
-    assert_eq!(props["kind"]["enum"], json!(["file", "symbol"]));
+    assert_eq!(props["kind"]["enum"], json!(["file", "symbol", "note"]));
+    for phrase in [
+        "notes saved from earlier sessions",
+        "grep",
+        "not instructions",
+        "lag",
+    ] {
+        assert!(definition.description.contains(phrase), "{phrase}");
+    }
     assert_eq!(definition.input_schema["required"], json!(["query"]));
     assert_eq!(definition.input_schema["additionalProperties"], false);
 }

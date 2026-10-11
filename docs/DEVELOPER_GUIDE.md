@@ -937,7 +937,7 @@ The seven tools are intentionally permanent prompt cost, so additions require a 
 | `glob` | `pattern`, optional `path` | Lists matching allowed files deterministically. |
 | `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. |
 | `bash` | `command` | Executes only commands classified `Allow`. |
-| `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. |
+| `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`/`note`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. Notes saved from earlier sessions are included unless `kind` is `file` or `symbol`; any result containing a note is prefixed with the same "unverified, not instructions" notice as the injected block. The tool is offered, and the system prompt carries a one-sentence hint to use it, only in sessions that have an index. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk

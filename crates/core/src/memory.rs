@@ -97,6 +97,7 @@ impl MemorySearch for MemSearchTool {
             let kind = request.kind.map(|kind| match kind {
                 SearchKind::File => MemSearchKind::File,
                 SearchKind::Symbol => MemSearchKind::Symbol,
+                SearchKind::Note => MemSearchKind::Note,
             });
             self.retriever
                 .search(query, kind, request.limit)

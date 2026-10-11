@@ -27,6 +27,11 @@ test("fixed event fields and range restrictions are checked at the boundary", ()
   for (const n of stream()) expect(parseNotification(n)).toEqual(n);
   for (const value of [{ ...note(1, "turn.started"), session_id: undefined }, note(0, "turn.started"), note(1, "text.delta", { text: 5 }), { ...note(1, "turn.started"), seq: undefined, seq_from: 1, seq_to: 2 }, note(1, "turn.finished", { stop_reason: "other", usage: {} })]) expect(() => parseNotification(value)).toThrow(ProtocolError);
 });
+test("unknown notification methods are accepted without relaxing sequence rules", () => {
+  const unknown = { session_id: "s", seq: 11, turn_id: "t", method: "memory.future_event", params: { nested: { payload: true } } };
+  expect(parseNotification(unknown) as unknown).toEqual(unknown);
+  expect(() => parseNotification({ ...unknown, seq: undefined, seq_from: 11, seq_to: 12 })).toThrow(ProtocolError);
+});
 test("sequence window accepts complete merged ranges, dedupes and never hides an out-of-order gap", () => {
   const window = new SequenceWindow();
   expect(window.accept(note(3, "text.delta", { text: "third" }))).toBe("gap");

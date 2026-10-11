@@ -33,7 +33,10 @@ export function parseNotification(value: unknown): Notification {
   const p = value.params;
   const ranged = value.seq === undefined;
   if (ranged ? !integer(value.seq_from) || value.seq_from < 1 || !integer(value.seq_to) || value.seq_to < value.seq_from || !["text.delta", "reasoning.delta"].includes(value.method as string) : !integer(value.seq) || value.seq < 1 || value.seq_from !== undefined || value.seq_to !== undefined) throw new ProtocolError("Invalid event sequence");
-  let valid = false;
+  // Unknown methods still occupy the shared sequence space. Accept their
+  // envelopes so newer daemons remain usable; reducers ignore methods they do
+  // not understand. Known methods retain strict parameter validation below.
+  let valid = true;
   switch (value.method) {
     case "turn.started": valid = true; break;
     case "reasoning.delta": case "text.delta": valid = strings(p, "text"); break;

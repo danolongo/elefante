@@ -126,6 +126,29 @@ fn every_notification_has_one_fixed_envelope() {
 }
 
 #[test]
+fn unknown_notification_methods_deserialize_with_params_but_never_serialize() {
+    let wire = note(
+        414,
+        "memory.future_event",
+        json!({"nested":{"payload":true}}),
+    );
+    let parsed: Notification = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        parsed.event,
+        NotificationEvent::Unknown {
+            method: "memory.future_event".into()
+        }
+    );
+    assert!(serde_json::to_value(parsed).is_err());
+    assert!(
+        serde_json::from_value::<Notification>(
+            json!({"session_id":"s1","seq":414,"turn_id":"t7","method":"memory.future_event"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn stop_reasons_and_usage_preserve_other_objects_and_nullable_cost() {
     for reason in [
         json!("end_turn"),
@@ -256,6 +279,12 @@ fn notification_rejects_missing_routing_ambiguous_ranges_and_discrete_coalescing
     range["method"] = json!("turn.started");
     range["params"] = json!({});
     assert!(serde_json::from_value::<Notification>(range).is_err());
+
+    let mut unknown_range = note(1, "future.event", json!({"value":1}));
+    unknown_range.as_object_mut().unwrap().remove("seq");
+    unknown_range["seq_from"] = json!(1);
+    unknown_range["seq_to"] = json!(2);
+    assert!(serde_json::from_value::<Notification>(unknown_range).is_err());
 }
 
 fn delta(seq: u64, reasoning: bool, text: &str) -> Notification {

@@ -89,7 +89,7 @@ impl<W: Write> StreamRenderer<W> {
                 }
                 _ => Ok(()),
             },
-            E::TurnStarted {} => Ok(()),
+            E::TurnStarted {} | E::Unknown { .. } => Ok(()),
         }
     }
 

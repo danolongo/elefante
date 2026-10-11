@@ -8,8 +8,9 @@ when a turn ends. It knows no OpenRouter field names and performs no syscalls.
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/lib.rs` | 907 | `Session`, `ToolGate`, `RoundAccumulator`, `ContextSource`, `run_agent_loop`, and every public type. |
-| `src/memory.rs` | 89 | `MemContext` and `MemSearchTool` — the repository index as a source of context and as the backing for `memory_search`. |
+| `src/lib.rs` | 1006 | `Session`, `ToolGate`, `RoundAccumulator`, `ContextSource`, `InjectedContext`, `run_agent_loop`, and every public type. |
+| `src/learn.rs` | 881 | `Learner`, `LearnConfig`, and the `LearnSink` it reports to. |
+| `src/memory.rs` | 137 | `MemContext` and `MemSearchTool` — the repository index as a source of context and as the backing for `memory_search`. |
 
 `lib.rs` is still one large file and still the obvious first split — `ToolGate` and
 `RoundAccumulator` are both self-contained. `memory.rs` is the only part that knows `elefante-mem`
@@ -63,6 +64,10 @@ A `ContextSource` supplies two things: a **block** relevant to this turn's promp
   A session that starts before the first index finishes simply adopts it on the first turn where
   one exists, costing one cache miss.
 - A source that returns `None` adds nothing — no empty envelope.
+- `turn_block` returns `Option<InjectedContext { text, notes }>`. When learned notes were injected,
+  `Session::prompt` emits `OutputEvent::Context { notes }` **after** `TurnStarted` (before it, the
+  daemon would have no active turn to attach it to). It carries metadata only — the rendered text is
+  never emitted and never stored — so a client can say which notes shaped a turn.
 
 ### Learning (`learn.rs`)
 
@@ -92,7 +97,17 @@ answer to `elefante-mem`, which decides what is kept. The model's reply is a *pr
   provider refuses a request *because of* the schema (HTTP 400, 404 or 422), the learner drops the
   schema for the rest of the session and asks again without it, which is not counted as a failure.
   `Learner::diagnostics()` says why the last call failed, what an unreadable reply began with, and what
-  the store refused.
+  the store refused; a success clears it.
+- **The sink.** `Learner::with_sink` takes an `Arc<dyn LearnSink>` (`learned`, `usage`, `health`; every
+  method defaults to a no-op, so `Learner::new` is unchanged). `learned` gets only `Added`, `Promoted`,
+  `Superseded` (with the note it replaced) and `Revived` notes, resolved with one read after the
+  commit; a reinforced note is not reported. `usage` is the `Usage` of each extractor call that
+  reported one, including a call whose reply turned out to be unreadable. `health` is `LearnHealth { consecutive_failures, failure }` with a *class*
+  (`ProviderStatus(code)`, `NoReply`, `UnreadableReply`, `Store`), reset on success; it is what the
+  daemon turns into the wire's fixed-vocabulary `problem`, never the provider's text. Callbacks run
+  on the learner task and must return quickly.
+- **Consent is not here.** The learner has no idea whether it may run; the daemon simply does not
+  call `observe` until a person has agreed.
 
 ## Invariants
 
@@ -126,8 +141,8 @@ cargo test -p elefante-core     # 28 tests, no network
 ```
 
 `tests/session.rs` (13) covers multi-turn history, cancellation, and pairing under interrupt.
-`tests/loop.rs` (6) covers the single-turn path. `tests/context.rs` (8) covers where context goes in
-a request and that it never enters history. `tests/prompt.rs` (1) asserts the default system prompt. Nothing is `#[ignore]`d; every test drives a scripted in-process provider, so the suite
+`tests/loop.rs` (6) covers the single-turn path. `tests/context.rs` (10) covers where context goes in
+a request, that it never enters history, and that the audit event follows `turn.started` without the rendered text. `tests/learn.rs` covers the learner, including the sink. `tests/prompt.rs` (1) asserts the default system prompt. Nothing is `#[ignore]`d; every test drives a scripted in-process provider, so the suite
 needs no credentials.
 
 ## Boundaries

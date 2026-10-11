@@ -318,4 +318,162 @@ the overlap coefficient (0.4) while duplicates use Jaccard (0.9), both pinned by
 
 ---
 
+## M3.1 — Hardening and consent            (implemented 2026-10-11, branch `feat/memory-ui`)
+
+**Shipped.** `learn::display_safe` (Unicode categories Cc, Cf, Zl, Zp, whitespace collapsed), applied
+at ingest, to every column `elefante memory` prints, and to every note the daemon puts on the wire;
+`elefante memory list` verifies the store's stamp and prints only an explanation for a foreign one;
+the learner clears its failure state on success. `ELEFANTE_LEARN` became `LearnMode { Off, Ask, On }`:
+**unset now means ask** (it meant on). The answer lives in `~/.elefante/memory-consent`, stamped with
+the memory key and bound to the extractor model; until it exists the daemon never calls
+`Learner::observe`, so nothing is read or held, and a later "yes" is not retroactive. `memory.consent`,
+the additive `memory` object on create/attach results, `elefante memory learn on|off` (through a
+listening daemon, else the file), a TUI launch modal (Y / N / Esc to ask later, no default key), and a
+one-line stderr notice from a headless terminal client while consent is unset.
+
+**Gate.** Covered by a test in the tree:
+- *No control or formatting character reaches a person.* Stripped before verification and the quote
+  still matches (`mem/tests/learn.rs`); `display_safe` unit test; a hand-built database with hostile
+  `kind`/`status`/`origin` prints clean, and an unstamped one prints only the explanation
+  (`cli/tests/memory.rs`); a failure followed by a success reports healthy (`core/tests/learn.rs`).
+- *No extractor request before consent*, counted on the stub, and the pre-consent phrase is absent
+  from the first request after a grant (`srv/tests/learn.rs`). The answer persists across a daemon
+  restart, applies to a second live session, is bound to the extractor (a different one reads
+  `unset`), `ELEFANTE_LEARN=1` needs no file, `0` beats a granted file, a tampered file reads `unset`,
+  and revoking discards held text before idle, close or exit can flush it.
+- *Skew.* The Rust types and the TS parser accept a result with and without `memory`
+  (`rpc/tests/wire.rs`, `tui/tests/protocol.test.ts`).
+- The consent modal discloses the extractor and offers only Y, N and Esc; typing and Esc stay in it
+  (`tui/tests/ui.test.tsx`). A healthy status line carries no `memory:` suffix.
+
+**No test found.** (1) "A new client against a result without `memory` shows no modal" is true by
+construction in `tui/src/main.tsx` (the modal needs `consent === "unset"` and a non-null extractor),
+but nothing drives that code. (2) "The modal never opens with text in the input" holds because it is
+raised once at launch only; no test asserts it. (3) "Byte-identical screen when healthy" is asserted
+only as the absence of the `memory:` suffix, not as a frame comparison. (4) The credentialed live test
+was not re-run for this record. "M0–M3 gates still green" rests on the whole hermetic suite: on the
+final tree `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (516 passed, 0 failed)
+and `cargo +1.90.0 check` pass, as do the TUI `tsc`, `bun test` (89 passed), `bun build --compile` and
+the CI smoke test.
+
+**Deferred.** Consent per repository (design § 13, question 2). A stronger or second confirmation when
+`ELEFANTE_EXTRACT_MODEL` names another vendor (question 3): the modal names the extractor and says when
+it is the session's own model, nothing more. The first-run flow that will fold this question into the
+extractor picker (`PLAN.md` § First-run setup flow).
+
+**Amended.** M3's documented default changed from on to ask; `ELEFANTE_LEARN=1` restores it. Recorded in
+`DEVELOPER_GUIDE.md` (§ 5 Memory wire, § 10). Hermetic daemon tests construct `LearnMode::On`.
+
+---
+
+## M5 (memory parts) — State, spend and lenient clients            (implemented 2026-10-11, branch `feat/memory-ui`)
+
+Only what learned memory needs from M5. Token analysis proper (cache-read warnings, standing-overhead
+target, staleness signals, `session.stale`) is **not** built, and M5 stays open.
+
+**Shipped.** The full `MemoryStatus` (`enabled`, `consent`, `learning`, `extractor`, `notes`, `index`,
+cumulative `spend`, fixed-vocabulary `problem`) in create and both attach results and refreshed by the
+never-coalesced `memory.status` event; `View::emit_session` for events that belong to no turn;
+`LearnSink` (`learned`, `usage`, `health`) on the learner; a consecutive-failure count in place of
+"last error"; `Store::reset_reason()` so a rebuilt store is reported; lenient clients (Rust
+`NotificationEvent::Unknown` through a hand-written `Deserialize`, TS parser accepting an unknown
+`method`); one session cost in the TUI (turn usage plus `spend.cost`) and an exception-only status
+suffix (`memory: paused  /memory`, `not saving`, `unavailable`).
+
+**Gate.** Covered: an unknown notification with `params` is accepted by both parsers and never
+serialised by Rust (`rpc/tests/wire.rs`, `tui/tests/protocol.test.ts`); a status from a fresh attach
+carries counts and cumulative extractor spend, and the same fields come back on a second attach
+(`srv/tests/learn.rs`); the sink reports usage, three-state health and recovery (`core/tests/learn.rs`);
+the reducer treats `memory.status` as turn-less state that advances `seq` and survives a snapshot
+restore (`tui/tests/session.test.ts`); spend joins the single total and only paused, failing and
+unavailable states add a suffix (`tui/tests/ui.test.tsx`); `reset_reason` per cause
+(`mem/tests/trust.rs`).
+
+**No test found.** (1) "Displayed cost survives a reattach" is covered in pieces (daemon returns
+spend; TUI sums it) but no test joins them. (2) A daemon reporting `learning: "failing"` or the
+rebuilt-store `problem` has no `srv` test; the TUI suffix is tested only on hand-built states.
+(3) "`seq` has no holes for any client" holds by construction (one counter in `emit`/`emit_session`,
+events never coalesced) but no test asserts contiguity across memory events. (4) The TS reducer ignoring
+an unknown event is untested; only the parser's acceptance is.
+
+**Deferred.** Everything under "token analysis" above. A cross-session push of learned notes (design
+D8): a status refresh reaches every live session when consent changes, but a note learned in one
+session reaches another only at its next status refresh or `memory.list`.
+
+**Deviations from the design pass.** `create` returns the whole `MemoryStatus`, not just the M3.1 seed.
+`learning: "paused"` covers declined and off as well as unset (read `consent` for why). `memory.status`
+is not emitted at create/attach, which return it. `memory.consent` targets the extractor of the last
+session the connection created or attached; a fresh connection targets the configured default.
+
+---
+
+## M6 (injected-note audit only) — Which notes shaped a turn            (implemented 2026-10-11, branch `feat/memory-ui`)
+
+**Shipped.** The audit input M6 needs, nothing of M6's persistence. `ContextSource` returns an
+`InjectedContext { text, notes }`; `Session::prompt` emits `OutputEvent::Context` **after**
+`TurnStarted`; the daemon turns it into `memory.context` (carrying the turn's `turn_id`) and records
+`memory_note_ids` on the active and completed turn, so snapshots carry them; the TUI draws one
+persistent `◇ used N saved notes` line under the turn.
+
+**Gate.** Covered: the event follows `turn.started` with the same `turn_id`, and its text is not in
+history or the extractor's input (`core/tests/context.rs`, `srv/tests/learn.rs`); `memory_note_ids`
+round-trips on both turn shapes (`rpc/tests/wire.rs`) and restores from a snapshot in the reducer
+(`tui/tests/session.test.ts`); the line renders (`tui/tests/ui.test.tsx`).
+
+**No test found.** That the daemon fills `memory_note_ids` in the snapshot it serves: both ends are
+tested, the server's `View::emit` path between them is not. "A turn that received none records none" is
+true of the code (`[]`) and untested.
+
+**Deferred.** All of conversation history: `session.list` / `resume` / `delete`, the durable per-turn
+record under `.elefante/`, `repo_root` resolution, bounded snapshots, the picker and its list overlay.
+The gate item "the stored record of a turn names its injected notes by id" has no record to test until
+then; `PLAN.md` M6 keeps it.
+
+---
+
+## M7 — Memory in the UI            (implemented 2026-10-11, branch `feat/memory-ui`)
+
+**Shipped.** `memory.learned` (one per changed note, at most 8 per extraction, never for a reinforced
+note) and `memory.context`; `memory.list | forget | approve | clear | status` keyed by `cwd`, with
+`UNKNOWN_NOTE` (-32006) and `MEMORY_OFF` (-32007); `elefante memory` uses the daemon when one listens
+and opens the store directly otherwise. TUI: persistent transcript lines (`◇ remembered: …  /forget 14`,
+`◇ updated: “old” → “new”`), a modal `/memory` panel (list, provenance in words, `f` to forget with a
+Y/N confirmation re-checked against the id, a stated limit, wrapping and scrolling), `/forget <id>`, and
+exact slash-command routing (only `/memory` and `/forget <integer>`; `//x` sends `/x`). Headless: with
+stderr a terminal, `memory: saved N note(s)` printed at the next `turn.finished` after notes were saved,
+and each distinct `problem` once; never to stdout, never note text.
+
+**Gate.** Covered: `memory.learned` replays with `turn_id: null` and `memory.context` follows its
+`turn_id` (`srv/tests/learn.rs`); the learner reports exactly one normalised change per note
+(`core/tests/learn.rs`); a batch is capped at 8 candidates (`mem/tests/learn.rs`) and a session at 20
+calls (`core/tests/learn.rs`); list/forget/status by `cwd`, `UNKNOWN_NOTE` on a second forget, and
+`MEMORY_OFF` with memory off (`srv/tests/learn.rs`, `srv/tests/memory.rs`); `clear` removes learned
+notes and leaves the code graph (`mem/tests/learn.rs`); the CLI renders daemon results through the same
+sanitiser and prefers a listening daemon (`cli/tests/client.rs`); the panel's list, confirmation, stale-id
+guard, loading/error states and key isolation (`tui/tests/ui.test.tsx`); `/usr/bin`, a pasted block and
+`//x` are prompts (`tui/tests/commands.test.ts`); hostile note text is sanitised before the reducer and
+the panel; the stderr lines, once-only problems and silence when disabled (`cli/tests/renderer.rs`).
+
+**No test found.** (1) `memory.approve` through the daemon, and `clear` on a non-empty store through
+the daemon. (2) That a daemon `forget` changes the *next retrieval*, rather than the status count.
+(3) "A reinforced note emits nothing": true by construction (`changed_notes` lists only added, promoted,
+revived and superseded) but no test reinforces through a sink. (4) That `memory.learned` stays
+`turn_id: null` while a turn is running; the test replays an idle session. (5) The `memory: learning is
+paused` stderr notice (the predicate is unit-tested, the print is not). (6) "Screen layout unchanged with
+learning working" beyond the absent suffix.
+
+**Deferred.** A tombstone, so a forgotten note can be learned again (D9; the panel says so); consent per
+repository; a bounded "recent" summary on attach (question 1); a flag to force the headless lines on or
+off (question 5); approve, history (`--all`) and clear in the panel, which remain `elefante memory`;
+the panel on M6's list overlay (it is standalone); the panel header's spend breakdown and index state
+(D7); `memory.status` push when another session learns.
+In a one-shot `elefante "prompt"` the session closes before extraction usually finishes, so
+`memory: saved` rarely appears; only problems do.
+
+**Amended.** `MEMORY-UI-DESIGN.md` is now an implemented design, with the unbuilt parts marked;
+`DEVELOPER_GUIDE.md` § 5 gained **Memory wire**; `PLAN.md` marks M3.1 and the memory parts of M5, M6 and
+M7 shipped.
+
+---
+
 _Next: M4 — critics._

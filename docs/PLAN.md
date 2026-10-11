@@ -208,7 +208,9 @@ variables stay as overrides.
 
 M3.1's launch-time consent question is the stopgap for step 3 until this flow exists; when it lands,
 step 3's sentence *is* the consent question, and answering the picker records the same stamped consent
-bound to the chosen model.
+bound to the chosen model. **The stopgap has shipped** (M3.1, below): the TUI asks once, the answer is
+stored in `~/.elefante/memory-consent` bound to the extractor, and `elefante memory learn on|off` answers
+headlessly. Steps 1 and 2, the pickers, and the whole flow remain unbuilt.
 
 Open for its design pass: whether the flow is re-runnable (a `setup` subcommand or TUI command)
 so a changed mind does not mean editing a file by hand, and whether the critic and triage roles
@@ -836,7 +838,7 @@ future compactor drops has already been read.
 
 ### M3.1 — Learned-memory hardening and consent
 
-Follow-up to M3, designed in [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) (§ 7, § 8). It fixes two
+**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)). Follow-up to M3, designed in [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) (§ 7, § 8). It fixes two
 defects found in the merged code and changes one default; the rest of that document is assigned to M5,
 M6 and M7 below.
 
@@ -872,7 +874,11 @@ nothing. `elefante memory learn on|off` answers headlessly; `memory.consent` and
 
 **Baseline.** Per-turn accounting from `usage`, cache-hit reporting, standing prompt overhead, staleness signals, cost attribution by role. Cost comes from `usage.cost` on each response rather than a local price table — the provider reports what the generation actually cost, including cache discounts, so there is no table to keep current.
 
-**Memory is the first background role to be accounted for.** The learned-memory extractor spends money
+**Memory is the first background role to be accounted for.** *The memory parts of this milestone have
+shipped — `MemoryStatus`, `memory.status`, lenient clients, `View::emit_session`, the consecutive-failure
+count, `Store::reset_reason()`, the single cost total and the status suffix. `session.stale` and the rest
+of token analysis (the baseline above and every gate item that is not about memory or unknown events) are
+unbuilt, so M5 stays open.* The learned-memory extractor spends money
 the turn totals never see, so this milestone adds the full `MemoryStatus` from
 [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) § 4.1 (grown in place from M3.1's `memory` field):
 consent, learning working/paused/failing, cumulative memory spend, and a fixed-vocabulary problem
@@ -909,7 +915,9 @@ output to 2 KiB previews; the durable record instead holds, per turn: the prompt
 reasoning text, the answer, every tool call with its **full** input, output, duration, and
 approval decision, `stop_reason`, and `usage` — and the ids of any learned notes injected into the turn
 (`InjectedContext` from [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) § 5), since what shaped a turn
-is part of auditing it. Encrypted reasoning blocks are replay state, not
+is part of auditing it. *`InjectedContext`, the `memory.context` event and `memory_note_ids` on snapshots
+have shipped (the in-daemon half of this audit); the durable record, and everything else in this
+milestone, has not.* Encrypted reasoning blocks are replay state, not
 readable text, and are stored only as the history needs them for resume — an audit cannot read
 what the provider does not disclose. Everything passes `Scrubber` on write, as above.
 
@@ -961,6 +969,12 @@ a third party:
 - **M0–M5 gates still green.**
 
 ### M7 — Memory in the UI
+
+**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)), together with M3.1 and the memory parts of M5
+and M6. Two departures from the baseline below: the `/memory` panel is a standalone modal, not built on
+M6's list overlay (which does not exist), and the panel lists and forgets only — approve, history and
+clear stay in `elefante memory`. A tombstone for forgotten notes, per-repository consent and a "recent"
+summary on attach remain open (`MEMORY-UI-DESIGN.md` § 13).
 
 **Baseline.** The user-facing half of learned memory, specified in
 [`MEMORY-UI-DESIGN.md`](./MEMORY-UI-DESIGN.md) (§ 4.2, 4.3, 6). Depends on M5 (state, events, lenient

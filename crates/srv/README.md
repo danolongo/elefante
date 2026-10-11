@@ -10,7 +10,7 @@ around it.
 |---|---:|---|
 | `src/main.rs` | 4 | The binary. Calls `run_from_env()` and nothing else. |
 | `src/lib.rs` | 12 | Module declarations, four re-exports, three capacity constants. |
-| `src/server.rs` | 1112 | **The largest file in the workspace.** Listener, session registry, ring buffer, method dispatch, turn driving. |
+| `src/server.rs` | 1924 | **The largest file in the workspace.** Listener, session registry, ring buffer, method dispatch, turn driving. |
 | `src/queue.rs` | 300 | `ClientQueue` — per-client delivery with coalescing and eviction. |
 | `src/stub.rs` | 198 | `StubProvider`, the scripted fake used by daemon tests. |
 | `src/credentials.rs` | 95 | `0700` directories and `0600` files for the socket and stored key. |
@@ -31,11 +31,26 @@ elefante_srv::socket_path()?;                      // $XDG_RUNTIME_DIR, else ~/.
 **Learning.** After each turn the daemon hands the session's new text to that session's `Learner`
 (`elefante-core`), which decides whether to ask a model what is worth remembering. What is still
 pending is extracted when the session closes, after `ELEFANTE_LEARN_IDLE_SECS` (default 300) of
-quiet, and as the daemon exits. `ELEFANTE_LEARN=0` turns this off alone; `ELEFANTE_MEMORY=0` turns
-it off with the whole index. The extractor's model comes from `ELEFANTE_EXTRACT_MODEL` /
-`ELEFANTE_EXTRACT_EFFORT`, falling back to the session's. The memory key lives beside the
-credentials (`~/.elefante/memory.key`), never in a working tree. No RPC method, notification or
-error code was added.
+quiet, and as the daemon exits. The extractor's model comes from `ELEFANTE_EXTRACT_MODEL` /
+`ELEFANTE_EXTRACT_EFFORT`, falling back to the session's. The memory key and the consent file
+(`memory-consent`) live beside the credentials (`~/.elefante/`), never in a working tree.
+
+**Consent.** `DaemonConfig::learn` is a `LearnMode`: `ELEFANTE_LEARN` unset is `Ask`, `1`/`on` is `On`
+(the operator's consent), `0`/`off` and `ELEFANTE_MEMORY=0` are `Off`. One `ConsentGate` is shared by
+every session. In `Ask` it reads the stamped file, and a record made for a different extractor model
+reads as unset. A turn is handed to the learner only if consent was granted when it began and the
+gate's revision is unchanged when it ends; a `memory.consent` that revokes drops whatever the learner
+was holding. Tests construct `LearnMode::On` (or `Ask` to test the question) and the file path derives
+from `credentials.parent()`, so they never touch the real home.
+
+**The memory wire.** `create` and `attach` return a `MemoryStatus` built from the gate, the store's
+cached counts, the session's cumulative extractor spend and learner health. A `ServerLearnSink` turns
+learner callbacks into `View::emit_session` events (`memory.learned`, `memory.status`), which use no
+active turn, so their `turn_id` is `null` even mid-turn; `OutputEvent::Context` becomes `memory.context`
+through the ordinary `emit` and fills `memory_note_ids` on the turn. `memory.list | forget | approve |
+clear | status` take a `cwd`, open the repository's store on demand, and answer `MEMORY_OFF` or
+`UNKNOWN_NOTE`; `memory.consent` is user-level. The contract is `DEVELOPER_GUIDE.md` §5 (**Memory
+wire**). Every note string leaving the daemon passes `learn::display_safe`.
 
 `DaemonConfig::from_env()` builds the config the same way `run_from_env` does, which is what
 tests use to point a daemon at an isolated socket.
@@ -89,7 +104,7 @@ own work.
 ## Testing
 
 ```sh
-cargo test -p elefante-srv     # 30 tests
+cargo test -p elefante-srv     # hermetic, no network
 ```
 
 `tests/daemon.rs` (15) drives the real daemon over a real socket with `ELEFANTE_SOCKET` pointed
@@ -97,7 +112,9 @@ at a `tempfile` path — resume, fanout, interrupt, approval, and lifecycle. `te
 does the same for the repository index: what a model is sent, what `memory_search` returns, a
 subdirectory session's scope, edits between turns, and that switching memory off writes nothing.
 It reads the requests the model would have received from a file the stub records them to
-(`record_requests` in the script). Inline tests cover
+(`record_requests` in the script). `tests/learn.rs` (17) drives learning end to end through a scripted
+extractor, and covers consent (nothing read before an answer, persistence, extractor binding, tampering,
+operator modes, revocation), the `memory` status and events, and the `memory.*` methods by `cwd`. Inline tests cover
 `queue.rs` (4), plus one each in `credentials.rs`, `server.rs`, and `stub.rs`.
 
 Nothing here needs credentials: `ELEFANTE_STUB_PROVIDER` swaps in `StubProvider`, which is why

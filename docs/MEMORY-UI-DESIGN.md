@@ -1,11 +1,31 @@
 # Memory in the UI — design
 
-> **Status: draft for review (revision 3). Nothing here is implemented.** Learned memory
-> (`M3-DESIGN.md`, merged in #14) shipped with no wire or UI changes, by design: its decision D12 was
-> "no RPC change". That left the user unable to see, approve, remove, or even know about what is being
-> remembered. This is the design pass for closing that gap. It is a working contract: each part is
-> retired into `DEVELOPER_GUIDE.md`, `PLAN.md` and the crate and `tui` READMEs when the milestone that
-> owns it has a green gate.
+> **Status: implemented on branch `feat/memory-ui` (revision 3); the milestone gates are recorded in
+> `MILESTONES.md`.** M3.1, the memory parts of M5, the injected-note audit from M6, and M7 all ship
+> together. Learned memory (`M3-DESIGN.md`, merged in #14) shipped with no wire or UI changes, by
+> design: its decision D12 was "no RPC change". That left the user unable to see, approve, remove, or
+> even know about what is being remembered; this design closed that gap. Where it and the code
+> differ, **the code and `DEVELOPER_GUIDE.md` § 5 (Memory wire) are the contract**; the differences are
+> listed below. The shipped behaviour has been retired into `DEVELOPER_GUIDE.md`, `PLAN.md`,
+> `MILESTONES.md` and the crate and `tui` READMEs, so this document is now background and rationale.
+>
+> **Still specification only (not built):** § 13's open questions and everything they imply — a
+> tombstone for forgotten notes (D9: forgetting is not durable), per-repository consent, a "recent"
+> summary on attach, a flag to force the headless stderr lines on or off, a stronger or second
+> confirmation for a cross-vendor extractor. Also unbuilt: the `/memory` panel header's spend breakdown
+> and index state (D7, § 4.1 `index` is on the wire but not drawn), the panel sitting on M6's list
+> overlay (no overlay exists; it is a standalone modal), cross-session push (D8), and M6's durable
+> conversation record, so the "injected-note ids in the stored record" gate item has nothing to attach
+> to yet. M5's other work (`session.stale`, cache and overhead reporting) is untouched.
+>
+> **Where the code differs from this text:** `session.create` returns the whole `MemoryStatus`, not only
+> the M3.1 seed; `learning: "paused"` covers declined and off, not just unset; `memory.status` is not
+> emitted at create/attach (those return it) and is sent to every live session when a consent answer
+> arrives; `memory.consent` targets the extractor of the last session its connection created or
+> attached; the consent modal is raised once per launch after create/attach, with no "input empty"
+> check; the headless `memory: saved N notes` line prints at the next `turn.finished`, so a one-shot
+> rarely shows it; and `cli/src/memory.rs`'s module comment still says its commands never need the
+> daemon.
 >
 > Revision 2 followed two independent reviews of revision 1 — an adversarial, code-grounded one and a
 > fresh-eyes user-experience one (§ 12). **Revision 3 splits the scope.** Only two things are needed
@@ -13,7 +33,7 @@
 > ship as **M3.1**. Everything else is assigned to the milestone whose machinery it needs (§ 2a) and
 > stays here as that milestone's specification; each Part A section says where it ships.
 >
-> Part A states what is true today and settles the design. Part B is the implementation plan for M3.1.
+> Part A states what was true before the work and settles the design. Part B is the implementation plan for M3.1.
 
 ---
 

@@ -1,8 +1,9 @@
 //! `elefante memory`: look at what was learned about a repository, and remove it.
 //!
-//! These commands open the repository's store directly and never need the daemon. Persisted
-//! free-form text is injected into prompts, so a person must always be able to see it and take
-//! it out. A running daemon notices a change within its cache lifetime (about thirty seconds).
+//! These commands go through a listening daemon when there is one (`memory.*` over the socket, so
+//! the change takes effect on its next retrieval) and open the repository's store directly when
+//! there is not. Persisted free-form text is injected into prompts, so a person must always be able
+//! to see it and take it out.
 
 use std::{
     env,

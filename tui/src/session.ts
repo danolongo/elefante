@@ -7,10 +7,15 @@ export function addUsage(a: Usage, b: Usage): Usage {
   return { input_tokens: a.input_tokens + b.input_tokens, output_tokens: a.output_tokens + b.output_tokens, reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens, cached_input_tokens: a.cached_input_tokens + b.cached_input_tokens, cache_write_tokens: a.cache_write_tokens + b.cache_write_tokens, cost: a.cost === null && b.cost === null ? null : (a.cost ?? 0) + (b.cost ?? 0) };
 }
 /** A turn's output in the order it happened; tool segments point into the turn's `tools` by id. */
-export type Segment = { kind: "reasoning"; text: string } | { kind: "text"; text: string } | { kind: "tool"; tool_call_id: string };
-/** Today's flat layout as segments, for turns restored from a snapshot, which carries no ordering. */
-export function flatSegments(reasoning: string, text: string, tools: Tool[]): Segment[] {
-  return [...(reasoning ? [{ kind: "reasoning" as const, text: reasoning }] : []), ...(text ? [{ kind: "text" as const, text }] : []), ...tools.map(t => ({ kind: "tool" as const, tool_call_id: t.tool_call_id }))];
+export type Segment = { kind: "reasoning"; text: string } | { kind: "text"; text: string } | { kind: "tool"; tool_call_id: string }
+  // Markers are part of the order too: they stay where they happened and later output starts after them.
+  | { kind: "memory_used"; count: number } | { kind: "memory_learned"; line: MemoryLine };
+/**
+ * Today's flat layout as segments, for turns restored from a snapshot, which carries no ordering.
+ * Saved notes are injected before the turn's first output, so their marker leads.
+ */
+export function flatSegments(reasoning: string, text: string, tools: Tool[], notes = 0): Segment[] {
+  return [...(notes > 0 ? [{ kind: "memory_used" as const, count: notes }] : []), ...(reasoning ? [{ kind: "reasoning" as const, text: reasoning }] : []), ...(text ? [{ kind: "text" as const, text }] : []), ...tools.map(t => ({ kind: "tool" as const, tool_call_id: t.tool_call_id }))];
 }
 function appendText(segments: Segment[], kind: "reasoning" | "text", text: string): Segment[] {
   if (!text) return segments;
@@ -27,7 +32,7 @@ export function initialSession(session_id: string, cwd = "", model = "", effort 
 }
 export function restoreSnapshot(snapshot: Snapshot, now = 0, effort = "", memory: MemoryStatus | null = null, memory_lines: MemoryLine[] = []): SessionState {
   const a = snapshot.active_turn;
-  return { ...initialSession(snapshot.session_id, snapshot.cwd, snapshot.model, effort), seq: snapshot.seq, turns: snapshot.turns.map(t => ({ ...t, tools: t.tools.map(tool => ({ ...tool })) })), usage: snapshot.turns.reduce((u, t) => addUsage(u, t.usage), emptyUsage()), memory, memory_lines, active_turn: a ? { turn_id: a.turn_id, prompt: "", text: a.text_so_far, reasoning: a.reasoning_so_far, tools: a.tools.map(t => ({ ...t })), segments: flatSegments(a.reasoning_so_far, a.text_so_far, a.tools), pending_approvals: a.pending_approval ? [{ ...a.pending_approval }] : [], memory_note_ids: a.memory_note_ids ?? [], thinking_since: a.text_so_far ? null : now, reasoning_tokens: estimateReasoningTokens(a.reasoning_so_far), error: null } : null };
+  return { ...initialSession(snapshot.session_id, snapshot.cwd, snapshot.model, effort), seq: snapshot.seq, turns: snapshot.turns.map(t => ({ ...t, tools: t.tools.map(tool => ({ ...tool })) })), usage: snapshot.turns.reduce((u, t) => addUsage(u, t.usage), emptyUsage()), memory, memory_lines, active_turn: a ? { turn_id: a.turn_id, prompt: "", text: a.text_so_far, reasoning: a.reasoning_so_far, tools: a.tools.map(t => ({ ...t })), segments: flatSegments(a.reasoning_so_far, a.text_so_far, a.tools, a.memory_note_ids?.length ?? 0), pending_approvals: a.pending_approval ? [{ ...a.pending_approval }] : [], memory_note_ids: a.memory_note_ids ?? [], thinking_since: a.text_so_far ? null : now, reasoning_tokens: estimateReasoningTokens(a.reasoning_so_far), error: null } : null };
 }
 /** Time is passed by the caller; this reducer performs no I/O and reads no clock. */
 export function reduceSession(state: SessionState, note: Notification, now = 0): SessionState {
@@ -38,7 +43,11 @@ export function reduceSession(state: SessionState, note: Notification, now = 0):
   if (note.method === "memory.learned") {
     if (note.params.note.status === "pending") return next;
     const after_turn = state.active_turn?.turn_id ?? state.turns.at(-1)?.turn_id ?? null;
-    return { ...next, memory_lines: [...state.memory_lines, { after_turn, change: note.params.change, note: safeMemoryNote(note.params.note), ...(note.params.replaced ? { replaced: safeMemoryNote(note.params.replaced) } : {}) }] };
+    const line: MemoryLine = { after_turn, change: note.params.change, note: safeMemoryNote(note.params.note), ...(note.params.replaced ? { replaced: safeMemoryNote(note.params.replaced) } : {}) };
+    // During a turn the line is a marker inside it, fixed at the point it arrived; between turns it
+    // is drawn after the last turn.
+    if (state.active_turn) return { ...next, active_turn: { ...state.active_turn, segments: [...state.active_turn.segments, { kind: "memory_learned", line }] } };
+    return { ...next, memory_lines: [...state.memory_lines, line] };
   }
   if (note.method === "turn.started") return { ...next, pending_prompt: "", error: null, active_turn: { turn_id: note.turn_id!, prompt: state.pending_prompt, text: "", reasoning: "", tools: [], segments: [], pending_approvals: [], memory_note_ids: [], thinking_since: now, reasoning_tokens: 0, error: null } };
   const active = state.active_turn;
@@ -51,7 +60,7 @@ export function reduceSession(state: SessionState, note: Notification, now = 0):
     case "tool.finished": turn.tools = turn.tools.map(t => t.tool_call_id === note.params.tool_call_id ? { ...t, ...note.params, state: note.params.is_error ? note.params.output_preview === "interrupted" ? "cancelled" : "error" : "ok" } : t); break;
     case "approval.requested": turn.pending_approvals = [...turn.pending_approvals, { ...note.params }]; break;
     case "approval.resolved": turn.pending_approvals = turn.pending_approvals.filter(a => a.approval_id !== note.params.approval_id); break;
-    case "memory.context": turn.memory_note_ids = note.params.notes.map(note => note.id); break;
+    case "memory.context": turn.memory_note_ids = note.params.notes.map(note => note.id); if (note.params.notes.length) turn.segments = [...turn.segments, { kind: "memory_used", count: note.params.notes.length }]; break;
     case "session.error": turn.error = note.params.message; next.error = note.params.message; break;
     case "turn.finished": return { ...next, active_turn: null, usage: addUsage(state.usage, note.params.usage), turns: [...state.turns, { turn_id: turn.turn_id, prompt: turn.prompt, text: turn.text, reasoning: turn.reasoning, tools: turn.tools, segments: turn.segments, stop_reason: note.params.stop_reason, usage: note.params.usage, memory_note_ids: turn.memory_note_ids }] };
   }

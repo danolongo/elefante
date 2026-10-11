@@ -141,3 +141,25 @@ test("memory lines survive a snapshot restore and are not replayed from it", () 
   expect(restoreSnapshot(snapshot(), 0, "high", null, line).memory_lines).toBe(line);
   expect(restoreSnapshot(snapshot()).memory_lines).toEqual([]);
 });
+
+test("memory notices are markers fixed at the point they happened, and output after them starts a new block", () => {
+  const events = [
+    note(1, "turn.started"),
+    note(2, "memory.context", { notes: [{ id: 14, kind: "convention", status: "active", statement: "s", origin: "stated" }, { id: 15, kind: "fact", status: "active", statement: "t", origin: "stated" }] }),
+    note(3, "text.delta", { text: "First. " }),
+    learned(4, "added", 16, "Mid-turn note."),
+    note(5, "text.delta", { text: "Second." }),
+  ];
+  const state = events.reduce((s, n) => reduceSession(s, n), initialSession("s"));
+  expect(state.active_turn?.segments.map(s => s.kind)).toEqual(["memory_used", "text", "memory_learned", "text"]);
+  expect(state.active_turn?.segments[0]).toEqual({ kind: "memory_used", count: 2 });
+  expect(state.memory_lines).toEqual([]);
+  const finished = reduceSession(state, note(6, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }));
+  expect(finished.turns[0]?.segments?.map(s => s.kind)).toEqual(["memory_used", "text", "memory_learned", "text"]);
+  expect(reduceSession(initialSession("s"), note(1, "turn.started")).active_turn?.segments).toEqual([]);
+});
+
+test("a turn restored from a snapshot leads with its saved-notes marker", () => {
+  const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "t", text_so_far: "hi", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [1, 2, 3] } });
+  expect(restored.active_turn?.segments).toEqual([{ kind: "memory_used", count: 3 }, { kind: "text", text: "hi" }]);
+});

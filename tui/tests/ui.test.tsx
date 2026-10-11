@@ -419,3 +419,28 @@ test("/memory and /forget <id> are commands; a path, a pasted block and //x are 
     expect(prompts).toEqual(["/usr/bin/env ls", "/x", "/forget abc"]);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
+
+test("saved-note markers stay where they happened in the turn instead of sinking to its end", async () => {
+  const events = [
+    note(1, "turn.started"),
+    note(2, "memory.context", { notes: [{ id: 14, kind: "convention", status: "active", statement: "s", origin: "stated" }] }),
+    note(3, "text.delta", { text: "Alpha answer." }),
+    note(4, "memory.learned", { change: "added", note: { id: 16, kind: "fact", status: "active", statement: "Mid-turn note.", origin: "stated" } }, null),
+    note(5, "text.delta", { text: "\n\nOmega answer." }),
+  ];
+  const state = events.reduce((s, n) => reduceSession(s, n), { ...initialSession("s"), pending_prompt: "Question" });
+  const setup = await testRender(<Transcript state={state} showReasoning={false} />, { width: 80, height: 20 });
+  try {
+    await setup.renderOnce();
+    await until(setup, "Omega answer.");
+    await until(setup, "Alpha answer.");
+    const frame = setup.captureCharFrame();
+    const at = (text: string) => frame.indexOf(text);
+    expect(at("Question")).toBeLessThan(at("◇ used 1 saved note"));
+    expect(at("◇ used 1 saved note")).toBeLessThan(at("Alpha answer."));
+    expect(at("Alpha answer.")).toBeLessThan(at("◇ remembered: Mid-turn note."));
+    expect(at("◇ remembered: Mid-turn note.")).toBeLessThan(at("Omega answer."));
+    expect(frame.split("◇ used").length - 1).toBe(1);
+    expect(frame.split("◇ remembered").length - 1).toBe(1);
+  } finally { await new Promise(resolve => setTimeout(resolve, 100)); await act(async () => setup.renderer.destroy()); }
+});

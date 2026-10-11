@@ -40,14 +40,16 @@ export function Transcript({ state, showReasoning }: { state: SessionState; show
   return <scrollbox flexGrow={1} flexBasis={0} minHeight={0} stickyScroll stickyStart="bottom" scrollX={false} contentOptions={{ flexDirection: "column", minHeight: 0 }}>
     {turns.map(turn => {
       const live = turn.turn_id === state.active_turn?.turn_id;
-      const shown = (turn.segments ?? flatSegments(turn.reasoning ?? "", turn.text, turn.tools))
+      const shown = (turn.segments ?? flatSegments(turn.reasoning ?? "", turn.text, turn.tools, turn.memory_note_ids?.length ?? 0))
         .map((segment, index) => ({ segment, index })).filter(({ segment }) => showReasoning || segment.kind !== "reasoning");
       return <box key={turn.turn_id} id={`turn-${turn.turn_id}`} flexDirection="column" marginBottom={1}>
         {turn.prompt && <box flexDirection="column" backgroundColor="#1c2433" paddingX={1} marginBottom={1}><text>{turn.prompt}</text></box>}
         {shown.map(({ segment, index }, position) => {
           const next = shown[position + 1]?.segment;
           // A blank line after each block and after a run of tool calls; parallel calls stay together.
-          const gap = next === undefined || segment.kind === "tool" && next.kind === "tool" ? 0 : 1;
+          const gap = next === undefined || segment.kind === "tool" && next.kind === "tool" || segment.kind.startsWith("memory_") ? 0 : 1;
+          if (segment.kind === "memory_used") return <text key={index} fg="#777777">◇ used {segment.count} saved {segment.count === 1 ? "note" : "notes"}</text>;
+          if (segment.kind === "memory_learned") return <text key={index} fg="#777777">{memoryLineText(segment.line)}</text>;
           if (segment.kind === "reasoning") return <box key={index} id={`reasoning-${turn.turn_id}-${index}`} flexDirection="column" paddingLeft={2} marginBottom={gap}>
             <text fg="#777777">{segment.text}</text>
           </box>;
@@ -57,7 +59,6 @@ export function Transcript({ state, showReasoning }: { state: SessionState; show
           const tool = turn.tools.find(t => t.tool_call_id === segment.tool_call_id);
           return tool && <box key={index} flexDirection="column" marginBottom={gap}><ToolCall tool={tool} /></box>;
         })}
-        {(turn.memory_note_ids?.length ?? 0) > 0 && <text fg="#777777">◇ used {turn.memory_note_ids!.length} saved {turn.memory_note_ids!.length === 1 ? "note" : "notes"}</text>}
         <MemoryLines lines={linesAfter(turn.turn_id)} />
       </box>;
     })}

@@ -10,6 +10,7 @@ pub mod graph;
 pub mod hash;
 pub mod indexer;
 pub mod layout;
+pub mod learn;
 pub mod repo;
 pub mod resolve;
 pub mod retrieve;

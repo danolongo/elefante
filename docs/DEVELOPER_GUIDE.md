@@ -6,7 +6,7 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M3, plus M3.1 and the memory-facing parts of M5, M6 and M7 (see `MILESTONES.md`): a provider-backed coding loop behind a daemon, driven by either a
+The repository is at M3, plus M3.1 and the memory-facing parts of the pre-rescope M5, M6 and M7 (see `MILESTONES.md`); what comes next is in `PLAN.md` § Milestones: a provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
 relevant context and gives the model a search tool, and durable notes learned from conversations.
 The implemented vertical slice can:
@@ -71,13 +71,10 @@ elefante/
 │   ├── MILESTONES.md              completion record
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/                     every crate carries its own README.md
-    ├── cli/                       `elefante` terminal binary
-    ├── core/                      provider/tool conversation loop
+    ├── elefante/                  the binary: wire types, daemon, headless client
+    ├── core/                      conversation loop + syscall-facing tool executor
     ├── provider/                  normalized model API + OpenRouter transport
     ├── guard/                     path, shell, and secret-output policy
-    ├── tools/                     schemas and syscall-facing tool executor
-    ├── rpc/                       wire envelopes and framing
-    ├── srv/                       daemon, session registry, ring
     └── mem/                       repository index: graph, indexer, retrieval
 ```
 
@@ -89,31 +86,31 @@ workspace lints from the root manifest. `unsafe` code is forbidden. Clippy's `al
 
 ### The system as it stands
 
-Three processes, one socket, one outbound connection. Section 5 traces a single turn through
+Three processes, one binary, one socket, one outbound connection. Section 5 traces a single turn through
 this; here it is as structure — which crate lives where, and what crosses each boundary.
 
 ```text
   ── clients ──────────────────────────────────────────────────────────────────
 
-   elefante  (bin)                        tui/  (Bun + OpenTUI)
-   ├─ elefante-cli    StreamRenderer      ├─ protocol.ts   framing, seq window
+   elefante  (bin, as a client)           tui/  (Bun + OpenTUI)
+   ├─ client/         StreamRenderer      ├─ protocol.ts   framing, seq window
    │                  stdout = answer     ├─ session.ts    pure reducer, no I/O
    │                  stderr = reasoning  └─ ui/*.tsx      components
-   └─ elefante-rpc    wire types             (speaks the wire; links no Rust)
+   └─ wire/           wire types             (speaks the wire; links no Rust)
              │                                        │
              └───────────────────┬────────────────────┘
                                  │  NDJSON, one value per line, ≤ 8 MiB
                                  │  Unix socket inside a 0700 directory
   ── daemon ─────────────────────▼─────────────────────────────────────────────
 
-   elefante-srv  (bin)
+   elefante daemon  (the same bin; daemon/)
    ├─ server.rs        listener · session registry · ring 4096 · dispatch
    ├─ queue.rs         per-client queue 256; coalesces same-method deltas only
    ├─ credentials.rs   0700 directories, 0600 key file
-   └─ stub.rs          scripted Provider for tests; validates tool pairing
+   └─ stub.rs          scripted Provider for tests (debug builds only)
              │
-             ├──► elefante-rpc ──► elefante-provider   re-exports StopReason, Usage
-             │                                         so wire and loop cannot drift
+             ├──► wire/ ──► elefante-provider   re-exports StopReason, Usage
+             │                                  so wire and loop cannot drift
              │
              └──► elefante-core     Session · turn loop · ToolGate · JoinSet
                        │            owns history across turns
@@ -121,7 +118,7 @@ this; here it is as structure — which crate lives where, and what crosses each
                        ├──► elefante-guard      PathPolicy · BashClassifier · Scrubber
                        │                        decides; never performs
                        │
-                       ├──► elefante-tools ──► elefante-guard
+                       ├──► core::tools ──► elefante-guard
                        │         │             7 schemas; every path through the
                        │         │             policy, every result scrubbed at
                        │         ▼             one exit point
@@ -138,18 +135,17 @@ this; here it is as structure — which crate lives where, and what crosses each
    ├─ indexer          walk · hash · extract · graph · imports · co-change
    ├─ retrieve         FTS5 seeds · graph hops · token-budget packing
    └─ brief            ~300-token repository summary
-        used by core (memory.rs: context + memory_search) and opened by srv
+        used by core (memory.rs: context + memory_search) and opened by the daemon
         (one Store and one Indexer per repository, shared by every session)
 
 Three things are visible here that a dependency list cannot show.
 
 **The wire has two independent implementations.** A Rust client and a TypeScript client speak
-it, sharing no code — which is why the contract lives in `elefante-rpc` and section 5 rather
+it, sharing no code — which is why the contract lives in `elefante::wire` and section 5 rather
 than inside either client, and why a change to it lands on both sides or lands broken.
 
 **There are exactly two egress points.** Everything that leaves this system leaves through
-`tools` (filesystem and `bash`) or `provider` (HTTPS). Both sit below `core`, and `guard` sits
-beside them depending on nothing — so the policy layer is exercisable with no filesystem, no
+`core::tools` (filesystem and `bash`) or `provider` (HTTPS). `guard` sits beside them depending on nothing — so the policy layer is exercisable with no filesystem, no
 network, and no subprocess, and there is no third path to audit.
 
 **The daemon is the only process that holds state.** Clients render; they do not remember.
@@ -163,33 +159,37 @@ The internal graph, precisely:
 elefante-guard      ──► (nothing)      pure policy; the graph's floor
 elefante-provider   ──► (nothing)
 
-elefante-tools      ──► guard
 elefante-mem        ──► guard                        (Scrubber on every stored string)
-elefante-rpc        ──► provider                     (re-exports StopReason, Usage)
-elefante-core       ──► guard, mem, provider, tools
-elefante-srv        ──► core, mem, rpc, provider, tools   the daemon; top of the graph
-elefante-cli        ──► rpc                          a client: it does not link core
+elefante-core       ──► guard, mem, provider         (tools.rs uses guard at the syscall boundary)
+elefante            ──► core, mem, provider          the binary; top of the graph
 ```
 
-Two edges are worth stating outright, because both look like mistakes and are not. **`cli`
-depends only on `rpc`** — it talks to the daemon over a socket and runs no turn in process,
-which is what makes "reconnect and the turn completes intact" true. And **`rpc` depends on
-`provider`** solely to re-export `StopReason` and `Usage`, so the wire and the agent loop cannot
-drift apart; the cost is that `rpc` is not a true leaf.
+One property the graph no longer shows, because client and daemon share a crate: **the client
+never runs a turn.** It talks to the daemon over a socket even though the code that would run one
+is linked into the same binary, which is what makes "reconnect and the turn completes intact"
+true. Keep turn logic out of `elefante::client` and `main.rs`.
 
 Each crate carries a `README.md` with its module map, entry points, invariants, and how to test
 it alone. The subsections below are the overview; the READMEs are the detail.
 
-### `elefante-cli`
+### `elefante`
 
-The binary is a client. It parses arguments and environment defaults, spawns `elefante-srv` if
-none is listening, and then either streams one headless turn over the socket (a prompt was
-given) or launches the Bun TUI (none was). It links only `elefante-rpc` — it constructs no
-provider, no `ToolExecutor`, and no `RunConfig`; those live in the daemon. The answer goes to
-stdout and reasoning plus tool activity to stderr, which is what resolves issue #4 — the two can
-no longer render as one undelimited run, by construction rather than by formatting.
+One crate, one binary, three modules that were three crates until the consolidation:
 
-Keep provider protocol parsing, policy, and orchestration out of this crate.
+- **`client`** (and `main.rs`) — the binary as a client. It parses arguments and environment
+  defaults, starts a daemon if none is listening (by running its own executable as
+  `elefante daemon`), and then either streams one headless turn over the socket (a prompt was given)
+  or launches the Bun TUI (none was). It constructs no provider, no `ToolExecutor` and no
+  `RunConfig`; those live in the daemon. The answer goes to stdout and reasoning plus tool activity
+  to stderr, which is what resolves issue #4 — by construction rather than by formatting.
+  `elefante memory` goes through the daemon too.
+- **`daemon`** — `elefante daemon`: socket, session registry, ring, bounded delivery, and the
+  lifetime of each repository's index (see `elefante-mem` below). Section 5 is the contract it
+  implements.
+- **`wire`** — the types both sides of the socket share. The memory additions (the `memory` result
+  field, three events, six methods, two error codes) are listed under **Memory wire** in §5.
+
+Keep provider protocol parsing and policy out of this crate; it composes.
 
 ### `elefante-core`
 
@@ -205,8 +205,8 @@ Core owns conversation semantics:
 - placing per-turn repository context in a request — as an ephemeral `user` message after the
   turn's user message, never `system`, never stored in history (`ContextSource`, `memory.rs`).
 
-Core does not know OpenRouter field names, does not know how a result batch is shaped on the
-wire, and does not perform filesystem operations.
+Core does not know OpenRouter field names and does not know how a result batch is shaped on the
+wire. Its only filesystem and process access is `core::tools`, below.
 
 ### `elefante-provider`
 
@@ -234,25 +234,18 @@ files. The crate exposes:
 
 Keeping decisions separate from syscalls makes security behavior directly unit-testable.
 
-### `elefante-tools`
+### `core::tools`
 
-Tools is the syscall boundary. It owns the seven permanent tool schemas and a cloneable
-`ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
+The syscall boundary, a module of `elefante-core` (it was the `elefante-tools` crate). It owns the
+seven permanent tool schemas and a cloneable `ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
 classifier; every success and error result passes through `Scrubber`.
 
-`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core`, so this crate
-still depends only on `guard`. Without an implementation attached it returns one fixed refusal.
+`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core::memory`, so the
+executor itself never touches a store. Without an implementation attached it returns one fixed
+refusal.
 
-Do not add an alternate read, write, process, glob, or search path that bypasses this crate's
+Do not add an alternate read, write, process, glob, or search path that bypasses this module's
 policy calls.
-
-### `elefante-rpc` and `elefante-srv`
-
-Both shipped in M1 and are covered by its gate. `rpc` holds the wire types shared by daemon and
-client; `srv` is the daemon itself — socket, session registry, ring, and bounded delivery.
-Section 5 is the contract they implement. M2 added no method, notification, or error code; the
-memory additions (the `memory` result field, three events, six methods, two error codes) are
-listed under **Memory wire** in §5. `srv` additionally owns the lifetime of each repository's index (below).
 
 ### `elefante-mem`
 
@@ -300,7 +293,7 @@ the reader thread.
   after the turn's user message in every round's request. It is not stored. A leading brief message
   is adopted once and frozen. Both are `user`-role: repository text never has system authority.
 - *`memory_search`:* `{query, limit?, kind?}` → ranked `path:line  kind name — description` lines.
-- *Lifecycle:* `srv` opens one `Store` and `Indexer` per repository root when the first session
+- *Lifecycle:* the daemon opens one `Store` and `Indexer` per repository root when the first session
   starts beneath it, and calls `Indexer::refresh()` at session create, turn start and turn end.
   `refresh()` returns immediately and coalesces; N triggers become at most two runs.
 - *Switch:* `ELEFANTE_MEMORY=0` (`DaemonConfig::memory`) — nothing opened, nothing written, no
@@ -328,9 +321,9 @@ detail; the contract is:
   note is no longer retrieved and compaction removes it.
 - *Presentation.* A separate `<repo-memory>` section, at most 400 estimated tokens, framed as
   unverified notes. A query with no notes renders exactly what it did before they existed.
-- *Controls.* `elefante memory list | forget | approve | clear | learn on|off`. They go through the
-  daemon (`memory.*` by `cwd`) when one is listening and open the store directly when none is.
-  `list` checks the stamp first and prints only an explanation for a foreign store.
+- *Controls.* `elefante memory list | forget | approve | clear | learn on|off`. They always go
+  through the daemon (`memory.*` by `cwd`, and `memory.consent`), starting one when none is
+  listening. A foreign store is refused and left untouched, and the command says so.
 - *Display.* Every string a person or a client sees (all columns, every `Note` on the wire) goes
   through `learn::display_safe`, which removes Unicode categories Cc, Cf, Zl and Zp and collapses
   whitespace. The same function strips candidates at ingest, so notes are stored clean; older
@@ -344,8 +337,9 @@ detail; the contract is:
 
 ## 5. Runtime interaction
 
-Elefante runs as a **daemon plus clients**. The `elefante` binary is a client; `elefante-srv`
-holds the sessions. A client that finds no daemon spawns one and waits for it to bind, so
+Elefante runs as a **daemon plus clients**, both the `elefante` binary: `elefante daemon` holds
+the sessions and every other invocation is a client. A client that finds no daemon starts one
+(its own executable, as `elefante daemon`) and waits for it to bind, so
 this is invisible in normal use — but the split is what makes reconnect, interrupt, and
 multiple simultaneous clients possible at all.
 
@@ -355,7 +349,7 @@ elefante (headless)      TUI client (bun)
         └───────┬───────────────┘
                 │  newline-delimited JSON over a Unix socket
                 ▼
-          elefante-srv ── session registry
+       elefante daemon ── session registry
                 │           ├─ ring (4,096 events)  ← resume
                 │           └─ per-client queue (256) ← backpressure
                 ▼
@@ -473,7 +467,7 @@ Server → client notifications:
 | `memory.context` | `{ notes }` — carries the turn's `turn_id` |
 
 `approval.requested` carries **no `reason`**: `BashDecision` has `verdict` and `rule` only, and
-a prose reason is the M4 triage-critic verdict.
+a prose reason is the M5 triage-critic verdict.
 
 `approval.resolved` is required by fanout — with several clients attached, one resolves the
 prompt and the rest must dismiss their modal.
@@ -778,7 +772,7 @@ Six independent flags describe what may be sent or observed:
 | `adaptive_thinking` | The model reasons before answering. |
 | `effort` | The model accepts `reasoning: { effort }`. |
 | `prompt_caching` | Stable system/tool cache breakpoints may be sent. |
-| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. No core caller yet. Repository context is deliberately an ephemeral `user` message rather than a `system` one, so its first consumer is M4, where critic findings are harness-authored and `system` is correct. |
+| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. No core caller yet. Repository context is deliberately an ephemeral `user` message rather than a `system` one, and M5's critic findings are one too, because a finding can quote diff text the repository controls. No consumer is planned. |
 | `structured_output` | Strict schemas may be requested. |
 | `cache_metrics` | Cache creation/read usage is observable. |
 
@@ -1011,6 +1005,16 @@ removing one costs a leak.
 
 The scrubber is defense in depth, not permission to weaken path or shell policy.
 
+### Learned memory: residual risk
+
+Verification bounds what a learned note can say; it cannot make a note true. The extractor can still
+pick a real quote from the user and pair it with a misleading plain-prose statement that passes every
+mechanical check. What limits the damage: the statement is short, scrubbed, escaped and framed as
+unverified; payload-shaped tokens (commands, URLs, paths, identifiers) must appear in the user's own
+words; assistant-only claims are `pending` and never reach a prompt; and `elefante memory` can list and
+remove anything. Storing only the quote itself would remove the risk and was not chosen, because a
+user's phrasing depends on its context and cannot represent facts the assistant established.
+
 ## 10. Configuration and CLI behavior
 
 Configuration precedence and defaults:
@@ -1040,6 +1044,12 @@ The process working directory is the tool-policy root. Running the CLI from this
 permits access to this monorepo; running it from a nested directory intentionally narrows the
 accessible tree.
 
+The same binary runs the daemon: `elefante daemon` serves the socket in the foreground until its idle
+timeout, and a client that finds no daemon starts one that way. The API key, base URL, memory and
+learning switches and idle timeouts are read when the daemon starts — from the environment of
+whichever client started it — so a running daemon keeps the settings it started with. The scripted
+test provider (`ELEFANTE_STUB_PROVIDER`) exists only in debug builds; a release daemon never reads it.
+
 Never store a real key in this repository. `.gitignore` excludes common environment and key
 files, and Elefante's own tools deny them. Supply credentials through the process environment
 or an external secret manager.
@@ -1060,7 +1070,7 @@ Test ownership follows behavior:
 
 - `elefante-guard` tests path traversal, symlinks, secret variants, compound shell syntax,
   redirections, known classifier limits, and scrub patterns.
-- `elefante-tools` tests strict schemas, exact editing, path enforcement at syscall boundaries,
+- `core::tools` tests (`crates/core/tests/tools.rs`) cover strict schemas, exact editing, path enforcement at syscall boundaries,
   deterministic walks, bash non-execution, scrubbing, and cloned/concurrent executors.
 - `elefante-provider` tests deterministic request JSON, per-model capabilities, arbitrary SSE
   chunking, `[DONE]` and keep-alive handling, `tool_calls` accumulation by index, malformed tool
@@ -1068,6 +1078,10 @@ Test ownership follows behavior:
   cached-input tokens, refusals, and forward-compatible events.
 - `crates/core/tests/loop.rs` uses a scripted provider to test a complete edit loop,
   parallel result pairing, refusal, and malformed/incomplete streams without network access.
+- `elefante` tests the wire shapes and framing, drives the real daemon over a real socket (resume,
+  fanout, interrupt, approvals, memory, learning, consent), and runs the real binary end to end —
+  including `elefante memory` against a daemon the binary starts itself. They need the debug profile,
+  where the scripted provider exists.
 
 The provider's always-on transport tests bind a loopback TCP listener. If a sandbox rejects
 local sockets, permit loopback binding rather than disabling the test.
@@ -1098,7 +1112,7 @@ request and a live agent request lands a trivial, reviewed edit. Both run in CI 
 
 1. Decide whether the behavior belongs in one of the seven existing tools. Tool definitions
    consume prompt tokens on every provider round.
-2. Add or update the strict schema in `elefante-tools::definitions`.
+2. Add or update the strict schema in `elefante_core::tools::definitions`.
 3. Add a private `Deserialize` input type with `deny_unknown_fields`.
 4. Route execution through `ToolExecutor::execute`.
 5. Resolve every path with `PathPolicy` immediately before filesystem access.
@@ -1177,15 +1191,13 @@ When behavior changes, update:
   to the file goes with it and the note stays, found by its words. Retrieval is lexical, so a note
   phrased in vocabulary the prompt never uses is not found. There is no transcript compaction;
   one added later must call `Learner::flush` before dropping history.
-- Memory spend is accumulated and shown; the rest of token accounting and staleness reporting
-  waits for M5 proper.
+- Memory spend is accumulated and shown; cost per role and a cache-hit warning arrive with M5.
 - Forgetting a note is not durable: the same preference, said again, can be saved again. Consent is
-  per user and extractor, not per repository, and a fresh attach does not summarise what was learned
-  while the client was away. `docs/MEMORY-UI-DESIGN.md` § 13 keeps the open questions.
-- There is no model-backed critic.
+  per user and extractor, not per repository. Both are M7 (`PLAN.md`).
+- There is no model-backed critic (M5).
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and
   sessions live only in daemon memory — they end with `session.close` or the daemon's idle exit.
-  `PLAN.md` § Session picker and milestone M6 cover the list and durable history.
+  Durable conversation history was cut in the rescope; M6's audit log records tool activity.
 - The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
   time-of-check/time-of-use filesystem races.
 

@@ -2,15 +2,17 @@
 
 The provider-neutral agent loop. Core owns conversation semantics — building requests, consuming
 normalized events, validating the tool-use lifecycle, dispatching tool batches, and deciding
-when a turn ends. It knows no OpenRouter field names and performs no syscalls.
+when a turn ends — and, in `tools.rs`, the syscall boundary every tool goes through. It knows no
+OpenRouter field names, and nothing outside `tools.rs` touches the filesystem or spawns a process.
 
 ## Layout
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/lib.rs` | 1006 | `Session`, `ToolGate`, `RoundAccumulator`, `ContextSource`, `InjectedContext`, `run_agent_loop`, and every public type. |
-| `src/learn.rs` | 881 | `Learner`, `LearnConfig`, and the `LearnSink` it reports to. |
-| `src/memory.rs` | 137 | `MemContext` and `MemSearchTool` — the repository index as a source of context and as the backing for `memory_search`. |
+| `src/lib.rs` | 1038 | `Session`, `ToolGate`, `RoundAccumulator`, `ContextSource`, `InjectedContext`, `run_agent_loop`, and every public type. |
+| `src/learn.rs` | 1017 | `Learner`, `LearnConfig`, and the `LearnSink` it reports to. |
+| `src/memory.rs` | 138 | `MemContext` and `MemSearchTool` — the repository index as a source of context and as the backing for `memory_search`. |
+| `src/tools.rs` | 599 | `ToolExecutor`, the seven tool implementations, `definitions()`, and the input structs each tool decodes. Formerly the `elefante-tools` crate. |
 
 `lib.rs` is still one large file and still the obvious first split — `ToolGate` and
 `RoundAccumulator` are both self-contained. `memory.rs` is the only part that knows `elefante-mem`
@@ -121,6 +123,40 @@ answer to `elefante-mem`, which decides what is kept. The model's reply is a *pr
 - **Consent is not here.** The learner has no idea whether it may run; the daemon simply does not
   call `observe` until a person has agreed.
 
+### Tools (`tools.rs`)
+
+```rust
+use elefante_core::tools::{ToolExecutor, definitions};
+
+let tools = ToolExecutor::new("/path/to/repo")?;   // roots PathPolicy here
+let result = tools.execute("read", json!({ "path": "src/main.rs" })).await;
+
+let catalog = definitions();   // 7 schemas, alphabetical, for the provider request
+```
+
+`ToolExecutor` is cloneable and holds the policy and scrubber, so cloning it cannot produce an
+executor rooted somewhere else. `definitions()` is sorted alphabetically because a stable catalog
+order keeps the prompt cacheable. The seven tools are `bash`, `edit`, `glob`, `grep`,
+`memory_search`, `read` and `write`; `DEVELOPER_GUIDE.md` §8 documents each one.
+
+- **Scrubbing happens at the single exit point, not per tool.** `execute` matches on the tool name,
+  then rebuilds the result with `self.scrubber.scrub(&result.content)` before returning. A new tool
+  cannot forget to scrub; preserve that shape when adding one.
+- **Every path argument goes through `self.resolve`, which delegates to `PathPolicy`.** `glob` and
+  `grep` also filter their *results* through the policy, so a traversal or a symlink into a secret
+  cannot leak through a listing even when the caller never named the path.
+- **`bash` does not classify its own command.** Classification is `ToolGate`'s, which runs before
+  dispatch and can suspend for approval; a gate inside the executor would have nowhere to wait. The
+  executor spawns `bash -lc`, rooted at the policy root, `kill_on_drop`, in its own process group on
+  Unix so an interrupt takes the children with it.
+- **`memory_search` is a trait.** The tool is validated in `tools.rs` (a non-empty query, `limit`
+  1–20, `kind` of `file`, `symbol` or `note`, no other fields) and handed to a `MemorySearch`
+  attached with `ToolExecutor::with_memory`; `memory.rs` implements it over `elefante-mem`. With
+  nothing attached the tool returns one fixed refusal, so a session with memory off still gets a
+  deterministic answer.
+- **One syscall boundary.** Do not add a read, write, process, glob or search path elsewhere that
+  bypasses these policy calls: auditing the boundary means auditing one file.
+
 ## Invariants
 
 **Every `tool_use` must keep exactly one matching `tool_result`.** An unpaired id makes the next
@@ -149,19 +185,20 @@ discarded before validation so a refusal mid-block cannot desynchronize ids.
 ## Testing
 
 ```sh
-cargo test -p elefante-core     # 28 tests, no network
+cargo test -p elefante-core     # 97 tests, no network
 ```
 
-`tests/session.rs` (13) covers multi-turn history, cancellation, and pairing under interrupt.
-`tests/loop.rs` (6) covers the single-turn path. `tests/context.rs` (10) covers where context goes in
+`tests/session.rs` (20) covers multi-turn history, cancellation, and pairing under interrupt.
+`tests/loop.rs` (6) covers the single-turn path. `tests/tools.rs` (19) covers all seven tools
+against `tempfile` workspaces — real files, real `bash`, no network. `tests/context.rs` (12) covers where context goes in
 a request, that it never enters history, and that the audit event follows `turn.started` without the rendered text. `tests/learn.rs` covers the learner, including the sink. `tests/prompt.rs` (1) asserts the default system prompt. Nothing is `#[ignore]`d; every test drives a scripted in-process provider, so the suite
 needs no credentials.
 
 ## Boundaries
 
-No provider wire formats, no filesystem access, no socket handling. Core takes a `&dyn Provider`
-and a `&ToolExecutor` and calls them; if a change here needs to know how a tool result is shaped
-on the wire, it belongs in `provider` instead.
+No provider wire formats and no socket handling, and no filesystem access outside `tools.rs`. The
+loop takes a `&dyn Provider` and a `&ToolExecutor` and calls them; if a change here needs to know how
+a tool result is shaped on the wire, it belongs in `provider` instead.
 
 Core depends on `elefante-mem` only through `memory.rs`; the loop sees a `ContextSource` trait
 object and never a store.

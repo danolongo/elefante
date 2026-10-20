@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use elefante_core::tools::ToolExecutor;
 use elefante_core::{
     CancellationToken, ContextSource, InjectedContext, Note, OutputEvent, RunConfig, Session,
     ToolGate,
@@ -16,7 +17,6 @@ use elefante_provider::{
     Capabilities, ContentBlock, Event, Message, ModelId, Provider, ProviderError, Request, Role,
     StopReason, Usage,
 };
-use elefante_tools::ToolExecutor;
 use futures_util::{
     StreamExt,
     future::BoxFuture,
@@ -466,10 +466,10 @@ async fn no_request_ever_carries_a_system_message_beyond_the_configured_prompt()
 #[derive(Debug)]
 struct NoIndex;
 
-impl elefante_tools::MemorySearch for NoIndex {
+impl elefante_core::tools::MemorySearch for NoIndex {
     fn search(
         &self,
-        _: elefante_tools::MemorySearchRequest,
+        _: elefante_core::tools::MemorySearchRequest,
     ) -> BoxFuture<'_, Result<String, String>> {
         Box::pin(async { Ok("nothing".to_owned()) })
     }

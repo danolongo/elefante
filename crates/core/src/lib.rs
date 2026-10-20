@@ -2,6 +2,7 @@
 
 pub mod learn;
 pub mod memory;
+pub mod tools;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,12 +13,12 @@ use std::{
     time::Instant,
 };
 
+use crate::tools::{ToolExecutor, ToolResult, definitions as tool_definitions};
 use elefante_guard::{BashClassifier, Verdict};
 use elefante_provider::{
     ContentBlock, Effort, Event, Message, ModelId, Provider, ProviderError, ReasoningDetail,
     Request, Role, StopReason, ToolDefinition, Usage,
 };
-use elefante_tools::{ToolExecutor, ToolResult, definitions as tool_definitions};
 use futures_util::{StreamExt, future::BoxFuture};
 use serde_json::Value;
 use thiserror::Error;

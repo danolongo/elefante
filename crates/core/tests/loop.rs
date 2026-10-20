@@ -3,12 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use elefante_core::tools::ToolExecutor;
 use elefante_core::{LoopError, OutputEvent, RunConfig, run_agent_loop};
 use elefante_provider::{
     Capabilities, ContentBlock, Event, ModelId, Provider, ProviderError, ReasoningDetail, Request,
     StopReason, Usage,
 };
-use elefante_tools::ToolExecutor;
 use futures_util::{StreamExt, stream};
 use serde_json::json;
 

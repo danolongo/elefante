@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use elefante_core::tools::ToolExecutor;
 use elefante_core::{
     ApprovalOutcome, ApprovalSink, CancellationToken, OutputEvent, RunConfig, Session, ToolGate,
 };
 use elefante_provider::{
     Capabilities, ContentBlock, Event, ModelId, Provider, ProviderError, Request, StopReason, Usage,
 };
-use elefante_tools::ToolExecutor;
 use futures_util::{
     StreamExt,
     future::BoxFuture,

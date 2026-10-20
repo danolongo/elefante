@@ -258,18 +258,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "elefante-cli"
+name = "elefante"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "elefante-core",
  "elefante-mem",
  "elefante-provider",
- "elefante-rpc",
+ "futures-util",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -279,8 +282,11 @@ dependencies = [
  "elefante-guard",
  "elefante-mem",
  "elefante-provider",
- "elefante-tools",
  "futures-util",
+ "globset",
+ "ignore",
+ "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -329,51 +335,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "elefante-rpc"
-version = "0.1.0"
-dependencies = [
- "elefante-provider",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "elefante-srv"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "elefante-core",
- "elefante-mem",
- "elefante-provider",
- "elefante-rpc",
- "elefante-tools",
- "futures-util",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "elefante-tools"
-version = "0.1.0"
-dependencies = [
- "elefante-guard",
- "futures-util",
- "globset",
- "ignore",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
 ]

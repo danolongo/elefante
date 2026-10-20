@@ -4,10 +4,11 @@ Elefante is a small, modifiable coding-agent harness. Its current implementation
 Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
 seven guarded tools, and policy enforced in code rather than in a long system prompt.
 
-The daemon, the OpenTUI client, and a per-repository index have shipped. The index gives each
-turn relevant files and symbols and gives the model a `memory_search` tool. The long-term design
-adds learned memory, adversarial critics, and token analysis, which are deliberately
-milestone-gated.
+The daemon, the OpenTUI client, a per-repository index and learned memory have shipped. The index
+gives each turn relevant files and symbols and gives the model a `memory_search` tool. The project
+goes deep on four pillars — security, sandboxing, memory (including isolated subagents) and
+adversarial review — and what comes next is an OS sandbox, critics, and subagents that each work in
+their own git worktree, each behind a milestone gate. See [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Project status
 
@@ -31,13 +32,13 @@ Run the agent from the repository it should be allowed to modify:
 
 ```sh
 export OPENROUTER_API_KEY="..."
-cargo run -p elefante-cli -- "Inspect this repository and summarize its structure."
+cargo run -p elefante -- "Inspect this repository and summarize its structure."
 ```
 
 When no prompt argument is supplied, Elefante reads the prompt from standard input:
 
 ```sh
-printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante-cli
+printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante
 ```
 
 Useful options:
@@ -82,9 +83,9 @@ Two properties of this file are deliberate rather than incidental:
   redacts `sk-or-v1-` and `sk-ant-` shapes from every tool result as a second line of
   defence, in case a key reaches Elefante by some path the policy did not anticipate.
 
-`.env.example` in the repository root is an interim convenience. It goes away once the
-harness prompts for a key on first launch and stores it outside the working tree — see
-[`docs/PLAN.md`](docs/PLAN.md) § First-run key setup.
+You can skip the file entirely: launched with no key, the TUI asks for one and the daemon stores it
+in `~/.elefante/credentials.toml` at mode `0600`, outside every working tree. An exported
+`OPENROUTER_API_KEY` still wins.
 
 ## Safety model
 

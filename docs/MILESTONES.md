@@ -371,7 +371,7 @@ extractor picker (`PLAN.md` § First-run setup flow).
 
 ---
 
-## M5 (memory parts) — State, spend and lenient clients            (implemented 2026-10-11, branch `feat/memory-ui`)
+## Pre-rescope M5 (memory parts) — State, spend and lenient clients            (implemented 2026-10-11, branch `feat/memory-ui`)
 
 Only what learned memory needs from M5. Token analysis proper (cache-read warnings, standing-overhead
 target, staleness signals, `session.stale`) is **not** built, and M5 stays open.
@@ -412,7 +412,7 @@ session the connection created or attached; a fresh connection targets the confi
 
 ---
 
-## M6 (injected-note audit only) — Which notes shaped a turn            (implemented 2026-10-11, branch `feat/memory-ui`)
+## Pre-rescope M6 (injected-note audit only) — Which notes shaped a turn            (implemented 2026-10-11, branch `feat/memory-ui`)
 
 **Shipped.** The audit input M6 needs, nothing of M6's persistence. `ContextSource` returns an
 `InjectedContext { text, notes }`; `Session::prompt` emits `OutputEvent::Context` **after**
@@ -436,7 +436,7 @@ then; `PLAN.md` M6 keeps it.
 
 ---
 
-## M7 — Memory in the UI            (implemented 2026-10-11, branch `feat/memory-ui`)
+## Pre-rescope M7 — Memory in the UI            (implemented 2026-10-11, branch `feat/memory-ui`)
 
 **Shipped.** `memory.learned` (one per changed note, at most 8 per extraction, never for a reinforced
 note) and `memory.context`; `memory.list | forget | approve | clear | status` keyed by `cwd`, with
@@ -475,7 +475,7 @@ the panel on M6's list overlay (it is standalone); the panel header's spend brea
 In a one-shot `elefante "prompt"` the session closes before extraction usually finishes, so
 `memory: saved` rarely appears; only problems do.
 
-**Amended.** `MEMORY-UI-DESIGN.md` is now an implemented design, with the unbuilt parts marked;
+**Amended.** `MEMORY-UI-DESIGN.md` (deleted in the rescope; in history at `e0799ce:docs/MEMORY-UI-DESIGN.md`) is now an implemented design, with the unbuilt parts marked;
 `DEVELOPER_GUIDE.md` § 5 gained **Memory wire**; `PLAN.md` marks M3.1 and the memory parts of M5, M6 and
 M7 shipped.
 
@@ -484,7 +484,7 @@ M7 shipped.
 ## PR #15 review remediation            (implemented 2026-10-11, branch `fix/agent-memory-use`)
 
 Two adversarial reviews of PR #15 found the defects below; each was reproduced by a failing test
-first, then fixed. Plan: `docs/PR15-REVIEW-FIXES-PLAN.md`.
+first, then fixed. Plan: `e0799ce:docs/PR15-REVIEW-FIXES-PLAN.md`.
 
 - **Revoking consent now stops a running learner** (was: dropped the session's handle but left the
   learner retrying and reporting). `Learner::cancel()` forgets what is waiting, drops a call in
@@ -532,7 +532,7 @@ prompt-cache check and all three CLI live tests passed, including
 **Still not covered by a test:** the `.elefante` bypass classes in the known-gaps list (asserted as
 `Allow` precisely so the limit is documented), and the bun-built binary against a real older daemon.
 The agent-behaviour change still has no before/after measurement on real models (plan § 5 of
-`AGENT-MEMORY-USE-PLAN.md`).
+`e0799ce:docs/AGENT-MEMORY-USE-PLAN.md`; the protocol now lives in `PLAN.md` M7).
 
 **Deferred, with reasons.** The learner's held history grows for the whole session (needs the
 watermark/history ownership reworked); both parsers reject a *new value* of a known enum (a protocol
@@ -541,4 +541,40 @@ notes may rank below code in unfiltered search (unmeasured; predates this work).
 
 ---
 
-_Next: M4 — critics._
+## Rescope            (2026-10-19)
+
+Not a milestone: a decision about which milestones remain. The plan had grown wider than the four
+things the project is for — **security, sandboxing, memory (including isolated subagents) and
+adversarial review** — so `PLAN.md` was cut to those and its remaining milestones renumbered.
+
+**Renumbered.** The old M4 (critics) was never built and becomes **M5**. The old M5, M6 and M7 had
+shipped only their memory-facing parts; those entries above are relabelled "pre-rescope" and stay part
+of the baseline, and the rest of those milestones is cut. The new sequence is a five-crate
+consolidation, then **M4 Sandbox**, **M5 Critics**, **M6 Subagents** (a git worktree plus the M4
+sandbox per editing subagent, not containers), **M7 Memory depth**.
+
+**Cut**, each planned and none built: the model picker and catalogue, a guided first-run flow,
+capabilities from catalogue metadata, the `config.toml` role table, multi-model routing; staleness
+signals, `session.stale`, the `--sentinel` diagnostic, per-turn effort routing; the session picker,
+`session.list`/`resume`/`delete` and durable conversation history (the audit log survives, in M6);
+the Datadog sink; the plan critic; tmux panes; skills, hooks and plugins; further languages and import
+resolution; the user-level graph; provider beta features; memory-UI extras. Reasons are in `PLAN.md`
+§ Cut in the rescope.
+
+**Found while reviewing for the rescope** (by reading the code; none of it was run): an allowed
+`cargo test` executes repository code with the user's privileges and network; bash inherits the
+daemon's whole environment, `OPENROUTER_API_KEY` included when it was exported, and runs as a login
+shell; read-only commands such as `cat` can read outside the workspace, which the `read` tool cannot;
+bash has no timeout; and model-facing tool output has no size cap (only the 2 KiB client preview is
+cut). Each becomes an M4 gate item rather than another classifier rule.
+
+**Docs.** `M3-DESIGN.md`, `MEMORY-UI-DESIGN.md`, `PR15-REVIEW-FIXES-PLAN.md` and
+`AGENT-MEMORY-USE-PLAN.md` were deleted; they remain in history at `e0799ce:docs/<name>`. What they
+still held that nothing else did moved first: the learned-memory residual risk into
+`DEVELOPER_GUIDE.md` § 9, and the open questions on tombstones, per-repository consent and a
+cross-vendor extractor, with the agent-memory measurement protocol, into `PLAN.md` M7. `PLAN.md` also
+stopped calling the shipped key prompt "planned".
+
+---
+
+_Next: consolidation to five crates, then M4 — sandbox._

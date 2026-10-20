@@ -6,7 +6,7 @@ architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
 
 ## 1. Current scope
 
-The repository is at M3, plus M3.1 and the memory-facing parts of M5, M6 and M7 (see `MILESTONES.md`): a provider-backed coding loop behind a daemon, driven by either a
+The repository is at M3, plus M3.1 and the memory-facing parts of the pre-rescope M5, M6 and M7 (see `MILESTONES.md`); what comes next is in `PLAN.md` § Milestones: a provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
 relevant context and gives the model a search tool, and durable notes learned from conversations.
 The implemented vertical slice can:
@@ -473,7 +473,7 @@ Server → client notifications:
 | `memory.context` | `{ notes }` — carries the turn's `turn_id` |
 
 `approval.requested` carries **no `reason`**: `BashDecision` has `verdict` and `rule` only, and
-a prose reason is the M4 triage-critic verdict.
+a prose reason is the M5 triage-critic verdict.
 
 `approval.resolved` is required by fanout — with several clients attached, one resolves the
 prompt and the rest must dismiss their modal.
@@ -778,7 +778,7 @@ Six independent flags describe what may be sent or observed:
 | `adaptive_thinking` | The model reasons before answering. |
 | `effort` | The model accepts `reasoning: { effort }`. |
 | `prompt_caching` | Stable system/tool cache breakpoints may be sent. |
-| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. No core caller yet. Repository context is deliberately an ephemeral `user` message rather than a `system` one, so its first consumer is M4, where critic findings are harness-authored and `system` is correct. |
+| `mid_conversation_system` | `true` for OpenRouter — an OpenAI-shaped `messages` array accepts a `system` role at any position. No core caller yet. Repository context is deliberately an ephemeral `user` message rather than a `system` one, and M5's critic findings are one too, because a finding can quote diff text the repository controls. No consumer is planned. |
 | `structured_output` | Strict schemas may be requested. |
 | `cache_metrics` | Cache creation/read usage is observable. |
 
@@ -1011,6 +1011,16 @@ removing one costs a leak.
 
 The scrubber is defense in depth, not permission to weaken path or shell policy.
 
+### Learned memory: residual risk
+
+Verification bounds what a learned note can say; it cannot make a note true. The extractor can still
+pick a real quote from the user and pair it with a misleading plain-prose statement that passes every
+mechanical check. What limits the damage: the statement is short, scrubbed, escaped and framed as
+unverified; payload-shaped tokens (commands, URLs, paths, identifiers) must appear in the user's own
+words; assistant-only claims are `pending` and never reach a prompt; and `elefante memory` can list and
+remove anything. Storing only the quote itself would remove the risk and was not chosen, because a
+user's phrasing depends on its context and cannot represent facts the assistant established.
+
 ## 10. Configuration and CLI behavior
 
 Configuration precedence and defaults:
@@ -1177,15 +1187,13 @@ When behavior changes, update:
   to the file goes with it and the note stays, found by its words. Retrieval is lexical, so a note
   phrased in vocabulary the prompt never uses is not found. There is no transcript compaction;
   one added later must call `Learner::flush` before dropping history.
-- Memory spend is accumulated and shown; the rest of token accounting and staleness reporting
-  waits for M5 proper.
+- Memory spend is accumulated and shown; cost per role and a cache-hit warning arrive with M5.
 - Forgetting a note is not durable: the same preference, said again, can be saved again. Consent is
-  per user and extractor, not per repository, and a fresh attach does not summarise what was learned
-  while the client was away. `docs/MEMORY-UI-DESIGN.md` § 13 keeps the open questions.
-- There is no model-backed critic.
+  per user and extractor, not per repository. Both are M7 (`PLAN.md`).
+- There is no model-backed critic (M5).
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and
   sessions live only in daemon memory — they end with `session.close` or the daemon's idle exit.
-  `PLAN.md` § Session picker and milestone M6 cover the list and durable history.
+  Durable conversation history was cut in the rescope; M6's audit log records tool activity.
 - The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
   time-of-check/time-of-use filesystem races.
 

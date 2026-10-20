@@ -6,7 +6,7 @@ runs a model.** Everything here is deterministic, which is what lets a fixture r
 co-change weights be computed by hand and a query's output be byte-identical across runs.
 
 Nothing here talks to a provider or a socket. `elefante-core` turns a retrieval into a message
-and `elefante-srv` decides when to refresh; this crate only knows how to build, store and query
+and the daemon (`elefante::daemon`) decides when to refresh; this crate only knows how to build, store and query
 the graph.
 
 ## Layout

@@ -59,30 +59,27 @@ elefante/
   docs/DEVELOPER_GUIDE.md    # shipped behaviour, incl. the wire contract (§5)
   docs/LOCKFILE.md           # why tui/ commits exactly one lockfile
   crates/
-    rpc/                     # wire types shared by daemon and client (no deps on others)
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
-    guard/                   # PathPolicy, BashClassifier, Scrubber
-    mem/                     # graph store, indexer, retrieval, cache
-    core/                    # session, turn loop, context assembly, learner; tools: read, write, edit, glob, grep, bash, memory_search
-    srv/                     # daemon binary: socket, session registry
-    cli/                     # `elefante` binary: spawns daemon, launches client
+    guard/                   # PathPolicy, BashClassifier, Scrubber; sandbox policy (M4)
+    mem/                     # graph store, indexer, retrieval, cache, learned notes
+    core/                    # session, turn loop, context, learner, tools; critics (M5), subagents (M6)
+    elefante/                # the one binary: wire/ types, daemon/ (`elefante daemon`), client/
   tui/                       # Bun + @opentui/core client (TypeScript)
 ```
 
 **Dependency direction is a constraint, not an accident:**
 
 ```
-cli   ──► rpc, mem
-srv   ──► core, mem, rpc, provider
-core  ──► provider, mem, guard   (core::tools uses PathPolicy at the syscall boundary)
-mem   ──► guard            (Scrubber on the write path)
-rpc   ──► provider         (re-exports Usage and StopReason)
-guard ──► (nothing)
+elefante ──► core, mem, provider
+core     ──► provider, mem, guard   (core::tools uses PathPolicy at the syscall boundary)
+mem      ──► guard                  (Scrubber on the write path)
+guard    ──► (nothing)
+provider ──► (nothing)
 ```
 
 `guard` must never depend on `core`, `mem` or `provider`. The practical consequence: `guard` is pure policy — it decides, it never performs. This is what makes the whole gate layer unit-testable without a filesystem or a network. Critics need a model, so they live in `core` (M5), not in `guard`: `mem` depends on `guard`, and a `guard → provider` edge would pull the HTTP stack into the memory crate.
 
-**Consolidation to five crates (in progress, before M4).** Eight crates was more seams than the pillars need. `tools` has merged into `core` as `core::tools`; `rpc`, `srv` and `cli` merge into one `elefante` crate and one binary, with `elefante daemon` in place of a separate `elefante-srv`. The result is `provider`, `guard`, `mem`, `core`, `elefante`. This section is rewritten to the new layout in the same changes that make it.
+Five crates, after the consolidation (§ Milestones › Consolidation): eight was more seams than the pillars need. `tools` became `core::tools`; `rpc`, `srv` and `cli` became one `elefante` crate and one binary. Client and daemon now share a crate, so one rule the old graph enforced is now a rule of review: **the client never runs a turn** — it always goes through the socket.
 
 Key crates: `tokio 1.53`, `reqwest 0.13`, `rusqlite 0.40` (bundled + FTS5), `tree-sitter 0.27` (+ `tree-sitter-bash`), `blake3 1.8`, `moka 0.12`, `ignore`, `serde`/`serde_json`.
 
@@ -185,7 +182,7 @@ capabilities stay a conservative prefix table that defaults to all-false.
 
 ```
   ┌──────────────┐                     ┌──────────────────────────────┐
-  │ elefante-cli │──spawns if absent──►│        elefante-srv          │
+  │   elefante   │──starts if absent──►│       elefante daemon        │
   └──────┬───────┘                     │  ┌────────────────────────┐  │
          │ spawns                      │  │   Session registry     │  │
          ▼                             │  │  (many sessions, 1..n  │  │
@@ -200,7 +197,7 @@ capabilities stay a conservative prefix table that defaults to all-false.
                                        └──────────────────────────────┘
 ```
 
-Socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to `~/.elefante/run/elefante.sock`, mode `0600`. The CLI connects, and spawns the daemon only if the connect fails. The daemon exits after a configurable idle period with zero attached clients.
+Socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to `~/.elefante/run/elefante.sock`, mode `0600`. A client connects, and starts the daemon (its own executable, as `elefante daemon`) only if the connect fails. The daemon exits after a configurable idle period with zero attached clients.
 
 **Why the daemon exists even for single-user CLI use:** it is what lets subagents (M6) run as further sessions beside the parent, sharing one warm memory store and one set of provider connections, and lets a client attach to any of them with the existing `session.attach`. Retrofitting that onto an in-process design is the expensive path, so the split is paid for up front and is cheap now.
 
@@ -211,7 +208,7 @@ an agent did, which serves security rather than convenience.
 
 ---
 
-## The RPC protocol (`elefante-rpc`)
+## The RPC protocol (`elefante::wire`)
 
 Newline-delimited JSON, JSON-RPC 2.0 shaped, bidirectional over one unix socket. Requests carry ids; streaming uses server→client notifications, because the TUI needs sub-frame latency and polling would jitter.
 
@@ -660,21 +657,26 @@ milestones planned was cut (§ Cut in the rescope) or moved into M4–M7 below.
 
 ### Consolidation (before M4)
 
+**Implemented** (record in [`MILESTONES.md`](./MILESTONES.md)).
+
 **Baseline.** Eight crates become five. `tools` moves into `core` as `core::tools`. `rpc`, `srv` and
 `cli` become one `elefante` crate and one binary: `wire/`, `daemon/` and `client/` modules, with
 `elefante daemon` in place of `elefante-srv`, and a client that starts the daemon by running its own
-executable rather than looking for a sibling binary. `elefante memory` goes through the daemon only;
-the direct-store path and the "older daemon" fallbacks are deleted, and a `version` field on the
-create/attach results replaces them by telling the user to restart a daemon from another build. The
-scripted stub provider is compiled only into debug builds. No behaviour visible to the model or the
-TUI changes.
+executable rather than looking for a sibling binary. `elefante memory` goes through the daemon only,
+starting one if needed; the direct-store path and the "older daemon" fallbacks are deleted. A daemon
+that answers "method not found" is named as an older build, with how to stop it, and nothing is
+worked around. (A `version` field on create/attach was planned for this and dropped: every crate is
+version 0.1.0, so it would have detected nothing.) The scripted stub provider is compiled only into
+debug builds. No behaviour visible to the model or the TUI changes.
 
 **Gate.**
 - `cargo metadata --no-deps` lists exactly `elefante`, `elefante-core`, `elefante-guard`,
   `elefante-mem`, `elefante-provider`.
-- The test count is unchanged except for the deleted direct-mode CLI memory tests, listed by name.
+- No test is lost: the direct-mode `elefante memory` tests run through the binary and a daemon it
+  starts, so the gate items they carried (hostile rows sanitised, an unstamped store shows nothing,
+  consent per extractor) still hold.
 - With no daemon running, a one-shot prompt and every `elefante memory` subcommand start one and work.
-- A client against a daemon of another version prints the restart message.
+- A daemon that lacks a method is named as an older build, and nothing is written around it.
 - A release build contains no `ELEFANTE_STUB_PROVIDER`.
 - **M0–M3 gates still green**, credentialed ones included, since the client and daemon paths moved.
 

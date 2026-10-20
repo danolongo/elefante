@@ -294,7 +294,7 @@ pub struct MemoryStatus {
     pub extractor: Option<String>,
     pub notes: MemoryNoteCounts,
     pub index: MemoryIndexState,
-    pub spend: crate::Usage,
+    pub spend: super::Usage,
     pub problem: Option<String>,
 }
 

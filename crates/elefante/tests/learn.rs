@@ -4,14 +4,14 @@
 
 use std::{fs, path::Path, time::Duration};
 
+use elefante::daemon::{DaemonConfig, LearnMode, run};
+use elefante::wire::Usage;
 use elefante_mem::{
     MemKey, RepoId, Store,
     consent::{self, CONSENT_FILE, ConsentAnswer, ConsentRecord},
     learn,
     trust::KEY_FILE,
 };
-use elefante_rpc::Usage;
-use elefante_srv::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},

@@ -1,4 +1,4 @@
-use crate::{MemoryChange, MemoryNote, MemoryStatus, StopReason, Usage, encode_frame};
+use super::{MemoryChange, MemoryNote, MemoryStatus, StopReason, Usage, encode_frame};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 

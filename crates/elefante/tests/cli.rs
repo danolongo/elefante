@@ -89,7 +89,7 @@ fn an_empty_prompt_reports_usage_rather_than_calling_the_provider() {
 /// ```sh
 /// export OPENROUTER_API_KEY="..."
 /// export OPENROUTER_MODEL="..."   # optional; a cheap tool-capable slug is fine
-/// cargo test -p elefante-cli -- --ignored --nocapture
+/// cargo test -p elefante -- --ignored --nocapture
 /// ```
 ///
 /// It runs in a temporary directory rather than this repository, so a model that

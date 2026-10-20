@@ -3,7 +3,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, LearnMode, run};
+use elefante::daemon::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},

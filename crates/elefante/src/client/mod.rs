@@ -1,7 +1,7 @@
 //! Rendering for the daemon client. Each output stream owns its renderer.
 pub mod memory;
 
-use elefante_rpc::{Notification, NotificationEvent};
+use crate::wire::{Notification, NotificationEvent};
 use std::io::{self, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,10 +95,10 @@ impl<W: Write> StreamRenderer<W> {
             }
             E::TurnFinished { stop_reason, .. } => {
                 match stop_reason {
-                    elefante_rpc::StopReason::Refusal => {
+                    crate::wire::StopReason::Refusal => {
                         self.write(Channel::Status, "provider refused the request\n", false)
                     }
-                    elefante_rpc::StopReason::Interrupted => {
+                    crate::wire::StopReason::Interrupted => {
                         self.write(Channel::Status, "interrupted\n", false)
                     }
                     _ => Ok(()),

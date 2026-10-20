@@ -1,4 +1,4 @@
-use elefante_rpc::*;
+use elefante::wire::*;
 use serde_json::{Value, json};
 
 #[test]

@@ -1,6 +1,6 @@
 use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
 
-use elefante_srv::{DaemonConfig, LearnMode, run};
+use elefante::daemon::{DaemonConfig, LearnMode, run};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -151,7 +151,7 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
     for (index, note) in one.iter().enumerate() {
         assert_eq!(note["seq"], (index + 1) as u64);
         assert_eq!(note["session_id"], session);
-        serde_json::from_value::<elefante_rpc::Notification>(note.clone()).unwrap();
+        serde_json::from_value::<elefante::wire::Notification>(note.clone()).unwrap();
     }
     let mut seq = one.last().unwrap()["seq"].as_u64().unwrap();
     drop(first);
@@ -196,7 +196,7 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
         snapshot["result"]["snapshot"]["turns"][0]["text"],
         "hello world"
     );
-    serde_json::from_value::<elefante_rpc::AttachResult>(snapshot["result"].clone()).unwrap();
+    serde_json::from_value::<elefante::wire::AttachResult>(snapshot["result"].clone()).unwrap();
 }
 
 #[tokio::test]
@@ -609,7 +609,7 @@ async fn missing_key_is_application_error_and_invalid_cwd_is_rejected() {
 async fn oversized_and_unterminated_frames_close_connection() {
     let daemon = Daemon::start(None, Duration::from_secs(20)).await;
     let mut client = daemon.client().await;
-    let huge = vec![b' '; elefante_srv::MAX_LINE_BYTES + 2];
+    let huge = vec![b' '; elefante::daemon::MAX_LINE_BYTES + 2];
     let _ = client.write.write_all(&huge).await;
     let mut line = String::new();
     let result = tokio::time::timeout(Duration::from_secs(2), client.read.read_line(&mut line))

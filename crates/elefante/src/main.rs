@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
-use elefante_cli::StreamRenderer;
-use elefante_rpc::{
+use elefante::client::StreamRenderer;
+use elefante::wire::{
     MAX_FRAME_BYTES, Notification, NotificationEvent, Sequence, decode_frame, encode_frame,
 };
 use serde_json::{Value, json};
@@ -16,7 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear|learn>\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const USAGE: &str = "usage: elefante [--model MODEL] [--effort LEVEL] [--max-rounds N] [--max-tokens N] [PROMPT ...]\n       elefante memory <list|forget|approve|clear|learn>\n       elefante daemon\n\nWith a prompt, stream a headless daemon session. With no prompt, launch the TUI. A client starts the daemon when none is listening; `elefante daemon` runs it in the foreground. Optional: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, ELEFANTE_EFFORT.";
+const OLDER_DAEMON: &str = "the running daemon is from an older build of elefante; stop it (`pkill -f elefante-srv` or `pkill -f 'elefante daemon'`) and try again";
 const PAUSED_NOTICE: &str = "memory: learning is paused (not set up) — run “elefante memory learn on” or set ELEFANTE_LEARN=1";
 
 fn learning_is_paused(create_result: &Value) -> bool {
@@ -104,33 +105,21 @@ fn socket_path() -> anyhow::Result<PathBuf> {
             .join(".elefante/run/elefante.sock"),
     )
 }
-fn daemon_binary() -> anyhow::Result<PathBuf> {
-    let exe = env::current_exe().context("cannot locate the elefante executable")?;
-    let sibling = exe.with_file_name("elefante-srv");
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-    if exe.parent().is_some_and(|dir| dir.ends_with("deps"))
-        && let Some(profile) = exe.parent().and_then(Path::parent)
-    {
-        let sibling = profile.join("elefante-srv");
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-    Ok(PathBuf::from("elefante-srv"))
-}
+/// Connects to the daemon at `path`, starting one — this same executable, as `elefante daemon` —
+/// when none is listening.
 fn connect(path: &Path) -> anyhow::Result<UnixStream> {
     if let Ok(stream) = UnixStream::connect(path) {
         return Ok(stream);
     }
-    let mut child = Command::new(daemon_binary()?)
+    let exe = env::current_exe().context("cannot locate the elefante executable")?;
+    let mut child = Command::new(exe)
+        .arg("daemon")
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to spawn elefante-srv; install it beside elefante or on PATH")?;
+        .context("failed to start the elefante daemon")?;
     let mut stderr = child
         .stderr
         .take()
@@ -164,13 +153,13 @@ fn connect(path: &Path) -> anyhow::Result<UnixStream> {
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default();
             bail!(
-                "elefante-srv exited during startup ({status}): {}",
+                "the daemon exited during startup ({status}): {}",
                 output.trim()
             );
         }
         if Instant::now() >= deadline {
             bail!(
-                "elefante-srv did not become ready within 2 seconds at {}",
+                "the daemon did not become ready within 2 seconds at {}",
                 path.display()
             );
         }
@@ -417,83 +406,86 @@ fn stream_turn(client: &mut Client, path: &Path, session: &str) -> anyhow::Resul
     err.finish()?;
     result
 }
-/// Whether the daemon answered "method not found" (-32601): it is older than the request.
-fn is_method_not_found(error: &anyhow::Error) -> bool {
+/// The JSON-RPC error code the daemon answered with, when `error` is a daemon error.
+fn rpc_code(error: &anyhow::Error) -> Option<i64> {
     error
         .downcast_ref::<RpcFailure>()
-        .is_some_and(|failure| failure.code == -32601)
+        .map(|failure| failure.code)
 }
+/// `elefante daemon`: serve the socket in the foreground until the idle timeout.
+fn run_daemon() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?
+        .block_on(elefante::daemon::run_from_env())
+}
+
+/// `elefante memory …`, always through the daemon. Returns the process exit code.
+fn run_memory(args: &[String]) -> anyhow::Result<i32> {
+    use elefante::client::memory::{self, Command as MemoryCommand};
+    let cwd = env::current_dir().context("failed to determine current directory")?;
+    let (method, params, extractor) = match memory::parse(args, &cwd)? {
+        MemoryCommand::Usage(code) => {
+            println!("{}", memory::USAGE);
+            return Ok(code);
+        }
+        MemoryCommand::Confirm(explanation) => {
+            println!("{explanation}");
+            return Ok(2);
+        }
+        MemoryCommand::Learn(request) => (
+            "memory.consent",
+            json!({"answer":request.answer,"extractor":request.extractor}),
+            Some(request.extractor),
+        ),
+        MemoryCommand::Repository(method, params) => (method, params, None),
+    };
+    let mut client = Client::new(connect(&socket_path()?)?);
+    let result = match client.request(method, params) {
+        Ok(result) => result,
+        Err(error) if rpc_code(&error) == Some(-32601) => bail!(OLDER_DAEMON),
+        Err(error) if rpc_code(&error) == Some(i64::from(elefante::wire::UNKNOWN_NOTE)) => {
+            let id = args.get(1).map_or("?", String::as_str);
+            let state = if args[0] == "approve" {
+                "pending"
+            } else {
+                "learned"
+            };
+            println!("no {state} note {id}");
+            return Ok(1);
+        }
+        Err(error) if rpc_code(&error) == Some(i64::from(elefante::wire::MEMORY_OFF)) => {
+            let message = error
+                .downcast_ref::<RpcFailure>()
+                .map_or_else(String::new, |failure| failure.message.clone());
+            println!(
+                "memory is unavailable here: {}",
+                elefante_mem::learn::display_safe(&message)
+            );
+            return Ok(1);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(extractor) = extractor {
+        let consent = result["consent"]
+            .as_str()
+            .context("memory.consent returned no consent state")?;
+        println!("{}", memory::learn_report(consent, &extractor));
+        return Ok(0);
+    }
+    memory::render_daemon_result(args, &result, &mut io::stdout())
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("memory") {
-        let cwd = env::current_dir().context("failed to determine current directory")?;
-        if let Some(request) = elefante_cli::memory::learn_request(&args[1..])? {
-            let path = socket_path()?;
-            if let Ok(stream) = UnixStream::connect(path) {
-                let mut client = Client::new(stream);
-                match client.request(
-                    "memory.consent",
-                    json!({"answer":request.answer,"extractor":request.extractor}),
-                ) {
-                    Ok(result) => {
-                        let consent = result["consent"]
-                            .as_str()
-                            .context("memory.consent returned no consent state")?;
-                        println!(
-                            "{}",
-                            elefante_cli::memory::learn_report(consent, &request.extractor)
-                        );
-                        return Ok(());
-                    }
-                    // A daemon from before consent control: record the answer in the file, and say
-                    // plainly that the running daemon will not see it until it restarts.
-                    Err(error) if is_method_not_found(&error) => {
-                        eprintln!(
-                            "warning: the running daemon predates consent control; restart it \
-                             (pkill elefante-srv) for this to take effect"
-                        );
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+    match args.first().map(String::as_str) {
+        Some("daemon") if args.len() == 1 => return run_daemon(),
+        Some("memory") => {
+            let code = run_memory(&args[1..])?;
+            std::process::exit(code);
         }
-        if let Some((method, params)) = elefante_cli::memory::daemon_request(&args[1..], &cwd)?
-            && let Ok(stream) = UnixStream::connect(socket_path()?)
-        {
-            let mut client = Client::new(stream);
-            match client.request(method, params) {
-                Ok(result) => {
-                    let code = elefante_cli::memory::render_daemon_result(
-                        &args[1..],
-                        &result,
-                        &mut io::stdout(),
-                    )?;
-                    std::process::exit(code);
-                }
-                Err(error)
-                    if error.downcast_ref::<RpcFailure>().is_some_and(|failure| {
-                        failure.code == i64::from(elefante_rpc::UNKNOWN_NOTE)
-                    }) =>
-                {
-                    let id = args.get(2).map_or("?", String::as_str);
-                    println!(
-                        "no {} note {id}",
-                        if args.get(1).is_some_and(|command| command == "approve") {
-                            "pending"
-                        } else {
-                            "learned"
-                        }
-                    );
-                    std::process::exit(1);
-                }
-                // A daemon from before memory control: read the store directly, as before.
-                Err(error) if is_method_not_found(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let key_path = elefante_mem::MemKey::default_path().context("HOME is not set")?;
-        let code = elefante_cli::memory::run(&args[1..], &cwd, &key_path, &mut io::stdout())?;
-        std::process::exit(code);
+        _ => {}
     }
     let options = Options::parse()?;
     let path = socket_path()?;

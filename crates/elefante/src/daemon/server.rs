@@ -10,6 +10,11 @@ use std::{
     time::Duration,
 };
 
+use crate::wire::{
+    MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
+    MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
+    UNKNOWN_NOTE, Usage, truncate_preview,
+};
 use anyhow::Context as _;
 use elefante_core::tools::ToolExecutor;
 use elefante_core::{
@@ -30,11 +35,6 @@ use elefante_mem::{
     trust::KEY_FILE,
 };
 use elefante_provider::{Message, OpenRouterProvider, Provider};
-use elefante_rpc::{
-    MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
-    MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
-    UNKNOWN_NOTE, Usage, truncate_preview,
-};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::{
@@ -45,7 +45,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{MAX_LINE_BYTES, RING_CAPACITY, credentials, queue::ClientQueue, stub::StubProvider};
+#[cfg(debug_assertions)]
+use super::stub::StubProvider;
+use super::{MAX_LINE_BYTES, RING_CAPACITY, credentials, queue::ClientQueue};
 
 /// Startup configuration captured once, rather than reading mutable process state per turn.
 #[derive(Clone)]
@@ -116,7 +118,12 @@ impl DaemonConfig {
     /// # Errors
     /// Rejects invalid idle durations, unavailable home paths, and non-isolated stubs.
     pub fn from_env() -> anyhow::Result<Self> {
+        // The scripted provider exists for tests. A release build never reads the variable, so it
+        // cannot be switched to a script by its environment.
+        #[cfg(debug_assertions)]
         let stub_provider = env::var_os("ELEFANTE_STUB_PROVIDER").map(PathBuf::from);
+        #[cfg(not(debug_assertions))]
+        let stub_provider: Option<PathBuf> = None;
         anyhow::ensure!(
             stub_provider.is_none() || env::var_os("ELEFANTE_SOCKET").is_some(),
             "ELEFANTE_STUB_PROVIDER requires ELEFANTE_SOCKET"
@@ -427,7 +434,13 @@ fn make_provider(
     stored_key: Option<String>,
 ) -> anyhow::Result<Option<Arc<dyn Provider>>> {
     if let Some(path) = &config.stub_provider {
+        #[cfg(debug_assertions)]
         return Ok(Some(Arc::new(StubProvider::load(path)?)));
+        #[cfg(not(debug_assertions))]
+        anyhow::bail!(
+            "a scripted provider ({}) needs a debug build",
+            path.display()
+        );
     }
     let Some(key) = config.api_key.clone().or(stored_key) else {
         return Ok(None);
@@ -815,14 +828,14 @@ async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()
 }
 
 fn response(id: Value, result: Value) -> Value {
-    serde_json::to_value(elefante_rpc::Response {
+    serde_json::to_value(crate::wire::Response {
         id,
-        payload: elefante_rpc::ResponsePayload::Result(result),
+        payload: crate::wire::ResponsePayload::Result(result),
     })
     .expect("response serialization")
 }
 fn error(id: Value, code: i32, message: &str) -> Value {
-    serde_json::to_value(elefante_rpc::Response::error(id, code, message))
+    serde_json::to_value(crate::wire::Response::error(id, code, message))
         .expect("error serialization")
 }
 

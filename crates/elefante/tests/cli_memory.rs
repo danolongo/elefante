@@ -1,8 +1,15 @@
 //! `elefante memory`: the person's view of, and control over, what was learned.
+//!
+//! Every test drives the real binary, which starts a real daemon on a private socket when none is
+//! listening — the only way these commands reach a store.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
-use elefante_cli::memory;
+use elefante::client::memory::{self, Command as MemoryCommand};
 use elefante_mem::{
     MemKey, RepoId, Store,
     consent::{self, ConsentAnswer},
@@ -12,9 +19,10 @@ use elefante_mem::{
 
 struct Fixture {
     _tmp: tempfile::TempDir,
-    repo: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    home: std::path::PathBuf,
+    repo: PathBuf,
+    key_path: PathBuf,
+    home: PathBuf,
+    socket: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -27,8 +35,32 @@ fn fixture() -> Fixture {
         repo: repo.canonicalize().unwrap(),
         key_path,
         home,
+        socket: tmp.path().join("run/s.sock"),
         _tmp: tmp,
     }
+}
+
+/// The binary, isolated to the fixture: its own home, its own socket, a daemon that exits soon
+/// after the test, and none of the caller's memory switches.
+fn elefante(home: &Path, socket: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_elefante"));
+    command
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("ELEFANTE_SOCKET", socket)
+        .env("ELEFANTE_IDLE_SECS", "1")
+        .env_remove("ELEFANTE_MEMORY")
+        .env_remove("ELEFANTE_LEARN")
+        .env_remove("ELEFANTE_STUB_PROVIDER");
+    command
+}
+
+fn run(f: &Fixture, args: &[&str]) -> Output {
+    elefante(&f.home, &f.socket, &f.repo)
+        .arg("memory")
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn candidate(label: &str, statement: &str, quote: &str) -> Candidate {
@@ -91,10 +123,11 @@ fn teach(f: &Fixture) -> (i64, i64) {
 }
 
 fn cmd(f: &Fixture, args: &[&str]) -> (i32, String) {
-    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    let mut out = Vec::new();
-    let code = memory::run(&args, &f.repo, &f.key_path, &mut out).unwrap();
-    (code, String::from_utf8(out).unwrap())
+    let output = run(f, args);
+    (
+        output.status.code().unwrap(),
+        String::from_utf8(output.stdout).unwrap(),
+    )
 }
 
 #[test]
@@ -241,7 +274,7 @@ fn every_database_supplied_column_is_sanitized_before_display() {
 }
 
 #[test]
-fn an_unstamped_store_prints_only_an_explanation() {
+fn an_unstamped_store_shows_no_notes_and_is_left_alone() {
     let f = fixture();
     let dir = f.repo.join(".elefante");
     fs::create_dir_all(&dir).unwrap();
@@ -257,14 +290,16 @@ fn an_unstamped_store_prints_only_an_explanation() {
     )
     .unwrap();
     drop(conn);
+    let before = fs::read(dir.join("memory.db")).unwrap();
 
+    let (code, out) = cmd(&f, &["list"]);
+    assert_eq!(code, 1);
     assert_eq!(
-        cmd(&f, &["list"]),
-        (
-            0,
-            "memory store is not from this Elefante installation; no notes shown\n".to_owned()
-        )
+        out,
+        "memory is unavailable here: memory here was not made by this installation\n"
     );
+    assert!(!out.contains("hostile row"), "{out}");
+    assert_eq!(fs::read(dir.join("memory.db")).unwrap(), before);
 }
 
 /// Alters a learned row without access to the key.
@@ -281,29 +316,37 @@ fn tamper(db: &Path, id: i64) {
 #[test]
 fn bad_arguments_are_explained_not_guessed() {
     let f = fixture();
-    teach(&f);
     let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    let run = |a: &[&str]| memory::run(&args(a), &f.repo, &f.key_path, &mut Vec::new());
-    assert!(run(&["forget"]).is_err());
-    assert!(run(&["forget", "one"]).is_err());
-    assert!(run(&["forget", "1", "2"]).is_err());
-    assert!(run(&["list", "--bogus"]).is_err());
-    assert!(run(&["frobnicate"]).is_err());
-    assert_eq!(run(&[]).unwrap(), 2);
-    assert_eq!(run(&["--help"]).unwrap(), 0);
+    let parse = |a: &[&str]| memory::parse(&args(a), &f.repo);
+    assert!(parse(&["forget"]).is_err());
+    assert!(parse(&["forget", "one"]).is_err());
+    assert!(parse(&["forget", "1", "2"]).is_err());
+    assert!(parse(&["list", "--bogus"]).is_err());
+    assert!(matches!(
+        parse(&["clear"]).unwrap(),
+        MemoryCommand::Confirm(_)
+    ));
+    assert!(parse(&["frobnicate"]).is_err());
+    assert_eq!(parse(&[]).unwrap(), MemoryCommand::Usage(2));
+    assert_eq!(parse(&["--help"]).unwrap(), MemoryCommand::Usage(0));
+
+    assert_eq!(run(&f, &["clear"]).status.code(), Some(2));
+    for bad in [&["forget", "one"][..], &["frobnicate"]] {
+        assert!(!run(&f, bad).status.success(), "{bad:?}");
+    }
+    assert_eq!(run(&f, &[]).status.code(), Some(2));
+    assert!(
+        !f.socket.exists(),
+        "a malformed command is refused before any daemon is started"
+    );
 }
 
 #[test]
-fn the_binary_dispatches_memory_commands_without_a_daemon() {
+fn a_memory_command_starts_a_daemon_when_none_is_listening() {
     let f = fixture();
     teach(&f);
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(&f.repo)
-        .env("HOME", &f.home)
-        .env_remove("ELEFANTE_SOCKET")
-        .args(["memory", "list"])
-        .output()
-        .unwrap();
+    assert!(!f.socket.exists());
+    let output = run(&f, &["list"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -311,24 +354,16 @@ fn the_binary_dispatches_memory_commands_without_a_daemon() {
         "{stdout}"
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(&f.repo)
-        .env("HOME", &f.home)
-        .args(["memory", "forget", "99999"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    let (code, out) = cmd(&f, &["forget", "99999"]);
+    assert_eq!((code, out.as_str()), (1, "no learned note 99999\n"));
 }
 
 #[test]
-fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
+fn memory_learn_writes_extractor_bound_consent_without_a_repo() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let socket = tmp.path().join("no-daemon.sock");
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(tmp.path())
-        .env("HOME", &home)
-        .env("ELEFANTE_SOCKET", &socket)
+    let socket = tmp.path().join("run/s.sock");
+    let output = elefante(&home, &socket, tmp.path())
         .env("ELEFANTE_EXTRACT_MODEL", " vendor/extractor ")
         .env("OPENROUTER_MODEL", "vendor/chat")
         .args(["memory", "learn", "on"])
@@ -351,10 +386,7 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
     assert_eq!(record.answer, ConsentAnswer::Learn);
     assert_eq!(record.extractor, "vendor/extractor");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(tmp.path())
-        .env("HOME", &home)
-        .env("ELEFANTE_SOCKET", &socket)
+    let output = elefante(&home, &socket, tmp.path())
         .env_remove("ELEFANTE_EXTRACT_MODEL")
         .env("OPENROUTER_MODEL", "vendor/chat")
         .args(["memory", "learn", "off"])
@@ -372,10 +404,7 @@ fn memory_learn_writes_extractor_bound_consent_without_a_repo_or_daemon() {
     assert_eq!(record.answer, ConsentAnswer::Off);
     assert_eq!(record.extractor, "vendor/chat");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(tmp.path())
-        .env("HOME", &home)
-        .env("ELEFANTE_SOCKET", &socket)
+    let output = elefante(&home, &socket, tmp.path())
         .env_remove("ELEFANTE_EXTRACT_MODEL")
         .env_remove("OPENROUTER_MODEL")
         .args(["memory", "learn", "on"])
@@ -395,14 +424,13 @@ fn memory_learn_rejects_bad_settings_before_resolving_a_repo() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     for args in [vec!["memory", "learn"], vec!["memory", "learn", "maybe"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-            .current_dir(tmp.path())
-            .env("HOME", &home)
-            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+        let socket = tmp.path().join("run/s.sock");
+        let output = elefante(&home, &socket, tmp.path())
             .args(args)
             .output()
             .unwrap();
         assert!(!output.status.success());
+        assert!(!socket.exists(), "refused before a daemon was started");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("memory learn"),
             "{output:?}"
@@ -414,11 +442,9 @@ fn memory_learn_rejects_bad_settings_before_resolving_a_repo() {
 fn memory_learn_names_the_model_and_an_answer_for_one_model_leaves_another_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
+    let socket = tmp.path().join("run/s.sock");
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_elefante"))
-            .current_dir(tmp.path())
-            .env("HOME", &home)
-            .env("ELEFANTE_SOCKET", tmp.path().join("no-daemon.sock"))
+        elefante(&home, &socket, tmp.path())
             .env_remove("ELEFANTE_EXTRACT_MODEL")
             .env("OPENROUTER_MODEL", "vendor/chat")
             .args(args)

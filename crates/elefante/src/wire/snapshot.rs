@@ -1,4 +1,4 @@
-use crate::{MemoryStatus, Notification, StopReason, Usage};
+use super::{MemoryStatus, Notification, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

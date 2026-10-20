@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::{io::AsyncWrite, sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::CLIENT_QUEUE_CAPACITY;
+use super::CLIENT_QUEUE_CAPACITY;
 
 /// The ring never enters this queue: only this disposable delivery copy merges.
 pub(crate) struct ClientQueue {
@@ -100,7 +100,7 @@ impl ClientQueue {
                 if delivery.in_flight.is_none()
                     && let Some(value) = delivery.items.pop_front()
                 {
-                    let bytes = elefante_rpc::encode_frame(&value).map_err(io::Error::other)?;
+                    let bytes = crate::wire::encode_frame(&value).map_err(io::Error::other)?;
                     delivery.in_flight = Some(Frame {
                         session_id: value["session_id"].as_str().map(str::to_owned),
                         bytes,
@@ -174,8 +174,8 @@ impl ClientQueue {
 
 fn merge(left: &mut Value, right: &Value) -> bool {
     let (Ok(mut first), Ok(second)) = (
-        serde_json::from_value::<elefante_rpc::Notification>(left.clone()),
-        serde_json::from_value::<elefante_rpc::Notification>(right.clone()),
+        serde_json::from_value::<crate::wire::Notification>(left.clone()),
+        serde_json::from_value::<crate::wire::Notification>(right.clone()),
     ) else {
         return false;
     };

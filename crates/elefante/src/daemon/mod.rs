@@ -3,6 +3,7 @@
 mod credentials;
 mod queue;
 mod server;
+#[cfg(debug_assertions)]
 mod stub;
 
 pub use server::{DaemonConfig, LearnMode, run, run_from_env, socket_path};

@@ -577,4 +577,39 @@ stopped calling the shipped key prompt "planned".
 
 ---
 
-_Next: consolidation to five crates, then M4 — sandbox._
+## Consolidation — eight crates to five            (implemented 2026-10-19, branch `rescope-pillars`)
+
+**Shipped.** `elefante-tools` is now `core::tools`. `elefante-rpc`, `elefante-srv` and `elefante-cli`
+are one `elefante` crate and one binary, with `wire/`, `daemon/` and `client/` modules; `elefante
+daemon` replaces the `elefante-srv` binary, and a client that finds no daemon starts its own
+executable as one instead of looking for a sibling. `elefante memory` goes only through the daemon
+(starting one if needed): the direct-store path and both "older daemon" fallbacks are gone, and a
+daemon that does not know a method is named as an older build. The scripted stub provider is
+compiled only into debug builds, so a release daemon cannot be switched to a script by its
+environment. Workspace: `elefante`, `elefante-core`, `elefante-guard`, `elefante-mem`,
+`elefante-provider`.
+
+**Gate.** `cargo fmt --check`, clippy under `-D warnings` in the debug and release profiles,
+`cargo +1.90.0 check`, and `cargo test --workspace`: **553 passed, 5 ignored — the same count as
+before the merge.** No test was deleted. The direct-mode `elefante memory` tests now drive the real
+binary, which starts a real daemon on a private socket; the gate items they carried still hold
+through that path (hostile rows sanitised, an unstamped store shows nothing and is left
+byte-identical, consent kept per extractor). Replaced, one for one: the sibling-binary startup test
+by one where the self-started daemon refuses an invalid setting and its reason reaches stderr; the
+two "older daemon" fallback tests by one asserting the named error and that nothing is written. New:
+`elefante daemon` serves in the foreground and exits when idle; a malformed memory command starts no
+daemon. A release build contains no `ELEFANTE_STUB_PROVIDER` string (the debug build does). No test
+left a daemon running.
+
+**Not run.** The credentialed suite, which this change requires because the client and daemon paths
+moved; it is now `cargo test -p elefante -- --ignored` plus the provider check. Nothing under `tui/`
+changed; `tsc --noEmit` and `bun test` (97 passed) were re-run anyway.
+
+**Deviations.** The planned `version` field on create/attach results was dropped: every crate is
+version 0.1.0, so it would have detected nothing. `elefante memory` on a store this installation did
+not stamp now exits 1 with the daemon's explanation (it exited 0 with its own wording); `clear`
+without `--yes` keeps its old exit code and wording.
+
+---
+
+_Next: M4 — sandbox._

@@ -32,13 +32,13 @@ Run the agent from the repository it should be allowed to modify:
 
 ```sh
 export OPENROUTER_API_KEY="..."
-cargo run -p elefante-cli -- "Inspect this repository and summarize its structure."
+cargo run -p elefante -- "Inspect this repository and summarize its structure."
 ```
 
 When no prompt argument is supplied, Elefante reads the prompt from standard input:
 
 ```sh
-printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante-cli
+printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante
 ```
 
 Useful options:

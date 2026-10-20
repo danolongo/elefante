@@ -2,30 +2,20 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     process::Command,
     thread,
     time::Duration,
 };
 
 #[test]
-fn sibling_daemon_startup_failure_reports_captured_stderr() {
+fn daemon_startup_failure_reports_captured_stderr() {
     let directory = tempfile::tempdir().unwrap();
-    let cli = directory.path().join("elefante");
-    std::fs::copy(env!("CARGO_BIN_EXE_elefante"), &cli).unwrap();
-    let daemon = directory.path().join("elefante-srv");
-    std::fs::write(
-        &daemon,
-        "#!/bin/sh\necho 'daemon startup detail' >&2\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let output = Command::new(cli)
-        .env("PATH", "")
+    // The client starts its own executable as the daemon; an invalid setting makes that daemon
+    // refuse to start, and its reason must reach the person rather than a timeout.
+    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
         .env("ELEFANTE_SOCKET", directory.path().join("socket"))
+        .env("ELEFANTE_IDLE_SECS", "not-a-number")
         .env_remove("ELEFANTE_EFFORT")
         .arg("hello")
         .output()
@@ -33,8 +23,35 @@ fn sibling_daemon_startup_failure_reports_captured_stderr() {
     assert!(!output.status.success());
     assert_eq!(output.stdout.len(), 0);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("daemon startup detail"), "{stderr}");
+    assert!(stderr.contains("invalid ELEFANTE_IDLE_SECS"), "{stderr}");
+    assert!(stderr.contains("exited during startup"), "{stderr}");
     assert!(!stderr.contains("within 2 seconds"), "{stderr}");
+}
+
+#[test]
+fn elefante_daemon_serves_the_socket_in_the_foreground() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("run/socket");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .arg("daemon")
+        .env("HOME", directory.path().join("home"))
+        .env("ELEFANTE_SOCKET", &socket)
+        .env("ELEFANTE_IDLE_SECS", "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited before listening"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never listened"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(daemon.wait().unwrap().success(), "exits cleanly when idle");
 }
 
 fn receive(peer: &mut BufReader<UnixStream>, method: &str) -> Value {
@@ -56,7 +73,7 @@ fn answer(peer: &mut BufReader<UnixStream>, request: &Value, result: &Value) {
 }
 
 #[test]
-fn memory_learn_prefers_a_listening_daemon_without_touching_the_local_file() {
+fn memory_learn_goes_to_the_listening_daemon_without_touching_the_local_file() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
     let home = directory.path().join("home");
@@ -90,7 +107,7 @@ fn memory_learn_prefers_a_listening_daemon_without_touching_the_local_file() {
 }
 
 #[test]
-fn memory_list_prefers_a_listening_daemon_and_renders_safe_rows() {
+fn memory_list_goes_to_the_listening_daemon_and_renders_safe_rows() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -251,62 +268,39 @@ fn refuse(peer: &mut BufReader<UnixStream>, request: &Value, code: i64) {
 }
 
 #[test]
-fn a_daemon_that_predates_memory_control_does_not_stop_the_cli_reading_the_store() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("socket");
-    let cwd = std::fs::canonicalize(directory.path()).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut peer = BufReader::new(stream);
-        let request = receive(&mut peer, "memory.list");
-        refuse(&mut peer, &request, -32601);
-    });
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(&cwd)
-        .env("HOME", directory.path().join("home"))
-        .env("ELEFANTE_SOCKET", &socket)
-        .args(["memory", "list"])
-        .output()
-        .unwrap();
-    server.join().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "no learned notes for this repository\n",
-        "fell back to the store, which has nothing"
-    );
-}
-
-#[test]
-fn memory_learn_against_a_daemon_that_predates_consent_writes_the_file_and_warns() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("socket");
-    let home = directory.path().join("home");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut peer = BufReader::new(stream);
-        let request = receive(&mut peer, "memory.consent");
-        refuse(&mut peer, &request, -32601);
-    });
-    let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
-        .current_dir(directory.path())
-        .env("HOME", &home)
-        .env("ELEFANTE_SOCKET", &socket)
-        .env("ELEFANTE_EXTRACT_MODEL", "vendor/extractor")
-        .args(["memory", "learn", "on"])
-        .output()
-        .unwrap();
-    server.join().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        output.stdout,
-        b"memory learning is granted for vendor/extractor\n"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("predates consent control"), "{stderr}");
-    assert!(home.join(".elefante/memory-consent").exists());
+fn a_daemon_that_predates_a_memory_command_is_named_not_worked_around() {
+    for (args, method) in [
+        (&["memory", "list"][..], "memory.list"),
+        (&["memory", "learn", "on"], "memory.consent"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("socket");
+        let home = directory.path().join("home");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut peer = BufReader::new(stream);
+            let request = receive(&mut peer, method);
+            refuse(&mut peer, &request, -32601);
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_elefante"))
+            .current_dir(directory.path())
+            .env("HOME", &home)
+            .env("ELEFANTE_SOCKET", &socket)
+            .env("ELEFANTE_EXTRACT_MODEL", "vendor/extractor")
+            .args(args)
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(output.stdout.len(), 0);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("older build"), "{stderr}");
+        assert!(
+            !home.join(".elefante").exists(),
+            "nothing is written around the daemon"
+        );
+    }
 }
 
 #[test]

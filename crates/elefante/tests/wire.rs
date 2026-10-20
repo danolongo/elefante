@@ -1,4 +1,4 @@
-use elefante_rpc::*;
+use elefante::wire::*;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::fmt::Debug;

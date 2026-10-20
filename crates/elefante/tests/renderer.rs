@@ -1,5 +1,5 @@
-use elefante_cli::StreamRenderer;
-use elefante_rpc::Notification;
+use elefante::client::StreamRenderer;
+use elefante::wire::Notification;
 use serde_json::{Value, json};
 
 fn note(method: &str, params: Value) -> Notification {
@@ -229,7 +229,7 @@ fn memory_events_leave_the_answer_stream_untouched() {
     ] {
         if matches!(
             event.event,
-            elefante_rpc::NotificationEvent::TextDelta { .. }
+            elefante::wire::NotificationEvent::TextDelta { .. }
         ) {
             answer.render(&event).unwrap();
         } else {

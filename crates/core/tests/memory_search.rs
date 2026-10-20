@@ -3,12 +3,12 @@
 use std::{fs, sync::Arc};
 
 use elefante_core::memory::MemSearchTool;
+use elefante_core::tools::{MemorySearch, MemorySearchRequest, SearchKind};
 use elefante_mem::{
     MemKey, RepoId, Store,
     learn::{self, Candidate, IngestInput, Kind, Relation, Speaker, Turn},
     retrieve::Retriever,
 };
-use elefante_tools::{MemorySearch, MemorySearchRequest, SearchKind};
 
 fn key() -> MemKey {
     MemKey::from_bytes([7; 32])

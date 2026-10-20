@@ -1,4 +1,4 @@
-use elefante_tools::{
+use elefante_core::tools::{
     MEMORY_SEARCH_DEFAULT_LIMIT, MemorySearch, MemorySearchRequest, SearchKind, ToolExecutor,
     definitions,
 };
@@ -495,7 +495,7 @@ async fn memory_search_accepts_note_and_a_bad_kind_names_every_valid_one() {
     assert!(!ok.is_error, "{ok:?}");
     assert_eq!(
         index.requests()[0].kind,
-        Some(elefante_tools::SearchKind::Note)
+        Some(elefante_core::tools::SearchKind::Note)
     );
 
     let bad = executor

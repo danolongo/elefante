@@ -72,10 +72,9 @@ elefante/
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/                     every crate carries its own README.md
     ├── cli/                       `elefante` terminal binary
-    ├── core/                      provider/tool conversation loop
+    ├── core/                      conversation loop + syscall-facing tool executor
     ├── provider/                  normalized model API + OpenRouter transport
     ├── guard/                     path, shell, and secret-output policy
-    ├── tools/                     schemas and syscall-facing tool executor
     ├── rpc/                       wire envelopes and framing
     ├── srv/                       daemon, session registry, ring
     └── mem/                       repository index: graph, indexer, retrieval
@@ -121,7 +120,7 @@ this; here it is as structure — which crate lives where, and what crosses each
                        ├──► elefante-guard      PathPolicy · BashClassifier · Scrubber
                        │                        decides; never performs
                        │
-                       ├──► elefante-tools ──► elefante-guard
+                       ├──► core::tools ──► elefante-guard
                        │         │             7 schemas; every path through the
                        │         │             policy, every result scrubbed at
                        │         ▼             one exit point
@@ -148,8 +147,7 @@ it, sharing no code — which is why the contract lives in `elefante-rpc` and se
 than inside either client, and why a change to it lands on both sides or lands broken.
 
 **There are exactly two egress points.** Everything that leaves this system leaves through
-`tools` (filesystem and `bash`) or `provider` (HTTPS). Both sit below `core`, and `guard` sits
-beside them depending on nothing — so the policy layer is exercisable with no filesystem, no
+`core::tools` (filesystem and `bash`) or `provider` (HTTPS). `guard` sits beside them depending on nothing — so the policy layer is exercisable with no filesystem, no
 network, and no subprocess, and there is no third path to audit.
 
 **The daemon is the only process that holds state.** Clients render; they do not remember.
@@ -163,17 +161,17 @@ The internal graph, precisely:
 elefante-guard      ──► (nothing)      pure policy; the graph's floor
 elefante-provider   ──► (nothing)
 
-elefante-tools      ──► guard
 elefante-mem        ──► guard                        (Scrubber on every stored string)
 elefante-rpc        ──► provider                     (re-exports StopReason, Usage)
-elefante-core       ──► guard, mem, provider, tools
-elefante-srv        ──► core, mem, rpc, provider, tools   the daemon; top of the graph
-elefante-cli        ──► rpc                          a client: it does not link core
+elefante-core       ──► guard, mem, provider         (tools.rs uses guard at the syscall boundary)
+elefante-srv        ──► core, mem, rpc, provider     the daemon; top of the graph
+elefante-cli        ──► rpc, mem                     a client: it does not link core
 ```
 
 Two edges are worth stating outright, because both look like mistakes and are not. **`cli`
-depends only on `rpc`** — it talks to the daemon over a socket and runs no turn in process,
-which is what makes "reconnect and the turn completes intact" true. And **`rpc` depends on
+does not link `core`** — it talks to the daemon over a socket and runs no turn in process,
+which is what makes "reconnect and the turn completes intact" true. (It links `mem` only for the
+`elefante memory` fallback that opens the store directly.) And **`rpc` depends on
 `provider`** solely to re-export `StopReason` and `Usage`, so the wire and the agent loop cannot
 drift apart; the cost is that `rpc` is not a true leaf.
 
@@ -205,8 +203,8 @@ Core owns conversation semantics:
 - placing per-turn repository context in a request — as an ephemeral `user` message after the
   turn's user message, never `system`, never stored in history (`ContextSource`, `memory.rs`).
 
-Core does not know OpenRouter field names, does not know how a result batch is shaped on the
-wire, and does not perform filesystem operations.
+Core does not know OpenRouter field names and does not know how a result batch is shaped on the
+wire. Its only filesystem and process access is `core::tools`, below.
 
 ### `elefante-provider`
 
@@ -234,16 +232,17 @@ files. The crate exposes:
 
 Keeping decisions separate from syscalls makes security behavior directly unit-testable.
 
-### `elefante-tools`
+### `core::tools`
 
-Tools is the syscall boundary. It owns the seven permanent tool schemas and a cloneable
-`ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
+The syscall boundary, a module of `elefante-core` (it was the `elefante-tools` crate). It owns the
+seven permanent tool schemas and a cloneable `ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
 classifier; every success and error result passes through `Scrubber`.
 
-`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core`, so this crate
-still depends only on `guard`. Without an implementation attached it returns one fixed refusal.
+`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core::memory`, so the
+executor itself never touches a store. Without an implementation attached it returns one fixed
+refusal.
 
-Do not add an alternate read, write, process, glob, or search path that bypasses this crate's
+Do not add an alternate read, write, process, glob, or search path that bypasses this module's
 policy calls.
 
 ### `elefante-rpc` and `elefante-srv`
@@ -1070,7 +1069,7 @@ Test ownership follows behavior:
 
 - `elefante-guard` tests path traversal, symlinks, secret variants, compound shell syntax,
   redirections, known classifier limits, and scrub patterns.
-- `elefante-tools` tests strict schemas, exact editing, path enforcement at syscall boundaries,
+- `core::tools` tests (`crates/core/tests/tools.rs`) cover strict schemas, exact editing, path enforcement at syscall boundaries,
   deterministic walks, bash non-execution, scrubbing, and cloned/concurrent executors.
 - `elefante-provider` tests deterministic request JSON, per-model capabilities, arbitrary SSE
   chunking, `[DONE]` and keep-alive handling, `tool_calls` accumulation by index, malformed tool
@@ -1108,7 +1107,7 @@ request and a live agent request lands a trivial, reviewed edit. Both run in CI 
 
 1. Decide whether the behavior belongs in one of the seven existing tools. Tool definitions
    consume prompt tokens on every provider round.
-2. Add or update the strict schema in `elefante-tools::definitions`.
+2. Add or update the strict schema in `elefante_core::tools::definitions`.
 3. Add a private `Deserialize` input type with `deny_unknown_fields`.
 4. Route execution through `ToolExecutor::execute`.
 5. Resolve every path with `PathPolicy` immediately before filesystem access.

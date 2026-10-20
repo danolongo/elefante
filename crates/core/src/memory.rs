@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::tools::{MemorySearch, MemorySearchRequest, SearchKind};
 use elefante_mem::{
     Store, brief, learn,
     retrieve::{DEFAULT_BUDGET_TOKENS, LearnedHit, Query, Retriever, SearchKind as MemSearchKind},
 };
-use elefante_tools::{MemorySearch, MemorySearchRequest, SearchKind};
 use futures_util::future::BoxFuture;
 
 use crate::{ContextSource, InjectedContext, Note};

@@ -279,8 +279,11 @@ dependencies = [
  "elefante-guard",
  "elefante-mem",
  "elefante-provider",
- "elefante-tools",
  "futures-util",
+ "globset",
+ "ignore",
+ "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -352,7 +355,6 @@ dependencies = [
  "elefante-mem",
  "elefante-provider",
  "elefante-rpc",
- "elefante-tools",
  "futures-util",
  "rusqlite",
  "serde",
@@ -360,22 +362,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "elefante-tools"
-version = "0.1.0"
-dependencies = [
- "elefante-guard",
- "futures-util",
- "globset",
- "ignore",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
 ]
 
 [[package]]

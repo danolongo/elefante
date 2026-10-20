@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use elefante_core::tools::ToolExecutor;
 use elefante_core::{
     ApprovalOutcome, ApprovalSink, Note as CoreNote, OutputEvent, RunConfig, Session, ToolGate,
     learn::{
@@ -34,7 +35,6 @@ use elefante_rpc::{
     MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
     UNKNOWN_NOTE, Usage, truncate_preview,
 };
-use elefante_tools::ToolExecutor;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::{

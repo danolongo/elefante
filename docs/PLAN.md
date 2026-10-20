@@ -61,10 +61,9 @@ elefante/
   crates/
     rpc/                     # wire types shared by daemon and client (no deps on others)
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
-    guard/                   # PathPolicy, BashClassifier, Scrubber, Critic
-    tools/                   # read, write, edit, glob, grep, bash, memory_search
+    guard/                   # PathPolicy, BashClassifier, Scrubber
     mem/                     # graph store, indexer, retrieval, cache
-    core/                    # session, turn loop, context assembly, learner
+    core/                    # session, turn loop, context assembly, learner; tools: read, write, edit, glob, grep, bash, memory_search
     srv/                     # daemon binary: socket, session registry
     cli/                     # `elefante` binary: spawns daemon, launches client
   tui/                       # Bun + @opentui/core client (TypeScript)
@@ -74,17 +73,16 @@ elefante/
 
 ```
 cli   ──► rpc, mem
-srv   ──► core, mem, rpc, provider, tools
-core  ──► provider, tools, mem, guard
-tools ──► guard            (PathPolicy at the syscall boundary)
+srv   ──► core, mem, rpc, provider
+core  ──► provider, mem, guard   (core::tools uses PathPolicy at the syscall boundary)
 mem   ──► guard            (Scrubber on the write path)
 rpc   ──► provider         (re-exports Usage and StopReason)
 guard ──► (nothing)
 ```
 
-`guard` must never depend on `tools`, `mem` or `provider`. The practical consequence: `guard` is pure policy — it decides, it never performs. This is what makes the whole gate layer unit-testable without a filesystem or a network. Critics need a model, so they live in `core` (M5), not in `guard`: `mem` depends on `guard`, and a `guard → provider` edge would pull the HTTP stack into the memory crate.
+`guard` must never depend on `core`, `mem` or `provider`. The practical consequence: `guard` is pure policy — it decides, it never performs. This is what makes the whole gate layer unit-testable without a filesystem or a network. Critics need a model, so they live in `core` (M5), not in `guard`: `mem` depends on `guard`, and a `guard → provider` edge would pull the HTTP stack into the memory crate.
 
-**Consolidation to five crates (next, before M4).** Eight crates is more seams than the pillars need. `tools` merges into `core`, which already is its only consumer apart from the daemon; `rpc`, `srv` and `cli` merge into one `elefante` crate and one binary, with `elefante daemon` in place of a separate `elefante-srv`. The result is `provider`, `guard`, `mem`, `core`, `elefante`. This section is rewritten to the new layout in the same changes that make it.
+**Consolidation to five crates (in progress, before M4).** Eight crates was more seams than the pillars need. `tools` has merged into `core` as `core::tools`; `rpc`, `srv` and `cli` merge into one `elefante` crate and one binary, with `elefante daemon` in place of a separate `elefante-srv`. The result is `provider`, `guard`, `mem`, `core`, `elefante`. This section is rewritten to the new layout in the same changes that make it.
 
 Key crates: `tokio 1.53`, `reqwest 0.13`, `rusqlite 0.40` (bundled + FTS5), `tree-sitter 0.27` (+ `tree-sitter-bash`), `blake3 1.8`, `moka 0.12`, `ignore`, `serde`/`serde_json`.
 

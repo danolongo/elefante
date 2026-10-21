@@ -188,6 +188,11 @@ try:
             cwd = repo_copy / 'tui' if name.startswith('bun') else repo_copy
             p = run(argv, cwd=cwd, env=host_env)
             record('S4/repo-positive-' + name, 'pass' if p.returncode == 0 else 'fail', p.stdout.strip())
+        warmed_target = root / 'repo-positive-target'
+        if (repo_copy / 'target').exists():
+            (repo_copy / 'target').rename(warmed_target)
+        record('S4/cold-target', 'pass' if not (repo_copy / 'target').exists() else 'fail',
+               f'host-warmed target preserved at {warmed_target}; sandbox target starts absent')
         cargo_home = sandbox_home / '.cargo'
         registry_reads = [str(cargo_home / name) for name in ('registry', 'git') if (cargo_home / name).exists()]
         cache_writes = [str(cargo_home / name) for name in
@@ -216,7 +221,7 @@ try:
                writable_root=str(repo_copy), private_home=str(sandbox_home), writable_cargo_cache_files=cache_writes,
                bun_cache=str(sandbox_home / 'bun-cache'),
                observed_cargo_files=[str(p.relative_to(cargo_home)) for p in cargo_home.iterdir()],
-               limits='warm build artifacts reused; dependency cache read-only; Bun dependencies preinstalled; no network install inside sandbox')))
+               limits='sandbox Cargo build starts with an absent target directory; host target preserved in scratch sibling; registry cache warm and read-only; Bun cache warm and dependencies preinstalled; no network install inside sandbox')))
         if probe_ok:
             # ctypes calls happen only in the disposable child, never in Rust/product code.
             prefix = 'import ctypes,errno,os; l=ctypes.CDLL(None,use_errno=True); '

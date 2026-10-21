@@ -120,6 +120,7 @@ try:
         sandbox_home = root / 'tool-home'
         (sandbox_home / '.cargo').mkdir(parents=True)
         reads = [p for p in ['/usr', '/bin', '/lib', '/lib64', '/etc/ld.so.cache',
+                             '/etc/alternatives', '/etc/ssl/certs',
                              str(cargo_bin), str(bun_bin), str(toolchain),
                              str(rustup_home / 'settings.toml')] if pathlib.Path(p).exists()]
         compiler_links = []

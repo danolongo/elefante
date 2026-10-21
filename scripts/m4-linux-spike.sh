@@ -51,7 +51,7 @@ if (crate / 'Cargo.lock').exists():
 # Broad host read bind is intentional for S1-S3 mechanics only. S4 uses a
 # separate explicit mount set. Neither profile is a production policy.
 base = ['bwrap', '--ro-bind', '/', '/', '--bind', str(root), str(root),
-        '--unshare-user', '--unshare-pid', '--die-with-parent', '--new-session']
+        '--unshare-user', '--unshare-pid', '--proc', '/proc', '--die-with-parent', '--new-session']
 p = run(base + ['--', '/bin/true'])
 record('S1/default-userns', 'pass' if p.returncode == 0 else 'fail',
        f'pre-sysctl observation exit={p.returncode}; {p.stdout.strip()}', required=False)
@@ -122,6 +122,17 @@ try:
         reads = [p for p in ['/usr', '/bin', '/lib', '/lib64', '/etc/ld.so.cache',
                              str(cargo_bin), str(bun_bin), str(toolchain),
                              str(rustup_home / 'settings.toml')] if pathlib.Path(p).exists()]
+        compiler_links = []
+        compiler = pathlib.Path(shutil.which('cc'))
+        while compiler.is_symlink():
+            target = pathlib.Path(os.readlink(compiler))
+            target = target if target.is_absolute() else compiler.parent / target
+            compiler_links.append(dict(link=str(compiler), target=str(target)))
+            # Preserve each exact alternative entry, rather than mounting /etc.
+            if not any(target.is_relative_to(pathlib.Path(p)) for p in reads):
+                reads.append(str(target))
+            compiler = target
+        record('S4/compiler-resolution', 'pass', json.dumps(compiler_links))
         minimal = ['bwrap', '--unshare-user', '--disable-userns', '--unshare-net',
                    '--unshare-pid', '--die-with-parent', '--clearenv', '--proc', '/proc', '--dev', '/dev',
                    '--tmpfs', '/tmp']
@@ -157,7 +168,7 @@ try:
                                  check=True, stdout=subprocess.PIPE).stdout.decode().split('\0')
         for relative in filter(None, tracked):
             parts = pathlib.Path(relative).parts
-            if any(p.startswith('.env') or p.startswith('credentials') or p in
+            if any(p.startswith('.env') or p in ('credentials', 'credentials.toml') or p in
                    ('.ssh', '.aws', '.elefante', '.omx', 'node_modules', 'target') for p in parts):
                 continue
             src, dst = source / relative, repo_copy / relative
@@ -207,14 +218,29 @@ try:
                limits='warm build artifacts reused; dependency cache read-only; Bun dependencies preinstalled; no network install inside sandbox')))
         if probe_ok:
             # ctypes calls happen only in the disposable child, never in Rust/product code.
-            code = ('import ctypes,errno,os; l=ctypes.CDLL(None,use_errno=True); '
-                    'ctypes.set_errno(0); r=l.syscall(272,0); '
+            prefix = 'import ctypes,errno,os; l=ctypes.CDLL(None,use_errno=True); '
+            positive = prefix + 'assert l.syscall(140,0,0)>=0; assert l.syscall(145,0)>=0; print("both sentinels succeed")'
+            check('S6/filter-sentinels-positive', base + ['--', 'python3', '-c', positive])
+            stdin_observer = ('\ntry:\n data=os.read(0,16); print("stdin bytes read:",len(data))'
+                              '\nexcept OSError as e:\n print("stdin errno:",e.errno)\n')
+            single = (prefix + 'ctypes.set_errno(0); r=l.syscall(140,0,0); '
+                      'assert r==-1 and ctypes.get_errno()==errno.EPERM; print("EPERM sentinel verified")'
+                      + stdin_observer)
+            p = run(['python3', '-c', prefix + stdin_observer], input='positive')
+            record('S2/stdin-observer-positive',
+                   'pass' if p.returncode == 0 and 'stdin bytes read: 8' in p.stdout else 'fail', p.stdout.strip())
+            with (root / 'eperm.bpf').open('rb') as ep:
+                p = run(base + ['--seccomp', '0', '--', 'python3', '-c', single], stdin=ep)
+            record('S2/seccomp-stdin', 'pass' if p.returncode == 0 else 'fail', p.stdout.strip())
+            code = (prefix + 'ctypes.set_errno(0); r=l.syscall(140,0,0); '
                     'assert r==-1 and ctypes.get_errno()==errno.EPERM; '
+                    'ctypes.set_errno(0); r=l.syscall(145,0); '
+                    'assert r==-1 and ctypes.get_errno()==errno.ENOSYS; '
                     'ctypes.set_errno(0); r=l.syscall(435,0,0); '
                     'assert r==-1 and ctypes.get_errno()==errno.ENOSYS; '
-                    'assert os.read(0,1)==b""; print("EPERM, ENOSYS and stdin EOF verified")')
+                    'print("EPERM and ENOSYS sentinels and clone3 verified")' + stdin_observer)
             with (root / 'eperm.bpf').open('rb') as ep, (root / 'enosys.bpf').open('rb') as en:
-                p = run(base + ['--seccomp', '0', '--add-seccomp-fd', str(en.fileno()),
+                p = run(base + ['--add-seccomp-fd', '0', '--add-seccomp-fd', str(en.fileno()),
                         '--', 'python3', '-c', code], stdin=ep, pass_fds=(en.fileno(),))
             record('S2/stdin-and-S6/stacked-filters', 'pass' if p.returncode == 0 else 'fail', p.stdout.strip())
             def evaluate(program, number, arch):

@@ -699,9 +699,10 @@ daemon, which is not sandboxed. Sandboxed processes run model-chosen commands an
 so there is no mapping or proxy to build: the key lives only in the daemon (and `credentials.toml`).
 
 **Baseline.** Design pass first, with a spike on both platforms. The Linux spike uses a
-temporary `ubuntu-24.04` Actions job. Phase 0 has separately approved setup, trigger-fix and
+temporary `ubuntu-24.04` Actions job. Phase 0 has separately approved setup, CI-iteration and
 results commits: GitHub only dispatches a manual workflow when its file is on the default branch,
-so the temporary job must run on `sandboxing` pushes. The maintainer deferred
+so the temporary job runs on `sandboxing` pushes. Probe-harness errors are fixed and rerun before
+recording Linux behavior. The maintainer deferred
 the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
 their results remain `not run` through M4 and must be obtained before completion is reported.
 - **Policy, in `guard`.** `guard::sandbox::Policy { root, temp, readable, writable, read_only,
@@ -724,7 +725,9 @@ their results remain `not run` through M4 and must be obtained before completion
   namespaces when available. A `/tmp` tmpfs and private home replace host locations; `/run`, host
   `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The daemon feeds two stacked `seccompiler` programs
   through bubblewrap: ENOSYS for `clone3` and `io_uring_*` so runtimes fall back, and EPERM for
-  namespace/mount, process-inspection, keyring and other escape-prone calls. The filter restricts
+  namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
+  programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture
+  check does not cover them. The filter restricts
   socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
   spike decides the exact bubblewrap fd flags, Ubuntu user-namespace setup and any clone-flag mask.
   A new nested `.git` is quarantined after the command, including under ignored directories.
@@ -759,7 +762,10 @@ their results remain `not run` through M4 and must be obtained before completion
   `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set. Nothing in
   the workspace can change the policy: it is built from the daemon's own configuration only.
 - **Process and file hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`,
-  `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, and sandbox-only git flags);
+  `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, fixed macOS `SDKROOT`, and
+  sandbox-only git flags). On macOS, fixed `PATH` puts the resolved Command Line Tools compiler
+  directory ahead of `/usr/bin`: the `/usr/bin/clang` shim created assembler temporaries outside
+  the private temp directory even when `TMPDIR` was set, while the direct compiler did not.
   `OPENROUTER_API_KEY` is never passed. Shell uses `bash -c`, not a login shell, with a 120-second
   default timeout. `bash` and `grep` output is capped at 32 KiB, `read` at 128 KiB, keeping head,
   tail and the total size. Daemon file tools and the indexer open root-relative paths without
@@ -769,7 +775,9 @@ their results remain `not run` through M4 and must be obtained before completion
 - **Network on request.** `network: true` escalates and, if approved, enables the network for
   that one sandboxed call. It then has the whole internet, with no per-domain filter. macOS host
   loopback needs approval; Linux's private loopback works inside the network-off sandbox and
-  cannot reach the host listener.
+  cannot reach the host listener. This repository's existing tests bind host loopback, so a
+  full `cargo test` run inside the macOS sandbox requires network approval; the off-profile
+  probe failed exactly those ten tests and the approved-profile probe passed all 553.
 - **The classifier shrinks.** With paths enforced by the OS, the `.elefante` argument scanning in
   `guard/src/bash.rs` (glob forms, grep/rg flag tables) is deleted. The classifier keeps intent:
   destructive and privileged commands are denied, unknown ones ask, plain git is routed.

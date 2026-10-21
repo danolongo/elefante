@@ -45,9 +45,10 @@ Git writes and web research go through harness-owned, allowlisted paths.
 - **Plan in the repo.** After approval this plan becomes `docs/M4_milestone.md`. When M4.1
   ships, it is folded into `MILESTONES.md` and deleted, keeping the four-doc rule.
 - **Commits.** One commit per implementation phase, following the conventions in the next section.
-  Phase 0 uses three separately approved commits: the initial Linux spike job, a trigger fix,
-  then its results. GitHub returned 404 for `workflow_dispatch` on a workflow absent from the
-  default branch; the trigger fix adds a `sandboxing` push event. Ask before every commit and
+  Phase 0 uses separately approved CI-iteration commits and a results commit. GitHub returned
+  404 for `workflow_dispatch` on a workflow absent from the default branch, so a trigger-fix
+  commit added a `sandboxing` push event. The first Linux run exposed probe-harness errors,
+  requiring another iteration before its results can be trusted. Ask before every commit and
   every push.
 - **No `unsafe`.** The workspace forbids it. New dependencies:
   - `seccompiler`, Linux only, in `guard`: pure BPF compilation.
@@ -167,6 +168,8 @@ not be run by the agent.
 
 | Question | Observed result | Decision or follow-up |
 |---|---|---|
+| S6, first Linux run | `seccompiler` 0.5.0 builds at Rust 1.90. Its generated filters killed wrong-architecture calls but evaluated x32 syscall numbers as `ALLOW`; the x32 `getpid` call returned ENOSYS both with and without that filter on the runner. The combined bubblewrap filter probe was malformed and must be rerun. | Prepend an explicit x32-number rejection on x86_64. Do not infer filter loading from `clone3` alone, because the host also returns ENOSYS for it. |
+| S5, macOS | A scratch deny-default Seatbelt profile ran `git status` and all 97 Bun tests. With network off, `cargo test --workspace --offline --no-fail-fast` had 543 passed, 10 failed, 6 ignored; all ten failures bound the host loopback used by existing daemon/provider tests. With approved network and the same file rules, 553 passed, 0 failed, 6 ignored. A host-listener control refused off and connected when approved. DNS, a synthetic SSH fixture, `.git`/`.GIT` writes, hard links to protected fixtures, process inspection, pasteboard, `open -a`, and `launchctl submit` were refused; matching unsandboxed controls succeeded where available. `security` on a nonexistent item and an Apple Events request were inconclusive because the host controls also failed. `-D` substitutions worked, but Seatbelt accepted quote, backslash and newline values. `/usr/bin/clang` wrote temporary assembly outside the private temp dir despite `TMPDIR`; direct Command Line Tools clang plus fixed `SDKROOT` built successfully. | Keep host loopback behind network approval on macOS; this repository's full test suite needs one approved-network call. Put the direct Command Line Tools directory first in fixed `PATH` and pass fixed `SDKROOT`. Reject hostile `-D` values in the renderer. Keychain/Apple Events need conclusive synthetic controls before implementation-gate claims. |
 | S7, macOS | On arm64 macOS 15.7.9 with Rust 1.90, locked `rustix` 1.1.4 fails to compile `OFlags::NOFOLLOW_ANY`; 1.1.5 builds offline. A dirfd-relative open of an ordinary file succeeds and intermediate/final symlinks fail with `ELOOP`. `openat(rootfd, "../outside", NOFOLLOW_ANY)` succeeds. | Require `rustix` 1.1.5 or later compatible release. Reject absolute and parent components separately; `NOFOLLOW_ANY` alone does not enforce containment. |
 | S8, this checkout | Metadata-only unpruned `.git` walk: 4,343 directories and 130,997 entries, one `.git`, median 232 ms over five warm runs; first cold run about 1.2 s. Name-only secret scan pruning `target/` and `node_modules/`: 319 directories and 7,315 entries, median 18 ms. No secret contents were opened. | Keep the unpruned `.git` scan before each command for correctness, and prune only the secret-name scan. The per-command latency is a measured cost; the production Rust walk must be checked later. |
 | S10, macOS | Apple Git 2.50.1 accepts `status --porc` without `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` but exits 128 with it; exact `--porcelain` succeeds either way. | Keep the variable as a supplemental guard. The exact option allowlist remains primary. |
@@ -180,6 +183,8 @@ temporary workflow, spike programs and design amendment and is pushed after sepa
 **Trigger fix:** `fix(ci): run the sandbox spike on branch pushes`. GitHub's manual dispatch
 requires the workflow to exist on the default branch, so the temporary workflow must run on
 pushes to `sandboxing` instead.
+**Further CI iterations:** fix the temporary probe if its own setup fails, with a separate
+approval for each commit and push. Do not treat a probe-harness failure as a sandbox result.
 **Results commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
 
 ---
@@ -256,12 +261,13 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
 | EPERM | `socket()` for any family except `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` | `AF_VSOCK` is blocked |
 | EPERM, only under `Approved` | `socket(AF_UNIX)` | The host network namespace exposes abstract Unix sockets (X11, D-Bus); the DNS stub is UDP |
 
-Both programs also carry an architecture check, plus an x32 check if S6 shows it is needed.
+Both programs carry an architecture check and, on x86_64, an explicit x32 syscall-number check.
 Clone-flag masks are added only if S1 shows `--disable-userns` is unavailable.
 
 **Environment.**
 - Always: `PATH` (fixed: the system dirs plus the exact readable PATH dirs), `LANG`, `LC_ALL`,
-  `TERM=dumb`, `CARGO_HOME`, `RUSTUP_HOME`.
+  `TERM=dumb`, `CARGO_HOME`, `RUSTUP_HOME`; on macOS, a fixed `SDKROOT` and the resolved
+  Command Line Tools compiler directory ahead of `/usr/bin` in `PATH`.
 - Sandboxed only: `HOME` (Linux `/tmp/home`, macOS `TEMP/home`), `TMPDIR` (the temp dir),
   `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`.
 - Nothing else ever, including `OPENROUTER_API_KEY`.

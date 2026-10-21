@@ -724,12 +724,17 @@ their results remain `not run` through M4 and must be obtained before completion
   `.git` read-only, and masks secrets and harness state. `--disable-userns` prevents nested user
   namespaces when available. A `/tmp` tmpfs and private home replace host locations; `/run`, host
   `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The daemon feeds two stacked `seccompiler` programs
-  through bubblewrap: ENOSYS for `clone3` and `io_uring_*` so runtimes fall back, and EPERM for
+  through repeated bubblewrap `--add-seccomp-fd` arguments: ENOSYS for `clone3` and
+  `io_uring_*` so runtimes fall back, and EPERM for
   namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
   programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture
   check does not cover them. The filter restricts
   socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
-  spike decides the exact bubblewrap fd flags, Ubuntu user-namespace setup and any clone-flag mask.
+  spike settled repeated `--add-seccomp-fd` arguments, Ubuntu's AppArmor user-namespace sysctl
+  step, and `--disable-userns` without a clone-flag mask. Its toolchain probe required exact
+  Cargo/Bun binary directories, the selected rustup toolchain and settings, a read-only Cargo
+  registry, `/etc/alternatives` for GCC and `/etc/ssl/certs` for TLS clients; writable caches
+  lived under the private temp directory. No whole real home or Cargo home was bound.
   A new nested `.git` is quarantined after the command, including under ignored directories.
 - **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
   bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a

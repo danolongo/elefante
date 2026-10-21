@@ -149,7 +149,7 @@ code is written.
 | # | Question | Decides |
 |---|---|---|
 | S1 | ubuntu-24.04: does `bwrap` (0.9) work after `sysctl kernel.apparmor_restrict_unprivileged_userns=0`, and alternatively with the `bwrap-userns-restrict` AppArmor profile? Is `--disable-userns` honoured? | CI step; the setup text in the error; whether clone-flag masks are needed |
-| S2 | Do `--seccomp 0` and `--add-seccomp-fd` load the filters when the BPF bytes arrive on stdin? What does the child see on fd 0? | No helper binary needed. **Fallback:** an `elefante sandbox-exec` helper ro-bound from the daemon's running image |
+| S2 | Do `--seccomp 0` and `--add-seccomp-fd` load the filters when the BPF bytes arrive on stdin? What does the child see on fd 0? | Use repeated `--add-seccomp-fd` (including fd 0), because bubblewrap rejects combining it with `--seccomp`; the child sees fd 0 closed. No helper binary is needed. |
 | S3 | Do these bubblewrap behaviours hold: ro-bind `.git` over an rw root, `--tmpfs` over hidden directories, `--ro-bind /dev/null` over hidden files, loopback up with `--unshare-net`, and orphans killed by `--unshare-pid --die-with-parent`? | bubblewrap argv renderer |
 | S4 | What is the minimum toolchain set for `cargo build/test`, rustup proxies and `bun test`? Exact `PATH` dirs plus which read and write paths (e.g. `~/.cargo/.package-cache`, `~/.bun/install/cache`)? `$CARGO_HOME/credentials*` must stay hidden | Readable and writable lists |
 | S5 | Seatbelt, written from scratch in Codex's style: do `cargo test`, `bun test` and in-sandbox `git status` pass on this repo? Refused or not: DNS, `~/.ssh`, writes to `.git` and `.GIT`, a hard link to `.git/config` or a `~/.ssh` fixture, loopback to a host listener, `ps eww $PPID`, `security find-generic-password`, `pbpaste`, `open -a`, `launchctl submit`, `osascript`. Does `-D`/`(param)` substitution work? | Seatbelt renderer; the hard-link fallback |
@@ -159,36 +159,38 @@ code is written.
 | S9 | OpenRouter `plugins:[{id:"web",engine:"exa",max_results}]` (credentialed; **the maintainer runs it at the end of M4.1**): stream shape, plain-text citations, cost per call | `web_search` backend; use documented shape and hermetic tests provisionally |
 | S10 | Is `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` honoured by release git 2.50 (macOS) and the Ubuntu git? | Kept as an extra guard (the allowlist already refuses inexact options) |
 
-### Spike results (in progress)
+### Spike results
 
-These are observations from scratch probes, not implementation-gate results. The Linux rows remain
-open until their probes run. S9's live result is deliberately deferred until the end of M4.1 at
-the maintainer's request; its probe lives in `crates/provider/tests/s9_web_plugin.rs` and must
-not be run by the agent.
+These are observations from scratch probes, not implementation-gate results. Linux evidence is
+from successful `ubuntu-24.04` Actions runs [39584938893](https://github.com/danolongo/elefante/actions/runs/39584938893)
+and [39586238156](https://github.com/danolongo/elefante/actions/runs/39586238156). S9's live
+result is deliberately deferred until the end of M4.1 at the maintainer's request; its probe
+lives in `crates/provider/tests/s9_web_plugin.rs` and must not be run by the agent.
 
 | Question | Observed result | Decision or follow-up |
 |---|---|---|
-| S6, first Linux run | `seccompiler` 0.5.0 builds at Rust 1.90. Its generated filters killed wrong-architecture calls but evaluated x32 syscall numbers as `ALLOW`; the x32 `getpid` call returned ENOSYS both with and without that filter on the runner. The combined bubblewrap filter probe was malformed and must be rerun. | Prepend an explicit x32-number rejection on x86_64. Do not infer filter loading from `clone3` alone, because the host also returns ENOSYS for it. |
-| S1, first Linux run | On `ubuntu-24.04`, bubblewrap 0.9.0 failed before setup and succeeded after `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The runner had no `/etc/apparmor.d/bwrap-userns-restrict` profile. `--disable-userns` refused a nested namespace, but the positive nested test used a read-only `/proc` mount and must be rerun with a fresh `/proc`. | Use the sysctl step in CI. The AppArmor-profile alternative is unavailable on this runner; do not claim it was tested. Confirm nested-namespace controls on the corrected job. |
-| S3, first Linux run | Overlaying `.git` read-only over a writable root, masking a hidden directory with `--tmpfs`, masking a file with `/dev/null`, private loopback, and PID-namespace orphan cleanup all passed with positive controls. | Keep the planned bubblewrap argument order, pending the corrected rerun. |
+| S1, Linux | On `ubuntu-24.04`, bubblewrap 0.9.0 failed before setup and succeeded after `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The runner had no `/etc/apparmor.d/bwrap-userns-restrict` profile, so that alternative was not run. With a fresh `/proc`, a nested user namespace succeeded without `--disable-userns` and failed with it. | Use the sysctl step in CI and keep `--disable-userns`. Document the missing-profile alternative as not run, rather than claiming it failed. |
+| S2, Linux | Bubblewrap 0.9.0 rejects `--seccomp 0` combined with `--add-seccomp-fd`. `--seccomp 0` alone loads a filter from stdin. Repeated `--add-seccomp-fd`, one pointing at fd 0, loads stacked EPERM and ENOSYS programs: normally successful syscall sentinels changed to those errors. The child sees fd 0 closed (`EBADF`), while the unsandboxed observer read eight control bytes. | Use repeated `--add-seccomp-fd` and set the bash child's stdin to `/dev/null` explicitly; the daemon passes inheritable descriptors to bubblewrap with safe Rust. No helper executable is needed. |
+| S3, Linux | Overlaying `.git` read-only over a writable root, masking a hidden directory with `--tmpfs`, masking a file with `/dev/null`, private loopback, and PID-namespace orphan cleanup all passed with positive controls on the corrected runner. | Keep the planned bubblewrap argument order. |
+| S4, Linux | On `ubuntu-24.04`, exact `PATH` directories `/usr/bin`, `/bin`, the runner's Cargo bin and Bun bin worked. Read-only mounts of `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, the exact Cargo/Bun bin directories, selected Rust 1.90 toolchain, rustup settings file and Cargo registry supported a fresh target build and workspace test, plus `bun test` (97 tests). Writable paths were the root and private scratch home/cache under `/tmp`. A synthetic Cargo credentials file was visible outside and masked inside. A read-only registry warmed outside the sandbox was used; network installation and cold registry download were not tested. | Bind those exact system/toolchain paths and the dependency registry, keep Cargo credentials masked, and put writable cache files under the private temp directory. Do not bind the whole real home or Cargo home. The cold target result proves compilation, not installation without a warmed dependency cache. |
+| S5, macOS | A scratch deny-default Seatbelt profile ran `git status` and all 97 Bun tests. Network-off `cargo test --workspace --offline --no-fail-fast` had 543 passed and 10 loopback-bind failures; with approved network and identical file rules, 553 passed, 0 failed and 6 ignored. Off blocked DNS, a host listener, SSH and secret fixtures, `.git`/`.GIT` writes, protected hard links, process inspection, pasteboard, `open -a`, launchd submission, a synthetic keychain lookup and a Finder Apple Event; the matching unsandboxed operations succeeded. `-D` substitution worked, but Seatbelt itself accepted quote, backslash and newline values. `/usr/bin/clang` wrote assembly temporaries outside the private temp; direct Command Line Tools clang with fixed `SDKROOT` built successfully. | Keep host loopback behind network approval; the repository test suite needs approval on macOS. Put the direct compiler directory first in fixed `PATH`, pass fixed `SDKROOT`, and reject hostile `-D` values in the renderer. |
+| S6, Linux | `seccompiler` 0.5.0 builds at Rust 1.90. Its generated filters killed wrong-architecture calls but evaluated x32 syscall numbers as `ALLOW`; x32 `getpid` returned ENOSYS with and without a filter. Stacked EPERM and ENOSYS filters loaded through bubblewrap, proven by normally successful syscall sentinels; `clone3` alone was inconclusive because the host already returns ENOSYS. | Prepend an explicit x32-number rejection on x86_64 and test both programs' architecture and syscall actions. |
 | S7, Linux | `rustix` 1.1.5 and `seccompiler` 0.5.0 built with Rust 1.90. `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` opened a normal file and rejected symlink and parent traversal. | Use root-descriptor-relative `openat2` with both resolve flags. |
-| S10, Linux | Ubuntu runner Git 2.55.0 accepted exact `--porcelain` and refused abbreviated `--porc` with `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` (exit 128). | Keep the environment guard alongside the exact option allowlist. |
-| S5, macOS | A scratch deny-default Seatbelt profile ran `git status` and all 97 Bun tests. With network off, `cargo test --workspace --offline --no-fail-fast` had 543 passed, 10 failed, 6 ignored; all ten failures bound the host loopback used by existing daemon/provider tests. With approved network and the same file rules, 553 passed, 0 failed, 6 ignored. A host-listener control refused off and connected when approved. DNS, a synthetic SSH fixture, `.git`/`.GIT` writes, hard links to protected fixtures, process inspection, pasteboard, `open -a`, and `launchctl submit` were refused; matching unsandboxed controls succeeded where available. `security` on a nonexistent item and an Apple Events request were inconclusive because the host controls also failed. `-D` substitutions worked, but Seatbelt accepted quote, backslash and newline values. `/usr/bin/clang` wrote temporary assembly outside the private temp dir despite `TMPDIR`; direct Command Line Tools clang plus fixed `SDKROOT` built successfully. | Keep host loopback behind network approval on macOS; this repository's full test suite needs one approved-network call. Put the direct Command Line Tools directory first in fixed `PATH` and pass fixed `SDKROOT`. Reject hostile `-D` values in the renderer. Keychain/Apple Events need conclusive synthetic controls before implementation-gate claims. |
 | S7, macOS | On arm64 macOS 15.7.9 with Rust 1.90, locked `rustix` 1.1.4 fails to compile `OFlags::NOFOLLOW_ANY`; 1.1.5 builds offline. A dirfd-relative open of an ordinary file succeeds and intermediate/final symlinks fail with `ELOOP`. `openat(rootfd, "../outside", NOFOLLOW_ANY)` succeeds. | Require `rustix` 1.1.5 or later compatible release. Reject absolute and parent components separately; `NOFOLLOW_ANY` alone does not enforce containment. |
 | S8, this checkout | Metadata-only unpruned `.git` walk: 4,343 directories and 130,997 entries, one `.git`, median 232 ms over five warm runs; first cold run about 1.2 s. Name-only secret scan pruning `target/` and `node_modules/`: 319 directories and 7,315 entries, median 18 ms. No secret contents were opened. | Keep the unpruned `.git` scan before each command for correctness, and prune only the secret-name scan. The per-command latency is a measured cost; the production Rust walk must be checked later. |
-| S10, macOS | Apple Git 2.50.1 accepts `status --porc` without `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` but exits 128 with it; exact `--porcelain` succeeds either way. | Keep the variable as a supplemental guard. The exact option allowlist remains primary. |
 | S9, provisional | The ignored test compiles and checks the documented Exa-pinned plugin request. The maintainer has deferred the billable call; stream shape, citations and actual cost are **not run**. | Implement against the documented shape with a stub backend; do not claim live compatibility. Revisit backend and cost after the end-of-M4.1 probe. |
+| S10, Linux | Ubuntu runner Git 2.55.0 accepted exact `--porcelain` and refused abbreviated `--porc` with `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` (exit 128). | Keep the environment guard alongside the exact option allowlist. |
+| S10, macOS | Apple Git 2.50.1 accepts `status --porc` without `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` but exits 128 with it; exact `--porcelain` succeeds either way. | Keep the variable as a supplemental guard. The exact option allowlist remains primary. |
 
-S5 keychain follow-up: the earlier nonexistent-item result was inconclusive. An explicit scratch
-keychain and synthetic item made the identical `security find-generic-password` call succeed
-outside Seatbelt (exit 0) and fail inside the Off profile (exit 44). No real keychain item was
-queried. An identical `osascript` request for Finder's version returned `15.5` outside
-Seatbelt and failed inside it with `-1728`; this supplies the Apple Events positive control
-without changing TCC settings.
+The S5 keychain control used an explicit scratch keychain and synthetic item: the identical
+lookup exited 0 outside Seatbelt and 44 inside. Finder's version Apple Event exited 0 outside
+and failed with `-1728` inside. No real keychain item or TCC setting was touched.
 
-**Exit:** S1–S8 and S10 are answered and recorded, PLAN.md is amended if anything moved, and
-S9 is marked `not run` under the explicit credentialed deferral above. Phase 1 may then begin;
-the deferred S9 check remains a required final gate.
+**Exit:** the selected implementation routes in S1–S8 and S10 are answered and recorded, and
+PLAN.md is amended where a decision moved. The optional S1 AppArmor-profile alternative is
+`not run` because the Ubuntu runner did not provide that profile; the chosen sysctl route was
+tested. S9 remains `not run` under the explicit credentialed deferral above. Phase 1 may then
+begin; the deferred S9 check remains a required final gate.
 **First commit (Actions route):** `ci: probe Linux sandbox requirements`. This carries the
 temporary workflow, spike programs and design amendment and is pushed after separate approval.
 **Trigger fix:** `fix(ci): run the sandbox spike on branch pushes`. GitHub's manual dispatch
@@ -257,8 +259,8 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
 - then, layered over the root: `--ro-bind` for each `read_only`; `--tmpfs` over hidden
   directories; `--ro-bind /dev/null` over hidden files
 - under `Approved`, also `--ro-bind-try /run/systemd/resolve`
-- `--setenv` for each allowlisted variable, `--chdir <root>`, `--seccomp 0` (plus
-  `--add-seccomp-fd` per S2), `--`, `<bash> -c <cmd>`
+- `--setenv` for each allowlisted variable, `--chdir <root>`, repeated
+  `--add-seccomp-fd <fd>` for the two filters, `--`, `<bash> -c <cmd>`
 
 `/run` (apart from that one directory), `/var/run`, the host `/tmp`, `$XDG_RUNTIME_DIR` and
 `$HOME` are never bound.
@@ -416,7 +418,8 @@ post-scan first. Parallel bash calls stay parallel.
 
 **Launch:**
 - macOS: `/usr/bin/sandbox-exec -p <profile> -D… <bash> -c <cmd>`.
-- Linux: `<bwrap> <args>`, with the seccomp bytes on stdin (per S2).
+- Linux: `<bwrap> <args>`, with the two seccomp programs on inherited descriptors passed to
+  repeated `--add-seccomp-fd` arguments (per S2); bash receives `/dev/null` on stdin.
 - In every case: the environment comes from `guard::sandbox::environment`, there is a process
   group, and `kill_on_drop` is set.
 

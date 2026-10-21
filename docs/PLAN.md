@@ -699,8 +699,9 @@ daemon, which is not sandboxed. Sandboxed processes run model-chosen commands an
 so there is no mapping or proxy to build: the key lives only in the daemon (and `credentials.toml`).
 
 **Baseline.** Design pass first, with a spike on both platforms. The Linux spike uses a
-temporary `ubuntu-24.04` Actions job; Phase 0 therefore has a separately approved job commit
-before the results commit, because the workflow must be pushed to run. The maintainer deferred
+temporary `ubuntu-24.04` Actions job. Phase 0 has separately approved setup, trigger-fix and
+results commits: GitHub only dispatches a manual workflow when its file is on the default branch,
+so the temporary job must run on `sandboxing` pushes. The maintainer deferred
 the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
 their results remain `not run` through M4 and must be obtained before completion is reported.
 - **Policy, in `guard`.** `guard::sandbox::Policy { root, temp, readable, writable, read_only,

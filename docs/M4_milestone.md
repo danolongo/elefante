@@ -45,9 +45,10 @@ Git writes and web research go through harness-owned, allowlisted paths.
 - **Plan in the repo.** After approval this plan becomes `docs/M4_milestone.md`. When M4.1
   ships, it is folded into `MILESTONES.md` and deleted, keeping the four-doc rule.
 - **Commits.** One commit per implementation phase, following the conventions in the next section.
-  Phase 0 uses two separately approved commits because the selected GitHub Actions Linux spike
-  must be committed and pushed before it can run; the second records its results. Ask before
-  every commit and every push.
+  Phase 0 uses three separately approved commits: the initial Linux spike job, a trigger fix,
+  then its results. GitHub returned 404 for `workflow_dispatch` on a workflow absent from the
+  default branch; the trigger fix adds a `sandboxing` push event. Ask before every commit and
+  every push.
 - **No `unsafe`.** The workspace forbids it. New dependencies:
   - `seccompiler`, Linux only, in `guard`: pure BPF compilation.
 - `rustix` 1.1.5 or later compatible release, in `core` and `mem`: safe `openat2` and
@@ -174,8 +175,11 @@ not be run by the agent.
 **Exit:** S1–S8 and S10 are answered and recorded, PLAN.md is amended if anything moved, and
 S9 is marked `not run` under the explicit credentialed deferral above. Phase 1 may then begin;
 the deferred S9 check remains a required final gate.
-**First commit (Actions route):** `ci: probe Linux sandbox requirements`. This carries only the
-temporary workflow and spike programs and is pushed after separate approval.
+**First commit (Actions route):** `ci: probe Linux sandbox requirements`. This carries the
+temporary workflow, spike programs and design amendment and is pushed after separate approval.
+**Trigger fix:** `fix(ci): run the sandbox spike on branch pushes`. GitHub's manual dispatch
+requires the workflow to exist on the default branch, so the temporary workflow must run on
+pushes to `sandboxing` instead.
 **Results commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
 
 ---

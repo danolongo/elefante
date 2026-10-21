@@ -2,6 +2,8 @@ name: sandbox spike (Linux)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [sandboxing]
 
 permissions:
   contents: read

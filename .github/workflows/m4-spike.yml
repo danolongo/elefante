@@ -1,0 +1,29 @@
+name: sandbox spike (Linux)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install probe tools
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap python3 iproute2 apparmor-utils
+      - name: Probe sandbox assumptions
+        run: bash scripts/m4-linux-spike.sh "$RUNNER_TEMP/m4-linux-evidence"
+      - name: Preserve evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-linux-spike
+          path: ${{ runner.temp }}/m4-linux-evidence
+          if-no-files-found: error

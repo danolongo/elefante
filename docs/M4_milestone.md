@@ -38,15 +38,20 @@ Git writes and web research go through harness-owned, allowlisted paths.
 
 ## Ground rules
 
-- **Gates.** M4's gate plus the M0–M3 gates must be green before M4.1. M4.1's gate must be green
-  before M5.
+- **Gates.** M4's hermetic gate plus the M0–M3 hermetic gates must be green before M4.1.
+  Credentialed checks are deferred until the end of M4.1 at the maintainer's request; until
+  then they are `not run`, not green. M4.1's gate, including those deferred checks, must be
+  green before M5 or completion is reported.
 - **Plan in the repo.** After approval this plan becomes `docs/M4_milestone.md`. When M4.1
   ships, it is folded into `MILESTONES.md` and deleted, keeping the four-doc rule.
-- **Commits.** One commit per phase, following the conventions in the next section. Ask before
+- **Commits.** One commit per implementation phase, following the conventions in the next section.
+  Phase 0 uses two separately approved commits because the selected GitHub Actions Linux spike
+  must be committed and pushed before it can run; the second records its results. Ask before
   every commit and every push.
 - **No `unsafe`.** The workspace forbids it. New dependencies:
   - `seccompiler`, Linux only, in `guard`: pure BPF compilation.
-  - `rustix`, in `core` and `mem`: safe `openat2` and `O_NOFOLLOW_ANY`.
+- `rustix` 1.1.5 or later compatible release, in `core` and `mem`: safe `openat2` and
+  `O_NOFOLLOW_ANY`. The macOS probe found that 1.1.4 lacks the latter flag.
 
   Both are checked against MSRV 1.90 in the spike.
 - **Tests never skip silently.** A sandbox test that finds no sandbox fails with setup
@@ -149,11 +154,29 @@ code is written.
 | S6 | seccompiler: does it reject x32 numbers on x86_64? With one action per filter, can stacked EPERM and ENOSYS programs load through bubblewrap? | Prepend arch + x32 checks if needed |
 | S7 | `rustix` `openat2(RESOLVE_BENEATH\|RESOLVE_NO_SYMLINKS)` on Linux, and `O_NOFOLLOW_ANY` plus dirfd-relative `openat` on macOS, at MSRV 1.90? | Hardened file access |
 | S8 | Walk cost on this repo: directories only, never pruned, looking for `.git` (any case); plus the name-based secret scan, pruning `target/` and `node_modules/` | Per-command or cached scan |
-| S9 | OpenRouter `plugins:[{id:"web",engine:"exa",max_results}]` (credentialed; **the maintainer runs it**): stream shape, plain-text citations, cost per call | `web_search` backend |
+| S9 | OpenRouter `plugins:[{id:"web",engine:"exa",max_results}]` (credentialed; **the maintainer runs it at the end of M4.1**): stream shape, plain-text citations, cost per call | `web_search` backend; use documented shape and hermetic tests provisionally |
 | S10 | Is `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` honoured by release git 2.50 (macOS) and the Ubuntu git? | Kept as an extra guard (the allowlist already refuses inexact options) |
 
-**Exit:** every row is answered and recorded, and PLAN.md is amended if anything moved.
-**Commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
+### Spike results (in progress)
+
+These are observations from scratch probes, not implementation-gate results. The Linux rows remain
+open until their probes run. S9's live result is deliberately deferred until the end of M4.1 at
+the maintainer's request; its probe lives in `crates/provider/tests/s9_web_plugin.rs` and must
+not be run by the agent.
+
+| Question | Observed result | Decision or follow-up |
+|---|---|---|
+| S7, macOS | On arm64 macOS 15.7.9 with Rust 1.90, locked `rustix` 1.1.4 fails to compile `OFlags::NOFOLLOW_ANY`; 1.1.5 builds offline. A dirfd-relative open of an ordinary file succeeds and intermediate/final symlinks fail with `ELOOP`. `openat(rootfd, "../outside", NOFOLLOW_ANY)` succeeds. | Require `rustix` 1.1.5 or later compatible release. Reject absolute and parent components separately; `NOFOLLOW_ANY` alone does not enforce containment. |
+| S8, this checkout | Metadata-only unpruned `.git` walk: 4,343 directories and 130,997 entries, one `.git`, median 232 ms over five warm runs; first cold run about 1.2 s. Name-only secret scan pruning `target/` and `node_modules/`: 319 directories and 7,315 entries, median 18 ms. No secret contents were opened. | Keep the unpruned `.git` scan before each command for correctness, and prune only the secret-name scan. The per-command latency is a measured cost; the production Rust walk must be checked later. |
+| S10, macOS | Apple Git 2.50.1 accepts `status --porc` without `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` but exits 128 with it; exact `--porcelain` succeeds either way. | Keep the variable as a supplemental guard. The exact option allowlist remains primary. |
+| S9, provisional | The ignored test compiles and checks the documented Exa-pinned plugin request. The maintainer has deferred the billable call; stream shape, citations and actual cost are **not run**. | Implement against the documented shape with a stub backend; do not claim live compatibility. Revisit backend and cost after the end-of-M4.1 probe. |
+
+**Exit:** S1–S8 and S10 are answered and recorded, PLAN.md is amended if anything moved, and
+S9 is marked `not run` under the explicit credentialed deferral above. Phase 1 may then begin;
+the deferred S9 check remains a required final gate.
+**First commit (Actions route):** `ci: probe Linux sandbox requirements`. This carries only the
+temporary workflow and spike programs and is pushed after separate approval.
+**Results commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
 
 ---
 

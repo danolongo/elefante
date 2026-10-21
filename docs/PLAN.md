@@ -43,7 +43,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 | UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | The same split opencode runs in production, so it is a proven shape rather than one invented here. A headless core is also what lets subagents run as further sessions of the same daemon (M6). |
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. |
 | Storage | Project graph in `<repo>/.elefante/`, self-ignoring; user-level keys and consent in `~/.elefante/` | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
-| Isolation | OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux) plus a git worktree per editing subagent | Fast, nothing to install, and the same sandbox already wraps every bash call (M4). A microVM backend on macOS is a proposal for later; gVisor was considered and not chosen. |
+| Isolation | OS sandbox (Seatbelt on macOS, bubblewrap + seccomp on Linux) plus a git worktree per editing subagent | Bubblewrap can mask secrets and protect `.git` inside a writable root; Landlock cannot subtract access once granted. Linux requires bubblewrap and unprivileged user namespaces. Harness write git gains its own sandbox in M4.1. A microVM backend remains a proposal. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |
 | Provider | OpenRouter only | One transport, one auth, one code path. Reaching Claude via `anthropic/claude-opus-5` means this narrows the *code*, not the *models*. `Capabilities` survives and matters more, now resolved per model. |
 
@@ -688,77 +688,65 @@ network, inherits the daemon's environment — the API key included, when it was
 timeout. The classifier cannot fix this: every bypass costs another rule (`known_gaps()` lists eight
 classes). M4 moves enforcement to the operating system and lets the classifier go back to intent.
 
-**Threat model.** A prompt-injected model acting with the user's permissions. M4 stops three things:
-secrets leaving, network leaving, and files planted inside the root that something *outside* the
-sandbox later runs (git hooks, editor tasks — the class behind the July 2026 escapes in other agents).
-Kernel exploits are out of scope here; the microVM backend below is the answer to them.
+**Threat model.** A prompt-injected model choosing tool calls. M4 keeps shell commands inside a
+rooted OS sandbox, without the daemon's key or access to the daemon socket. The harness controls
+git writes and web research. Code the user later chooses to run outside elefante — builds, IDE
+tasks and hook managers — is outside this guarantee. Kernel exploits are also outside it; a
+microVM backend is a proposal.
 
 **The key never enters the sandbox.** The model runs at OpenRouter and every request comes from the
 daemon, which is not sandboxed. Sandboxed processes run model-chosen commands and never need the key,
 so there is no mapping or proxy to build: the key lives only in the daemon (and `credentials.toml`).
 
-**Baseline.** Design pass first, with a spike on both platforms.
-- **Policy, in `guard`.** `guard::sandbox::Policy { root, readable, writable, protected, network }`,
-  rendered to a Seatbelt profile (macOS) or a Landlock ruleset plus seccomp filter (Linux). Pure, and
-  tested by rendering. Readable: the root, system directories and the toolchains (`CARGO_HOME`,
-  `RUSTUP_HOME`) — an allowlist, because Landlock can only grant. Writable: the root and a private temp
-  directory. Protected (read-only inside the writable root): `.git` — and the directory a `.git` file
-  points to — and `.elefante/`. Never readable: `~/.elefante`, `~/.ssh` and the built-in credential
-  paths. Network: off.
-- **macOS.** `/usr/bin/sandbox-exec -p <profile> bash -c …` with a deny-by-default profile. Protected
-  paths are denied by pattern, so a `.git` created later anywhere in the root is covered too. Network,
-  Unix-socket connections and the DNS resolver's service are denied.
-- **Linux.** The daemon runs `/proc/self/exe sandbox-exec <policy> -- bash -c <command>` — the running
-  binary, never a path, which a `cargo build` inside the root could replace. The helper closes every
-  descriptor except stdin, stdout and stderr (Landlock does not cover files opened before it), sets
-  `no_new_privs`, applies Landlock and seccomp to itself, then starts bash; everything bash starts
-  inherits both, and neither can be undone. Safe Rust through the `landlock` and `seccompiler` crates.
-  - **Landlock** (files and TCP): the path allowlist above; TCP connect and bind with no port allowed;
-    from ABI 6, no signals to and no abstract-socket connections outside the sandbox; from ABI 9, no
-    connections to pathname Unix sockets outside it. ABI 4 is the minimum: below it, bash refuses.
-  - **seccomp** (system calls): `socket()` is refused for every address family but `AF_UNIX` — so no
-    TCP, UDP, ICMP or raw sockets, over IPv4 or IPv6 — and for `AF_UNIX` too below Landlock ABI 9
-    (`socketpair` stays allowed; it reaches nothing outside). Also refused: `io_uring_*` (it opens
-    sockets without calling `socket()`), `ptrace`, namespace creation (`unshare`, `setns`, `clone` and
-    `clone3` with namespace flags), the mount calls, `bpf` and `keyctl`. A system call from another
-    architecture kills the process.
-  - **DNS** is covered by the same rules: every resolver path needs an internet socket or a Unix socket
-    (systemd-resolved, nscd).
-  - **`.git` is detected and restored, not blocked.** Landlock rules only grant, and a grant on the
-    root covers everything beneath it, so a read-only `.git` cannot be carved out of a writable root.
-    Before each command the daemon snapshots `.git` except `objects/`; after it, once every process the
-    command started is dead, it compares, restores any change and says in the tool result what it
-    reverted. The same pass finds any new `.git` elsewhere in the root, deletes it and reports it. The
-    design pass measures the cost of that scan on a large `target/`.
-- **Every process a command started ends with it.** On Linux the helper is a child subreaper: it starts
-  bash rather than becoming it, and when bash exits it kills whatever is left, including processes
-  that left the process group. That closes the window in which a leftover process could rewrite `.git`
-  after the check or swap a symlink under the daemon's `read`. On macOS the process group is killed;
-  the design pass decides whether that is enough.
+**Baseline.** Design pass first, with a spike on both platforms. The Linux spike uses a
+temporary `ubuntu-24.04` Actions job; Phase 0 therefore has a separately approved job commit
+before the results commit, because the workflow must be pushed to run. The maintainer deferred
+the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
+their results remain `not run` through M4 and must be obtained before completion is reported.
+- **Policy, in `guard`.** `guard::sandbox::Policy { root, temp, readable, writable, read_only,
+  hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
+  programs (Linux). It is pure and tested by rendering. The root is validated before use: `/`,
+  `$HOME`, ancestors of `$HOME`, and paths containing or contained by `~/.elefante` make the
+  sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
+  harness state. Readable paths are the root, system directories and exact executable/toolchain
+  directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
+  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Network is off by
+  default.
+- **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
+  Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
+  reads and `.git` writes (in any case) are denied by pattern, including new nested directories.
+  Off denies host loopback; approved network enables it. Host process inspection, keychain,
+  pasteboard, Apple Events and launchd submission are denied.
+- **Linux.** Bubblewrap creates user, PID, IPC, UTS and (when network is off) network namespaces,
+  clears the environment, binds exact read paths, binds the root writable, overlays each existing
+  `.git` read-only, and masks secrets and harness state. `--disable-userns` prevents nested user
+  namespaces when available. A `/tmp` tmpfs and private home replace host locations; `/run`, host
+  `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The daemon feeds two stacked `seccompiler` programs
+  through bubblewrap: ENOSYS for `clone3` and `io_uring_*` so runtimes fall back, and EPERM for
+  namespace/mount, process-inspection, keyring and other escape-prone calls. The filter restricts
+  socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
+  spike decides the exact bubblewrap fd flags, Ubuntu user-namespace setup and any clone-flag mask.
+  A new nested `.git` is quarantined after the command, including under ignored directories.
+- **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
+  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
+  process that leaves the group can survive, but remains sandboxed; the output reader stops two
+  seconds after bash exits so a held pipe cannot stall the turn.
 - **The daemon's socket requires a token.** At start the daemon writes 128 random bits to
   `~/.elefante/run/token` (`0600`); every connection presents it first, and the CLI and TUI read it
   there. The sandbox cannot read `~/.elefante`, so a command that reaches the socket still cannot
   create a session, resolve an approval, set the key or change memory.
-- **Git goes through the harness.** `.git` is read-only, so the read commands (`status`, `diff`, `log`,
-  `show`, `blame`) run in the sandbox with `GIT_OPTIONAL_LOCKS=0`. A bash call that is a single plain
-  `git <subcommand> …` — no pipe, `&&`, redirection or substitution — is run by the daemon instead,
-  outside the sandbox, through one hardened git helper:
-  - Subcommands are allowlisted (the local ones: `add`, `rm`, `mv`, `restore`, `commit -m`, `switch`,
-    `branch`, `stash`, `tag`, `reset`, `merge`, `cherry-pick`, non-interactive `rebase`, plus the read
-    commands). Refused: anything touching remotes or configuration (`push`, `pull`, `fetch`, `clone`,
-    `remote`, `submodule`, `config`, `credential`), the options `-c`, `-C`, `--git-dir`, `--work-tree`
-    and `--exec-path`, and unknown subcommands, so aliases never resolve. The classifier's destructive
-    forms stay `Deny`. A git write inside a compound command is refused with a message asking for one
-    git command per call.
-  - Every invocation passes `-c protocol.allow=never` (no transport works) and turns off everything
-    that runs a program: hooks (`core.hooksPath=/dev/null`), fsmonitor, the pager, external diff,
-    textconv, the editor, credential helpers and signing. System and global configuration are skipped;
-    `user.name` and `user.email` are passed explicitly.
-  - Output is scrubbed and capped like bash. The argument and environment builder lives in `guard`
-    (pure); the existing hardening in `mem/src/cochange.rs`, the M5 diff critic and the M6 worktree and
-    `git apply` all use it.
-  - **Hooks do not run on the agent's commits** (in effect `--no-verify`). The design pass decides
-    whether `pre-commit` and `commit-msg` hooks run inside the sandbox before the harness commits.
+- **Git goes through the harness for writes.** Read git runs in the shell sandbox with
+  `GIT_OPTIONAL_LOCKS=0`. A write routes only when the whole bash call is one plain `git`
+  command with literal words or single-quoted strings. Pipes, lists, substitutions, expansions,
+  redirections, environment prefixes and global options are refused. `guard::git` applies an
+  exact option allowlist per local write subcommand (`add`, `rm`, `mv`, `restore`, `commit`,
+  `switch`, `checkout`, `branch`, `stash`, `tag`, `merge`, `cherry-pick`, `rebase`) and validates
+  paths and refs. `reset`, `clean`, remote/configuration commands, unknown options and aliases
+  are refused. Every routed write asks for approval; the disabled sandbox asks for every bash
+  call. The harness uses an absolute git binary, a cleared environment and flags that disable
+  hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
+  It refuses repositories with in-root include or hooksPath targets or LFS filters. Hooks do not
+  run on harness commits. The pure invocation builder also hardens indexer git.
 - **`web_search`, the eighth tool.** Bash never gets the internet for research; the daemon searches
   instead and returns the results as an ordinary tool result (untrusted content), capped. The query is
   an outbound channel, so it is scrubbed, length-capped and shown to the user. The design pass picks
@@ -769,51 +757,57 @@ so there is no mapping or proxy to build: the key lives only in the daemon (and 
 - **Fail closed.** If the sandbox cannot be applied, bash does not run and the error names why.
   `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set. Nothing in
   the workspace can change the policy: it is built from the daemon's own configuration only.
-- **Process hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`, `LANG`, `TERM`,
-  `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `GIT_OPTIONAL_LOCKS`); `OPENROUTER_API_KEY` is never passed.
-  `bash -c`, not a login shell. A wall-clock timeout (120 s default) kills the command. Model-facing
-  output of `bash`, `read` and `grep` is capped, keeping head and tail and stating the size cut.
-- **Network on request.** A command that needs the network (a dependency fetch) escalates; approving
-  it runs that one command without the network rules. It then has the whole internet — there is no
-  per-domain filter in M4. Loopback is network too: a test that binds `127.0.0.1` needs approval,
-  because Landlock matches ports, not addresses, and seccomp cannot read the address.
+- **Process and file hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`,
+  `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, and sandbox-only git flags);
+  `OPENROUTER_API_KEY` is never passed. Shell uses `bash -c`, not a login shell, with a 120-second
+  default timeout. `bash` and `grep` output is capped at 32 KiB, `read` at 128 KiB, keeping head,
+  tail and the total size. Daemon file tools and the indexer open root-relative paths without
+  following symlinks, after rejecting absolute and parent components; they refuse hard-linked
+  regular files and write by same-directory rename. The macOS `rustix` flag for this needs
+  `rustix` 1.1.5 or later: 1.1.4 lacks `OFlags::NOFOLLOW_ANY`.
+- **Network on request.** `network: true` escalates and, if approved, enables the network for
+  that one sandboxed call. It then has the whole internet, with no per-domain filter. macOS host
+  loopback needs approval; Linux's private loopback works inside the network-off sandbox and
+  cannot reach the host listener.
 - **The classifier shrinks.** With paths enforced by the OS, the `.elefante` argument scanning in
   `guard/src/bash.rs` (glob forms, grep/rg flag tables) is deleted. The classifier keeps intent:
   destructive and privileged commands are denied, unknown ones ask, plain git is routed.
 
 **Proposals, outside M4's gate.**
-- **A second lock on harness git.** Run the git helper itself under a sandbox profile — network off,
-  `.git` writable except `hooks/`, `config` and `info/` — so a gap in the allowlist still cannot reach
-  the network or plant a hook.
+- **Landlock inside bubblewrap**, as an additional Linux restriction if it brings measurable
+  protection without breaking toolchains.
+- **Hooks in the sandbox**, instead of skipping them on harness commits, after their behavior is
+  specified and tested.
 - **A per-domain egress proxy**, so an approved command reaches only named hosts. On Linux this needs a
-  network namespace, which Landlock and seccomp alone cannot provide.
+  controlled network path rather than the host network namespace.
 - **A microVM backend on macOS** (Apple `container`, which targets macOS 26, or Docker Sandboxes)
   behind a `Backend` trait that M4 shapes but does not implement. It isolates the kernel too, and is
   the fallback if Apple removes `sandbox-exec`. gVisor was considered and not chosen: Linux only, so on
   a Mac it needs Docker Desktop's VM, builds a Linux toolchain rather than the one shipped, and Docker's
   privileged daemon is itself a known way out.
 
-**Gate.**
-- Each harness-state bypass in `known_gaps()` — a shell variable naming the path, `cd` then a relative
-  path, `sqlite3` with an assembled path, `xargs` — is classified `Allow` and blocked by the OS.
-- Reading a `~/.ssh` fixture and writing outside the root fail. TCP and UDP to loopback over IPv4 and
-  IPv6, and a DNS lookup of a public name, all fail; with approval, the TCP connection succeeds.
-- Writing `.git/hooks/pre-commit` or `.git/config` is blocked (macOS) or reverted and reported (Linux);
-  a new `sub/.git` is removed and reported. `git status` works inside the sandbox; `git commit -m`
-  through the harness works; `git push`, `git fetch` and `git -c core.hooksPath=… commit` are refused.
-- Connecting to the daemon's socket from inside fails, and a connection without the token is refused.
-- A child sees no `OPENROUTER_API_KEY` while the daemon has one in its environment, and reading the
-  daemon's environment (`/proc/$PPID/environ`, `ps eww` on macOS) fails.
-- Linux: replacing `target/debug/elefante` between two calls does not change the helper; only
-  descriptors 0–2 are open inside; `io_uring_setup` is refused.
-- A symlink and a hard link to a `~/.ssh` fixture are refused by `read`, including a link swapped in
-  while `read` runs.
-- The timeout kills a grandchild, a process that left the group is gone when its command ends (Linux),
-  and an oversized output arrives capped.
-- A `web_search` query containing a secret fixture is scrubbed before it leaves.
-- With the sandbox unavailable, bash refuses and never runs unsandboxed.
-- Green on the macOS and Linux CI runners; the Linux job first asserts Landlock ABI ≥ 4.
-- **M0–M3 gates still green**, after the classifier shrinks.
+**Gate.** The detailed positive and negative controls are in `M4_milestone.md`. They prove the
+old classifier harness-state bypasses fail at the OS, outside paths and secrets stay hidden,
+network off and approved network differ correctly on both operating systems, `.git` is
+read-only in shell and write git routes through the harness, and repository config traps are
+refused. The daemon socket requires a token even if reached. Process, key, link, timeout,
+output-cap, seccomp and fail-closed cases are exercised. `web_search` rejects secrets and URLs.
+Sandbox tests fail with setup instructions if the sandbox is missing, and each negative test has
+a positive control. Both macOS and Linux CI legs, MSRV, TUI checks and **all M0–M3 gates** must
+be green before M4.1 starts. Credentialed tests are run separately by the maintainer at the end
+of M4.1, under the explicit deferral above.
+
+### M4.1 — Sandboxed harness git
+
+**Baseline.** Harness write git runs under its own profile with network off, nothing outside
+the root readable, the root writable, and `.git` writable except `hooks/`, `config`, `info/`
+and any protected hooksPath target. Linux uses bubblewrap overlays; macOS uses Seatbelt. The
+exact per-subcommand allowlist remains as a second line of defence.
+
+**Gate.** A test-only widening of the allowlist admits attempts such as
+`--output=$HOME/x`, `--no-index ~/.ssh/f` and `merge -s evil`; the OS still blocks them. A
+normal commit and rebase continue to work. M4 and earlier gates remain green on both operating
+systems before the milestone is recorded.
 
 ### M5 — Critics
 

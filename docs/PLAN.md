@@ -705,20 +705,26 @@ so the temporary job runs on `sandboxing` pushes. Probe-harness errors are fixed
 recording Linux behavior. The maintainer deferred
 the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
 their results remain `not run` through M4 and must be obtained before completion is reported.
-- **Policy, in `guard`.** `guard::sandbox::Policy { root, temp, readable, writable, read_only,
-  hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
+- **Policy, in `guard`.** `guard::sandbox::Policy { root, home, harness_dir, protected, temp,
+  readable, writable, read_only, hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
   programs (Linux). It is pure and tested by rendering. The root is validated before use: `/`,
   `$HOME`, ancestors of `$HOME`, and paths containing or contained by `~/.elefante` make the
   sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
   harness state. Readable paths are the root, system directories and exact executable/toolchain
   directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
-  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Network is off by
-  default.
+  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Hidden paths carry
+  an explicit file/directory kind so rendering performs no filesystem lookup. The home,
+  harness directory and exact socket/token paths let renderers reject overlapping readable
+  mounts, including custom socket locations. Network is off by default.
 - **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
   Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
   reads and `.git` writes (in any case) are denied by pattern, including new nested directories.
   Off denies host loopback; approved network enables it. Host process inspection, keychain,
-  pasteboard, Apple Events and launchd submission are denied.
+  pasteboard, Apple Events and launchd submission are denied. System reads use exact directories;
+  the host's whole `/private/var` is excluded, with required descendants tested during the
+  runtime gate. The profile grants exact literal reads of directory ancestors needed for path
+  traversal, including `$HOME` when the workspace is beneath it, without granting any home
+  subtree.
 - **Linux.** Bubblewrap creates user, PID, IPC, UTS and (when network is off) network namespaces,
   clears the environment, binds exact read paths, binds the root writable, overlays each existing
   `.git` read-only, and masks secrets and harness state. `--disable-userns` prevents nested user
@@ -728,7 +734,8 @@ their results remain `not run` through M4 and must be obtained before completion
   `io_uring_*` so runtimes fall back, and EPERM for
   namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
   programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture
-  check does not cover them. The filter restricts
+  check does not cover them. The EPERM program also refuses `ioctl(TIOCSTI)` to prevent
+  terminal input injection. The filter restricts
   socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
   spike settled repeated `--add-seccomp-fd` arguments, Ubuntu's AppArmor user-namespace sysctl
   step, and `--disable-userns` without a clone-flag mask. Its toolchain probe required exact
@@ -755,7 +762,11 @@ their results remain `not run` through M4 and must be obtained before completion
   call. The harness uses an absolute git binary, a cleared environment and flags that disable
   hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
   It refuses repositories with in-root include or hooksPath targets or LFS filters. Hooks do not
-  run on harness commits. The pure invocation builder also hardens indexer git.
+  run on harness commits. Git attributes can select custom clean/smudge filters or merge drivers,
+  so the harness also refuses a repository with any `filter=` or custom `merge=` attribute in
+  the worktree, index fallback or `.git/info/attributes`. The invocation disables global
+  attributes and an implicit custom merge default. The pure invocation builder also hardens
+  indexer git.
 - **`web_search`, the eighth tool.** Bash never gets the internet for research; the daemon searches
   instead and returns the results as an ordinary tool result (untrusted content), capped. The query is
   an outbound channel, so it is scrubbed, length-capped and shown to the user. The design pass picks

@@ -212,18 +212,23 @@ intermediate commit is weaker than today.
 ```rust
 pub struct Policy {
     root: PathBuf,           // canonical, validated (below)
+    home: PathBuf,           // canonical home for readable-mount validation
+    harness_dir: PathBuf,    // user-level harness state, never readable
+    protected: Vec<PathBuf>, // exact socket and token paths, including overrides
     temp: PathBuf,           // private per-session dir, 0700, outside root and ~/.elefante
     readable: Vec<PathBuf>,  // system dirs + exact PATH dirs + S4's toolchain set + ELEFANTE_SANDBOX_READ
     writable: Vec<PathBuf>,  // root, temp, S4's exact cache files
     read_only: Vec<PathBuf>, // every .git (any case) + validated gitdir/commondir + in-root core.hooksPath / include targets
-    hidden: Vec<PathBuf>,    // <root>/.elefante, in-root secrets, $CARGO_HOME/credentials*
+    hidden: Vec<HiddenPath>, // typed file/dir masks for harness state and credentials
     network: Network,        // Off | Approved
 }
+pub struct HiddenPath { path: PathBuf, kind: HiddenKind } // File | Directory
 pub fn validate_root(root, home, harness_dir) -> Result<(), RootError>;
-pub fn seatbelt_profile(&Policy) -> (String, Vec<(String, OsString)>); // profile text + -D params
-pub fn bwrap_args(&Policy, &LaunchSpec) -> Vec<OsString>;
+pub fn seatbelt_profile(&Policy) -> Result<(String, Vec<(String, OsString)>), RootError>; // profile + -D params
+pub fn bwrap_args(&Policy, &LaunchSpec) -> Result<Vec<OsString>, RootError>;
 pub fn seccomp_programs(arch, network: Network) -> Result<Vec<Vec<u8>>, _>;
 pub fn environment(source, sandboxed: bool) -> Vec<(OsString, OsString)>;
+// Policy::environment adds the exact PATH dirs and per-session HOME/TMPDIR.
 ```
 
 **Root validation.** The root is refused when it is `/`, `$HOME`, an ancestor of `$HOME`, or a
@@ -242,7 +247,11 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
 - **Writes:** allowed under `ROOT` and `TEMP`. Denied: `(require-all (subpath ROOT)
   (regex #"/\.[Gg][Ii][Tt](/|$)"))`, `.elefante`, and each `read_only` entry.
 - **Reads:** allowed for the readable set; denied for `hidden` and secret-name regexes under `ROOT`.
-  `/private/etc` and `/private/var` are listed explicitly.
+  `/private/etc` and narrowly required `/private/var` descendants (for example `/private/var/db`)
+  are listed explicitly; the host's whole `/private/var` and shared temp directories are not.
+  Directory ancestors needed to traverse to these paths are allowed as exact `literal` matches,
+  never as `subpath` mounts. The S5 probe needed literal reads of `/`, `/Users` and `$HOME` for
+  process startup; the `$HOME` grant does not include its contents.
 - **Network:**
   - Off: **no** loopback; Unix sockets only under `TEMP` and `ROOT`.
   - Approved: all network, the DNS service included.
@@ -262,6 +271,10 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
 - `--setenv` for each allowlisted variable, `--chdir <root>`, repeated
   `--add-seccomp-fd <fd>` for the two filters, `--`, `<bash> -c <cmd>`
 
+The renderer fails closed unless it receives two distinct inherited seccomp descriptors above
+stderr and only allowlisted environment variables. The caller opens and passes the descriptors;
+the renderer performs no filesystem lookup.
+
 `/run` (apart from that one directory), `/var/run`, the host `/tmp`, `$XDG_RUNTIME_DIR` and
 `$HOME` are never bound.
 
@@ -270,7 +283,7 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
 | Program | Calls | Why |
 |---|---|---|
 | ENOSYS | `clone3`, `io_uring_setup/enter/register` | Runtimes fall back to `clone` and plain I/O |
-| EPERM | `unshare`, `setns`, the mount family, `ptrace`, `process_vm_readv/writev`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key`, module loading, `kexec_*` | Block escape and other-process access |
+| EPERM | `unshare`, `setns`, the mount family, `ptrace`, `process_vm_readv/writev`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key`, module loading, `kexec_*`, `ioctl(TIOCSTI)` | Block escape, terminal injection and other-process access |
 | EPERM | `socket()` for any family except `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` | `AF_VSOCK` is blocked |
 | EPERM, only under `Approved` | `socket(AF_UNIX)` | The host network namespace exposes abstract Unix sockets (X11, D-Bus); the DNS stub is UDP |
 
@@ -340,7 +353,8 @@ else refused.
 - Prefix flags: `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat
   -c core.editor=false -c sequence.editor=false -c protocol.allow=never -c credential.helper=
   -c commit.gpgSign=false -c tag.gpgSign=false -c gpg.program=false -c gpg.ssh.program=false
-  -c core.sshCommand=false -c diff.external=`.
+  -c core.sshCommand=false -c diff.external= -c core.attributesFile=/dev/null
+  -c merge.default=text`.
 - Environment cleared to: the fixed `PATH`, `LANG`, `GIT_CONFIG_NOSYSTEM=1`,
   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_ATTR_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`,
   `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` (per S10), `GIT_CEILING_DIRECTORIES`, and
@@ -350,8 +364,10 @@ else refused.
 - the root had no repository at session start;
 - the repo config has `include.path` or `includeIf` targets, or `core.hooksPath`, inside the
   root. A `hooksPath` target is also added to `read_only`;
-- the repo uses Git LFS (`filter=lfs` in `.gitattributes`). Otherwise harness commits would store
-  full blobs, because global config is skipped.
+- any worktree or indexed `.gitattributes`, or `.git/info/attributes`, activates a custom
+  `filter=` or `merge=` driver. Git can execute these during `add`, `checkout`, `merge` and related
+  writes. The scan is unpruned and includes the index fallback for a missing worktree file.
+  This covers Git LFS too: skipping its global config would otherwise store full blobs.
 
 **`mem/src/cochange.rs:280`** switches to `hardened` with the absolute git path.
 
@@ -527,7 +543,7 @@ operating systems. Every negative test has a positive control.
 | Network off | TCP and UDP over IPv4 and IPv6, and DNS, fail; loopback to a listener **started by the test process** fails on both platforms; Linux: loopback inside the sandbox works |
 | Network approved | With approval, TCP to a test listener works and a name resolves; Linux: an abstract-socket connect still fails |
 | `.git` | Writes to `.git/hooks/pre-commit`, `.git/config` and `.GIT/config` fail; a hard link to `.git/config` cannot be written; Linux: a new `sub/.git` and `target/.git` are quarantined. `git status` and `git log -p` work in the sandbox. Harness `git add` + `commit -m` work and `.git/hooks` stays unchanged. Refused: `git push`, `git fetch`, `git commit --amen`, `git commit -S`, `git merge -s x`, `git commit` without `-m`, `git log \| git commit`; `git diff --output=$HOME/x` fails at the OS |
-| Repo-config traps | `include.path` into the root, `hooksPath=.husky` and LFS: harness git refuses, and `.husky/` is read-only in the sandbox |
+| Repo-config traps | `include.path` into the root, `hooksPath=.husky`, LFS and custom filter/merge attributes: harness git refuses, and `.husky/` is read-only in the sandbox. A synthetic filter or merge-driver marker is not executed; the same Git write succeeds in a repository without those attributes. |
 | Harness state and secrets | `.elefante/` reads empty or is refused; in-root `.env` and `*.pem` are refused |
 | Root validation | A session rooted at `$HOME` or `/` gets `Unavailable`, and bash runs nothing |
 | Daemon and local services | A socket fixture at the daemon path, `$XDG_RUNTIME_DIR`, `/run` and `/private/tmp/…`: none reachable; a socket in the session temp dir is reachable |

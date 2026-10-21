@@ -278,21 +278,15 @@ pub fn run_bounded(command: &mut Command, timeout: Duration, max_bytes: usize) -
 }
 
 fn git(root: &Path) -> Command {
-    let mut command = Command::new("git");
+    // Keep the standalone indexer independent of the caller's PATH and git environment.
+    let invocation = elefante_guard::git::hardened(Path::new("/usr/bin/git"), root);
+    let mut command = Command::new(invocation.program);
     command
-        .arg("-C")
-        .arg(root)
-        // Nothing in the repository's own config may run a program on our behalf.
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_PAGER");
-    // Never discover a repository above `root`: a plain directory must read as "not a repository",
-    // not as whatever enclosing repository happens to exist.
-    if let Some(parent) = root.parent() {
-        command.env("GIT_CEILING_DIRECTORIES", parent);
-    }
+        .args(invocation.args)
+        .args(["-c", "core.quotepath=false"])
+        .current_dir(invocation.cwd)
+        .env_clear()
+        .envs(invocation.environment);
     command
 }
 

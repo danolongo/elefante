@@ -48,8 +48,10 @@ Git writes and web research go through harness-owned, allowlisted paths.
   Phase 0 uses separately approved CI-iteration commits and a results commit. GitHub returned
   404 for `workflow_dispatch` on a workflow absent from the default branch, so a trigger-fix
   commit added a `sandboxing` push event. The first Linux run exposed probe-harness errors,
-  requiring another iteration before its results can be trusted. Ask before every commit and
-  every push.
+  requiring another iteration before its results can be trusted. Phase 1 has one separately
+  approved Linux gate-fix commit after pinned Clippy found Linux-only lint errors; Phase 2 stays
+  blocked until that gate reruns green. Ask before every commit. The maintainer later authorized
+  pushes without a separate request.
 - **No `unsafe`.** The workspace forbids it. New dependencies:
   - `seccompiler`, Linux only, in `guard`: pure BPF compilation.
 - `rustix` 1.1.5 or later compatible release, in `core` and `mem`: safe `openat2` and

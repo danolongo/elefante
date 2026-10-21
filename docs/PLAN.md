@@ -705,6 +705,9 @@ so the temporary job runs on `sandboxing` pushes. Probe-harness errors are fixed
 recording Linux behavior. The maintainer deferred
 the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
 their results remain `not run` through M4 and must be obtained before completion is reported.
+The policy phase needed a separately approved gate-fix commit: pinned Linux Clippy saw two
+Linux-only lint errors after the first push. No runtime phase begins until the Linux gate reruns
+green; the test requirements are unchanged.
 - **Policy, in `guard`.** `guard::sandbox::Policy { root, home, harness_dir, protected, temp,
   readable, writable, read_only, hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
   programs (Linux). It is pure and tested by rendering. The root is validated before use: `/`,

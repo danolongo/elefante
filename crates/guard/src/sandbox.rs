@@ -19,6 +19,47 @@ pub enum Architecture {
     Aarch64,
 }
 
+#[cfg(target_os = "linux")]
+const ENOSYS_CALLS: &[i64] = &[435, 425, 426, 427];
+#[cfg(target_os = "linux")]
+const X86_64_EPERM_CALLS: &[i64] = &[
+    272, 308, 165, 166, 155, 428, 429, 430, 431, 432, 433, 442, 101, 310, 311, 321, 298, 323, 250,
+    248, 249, 175, 313, 176, 246, 320,
+];
+#[cfg(target_os = "linux")]
+const AARCH64_EPERM_CALLS: &[i64] = &[
+    97, 268, 40, 39, 41, 428, 429, 430, 431, 432, 433, 442, 117, 270, 271, 280, 241, 282, 219, 217,
+    218, 105, 273, 106, 104, 294,
+];
+
+#[cfg(target_os = "linux")]
+fn syscall_numbers(
+    arch: Architecture,
+) -> (
+    seccompiler::TargetArch,
+    &'static [i64],
+    &'static [i64],
+    i64,
+    i64,
+) {
+    match arch {
+        Architecture::X86_64 => (
+            seccompiler::TargetArch::x86_64,
+            ENOSYS_CALLS,
+            X86_64_EPERM_CALLS,
+            41,
+            16,
+        ),
+        Architecture::Aarch64 => (
+            seccompiler::TargetArch::aarch64,
+            ENOSYS_CALLS,
+            AARCH64_EPERM_CALLS,
+            198,
+            29,
+        ),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SeccompError {
     #[error("seccomp compilation is available only on Linux")]
@@ -27,7 +68,7 @@ pub enum SeccompError {
     Compile(String),
 }
 
-/// Compiles two stacked filters, with an explicit x32 guard on x86_64.
+/// Compiles two stacked filters, with an explicit x32 guard on `x86_64`.
 ///
 /// # Errors
 /// Returns an error on unsupported platforms or failed compilation.
@@ -38,57 +79,10 @@ pub fn seccomp_programs(
 ) -> Result<Vec<Vec<u8>>, SeccompError> {
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-        SeccompRule, TargetArch,
+        SeccompRule,
     };
     use std::collections::BTreeMap;
-    let (target, enosys, eperm, socket, ioctl): (TargetArch, &[i64], &[i64], i64, i64) = match arch
-    {
-        Architecture::X86_64 => (
-            TargetArch::x86_64,
-            &[435, 425, 426, 427],
-            &[
-                272,
-                308,
-                165,
-                166,
-                155,
-                pivot_root_number(),
-                428,
-                429,
-                430,
-                431,
-                432,
-                433,
-                442,
-                101,
-                310,
-                311,
-                321,
-                298,
-                323,
-                250,
-                248,
-                249,
-                175,
-                313,
-                176,
-                246,
-                320,
-            ],
-            41,
-            16,
-        ),
-        Architecture::Aarch64 => (
-            TargetArch::aarch64,
-            &[435, 425, 426, 427],
-            &[
-                97, 268, 40, 39, 41, 428, 429, 430, 431, 432, 433, 442, 117, 270, 271, 280, 241,
-                282, 219, 217, 218, 105, 273, 106, 104, 294,
-            ],
-            198,
-            29,
-        ),
-    };
+    let (target, enosys, eperm, socket, ioctl) = syscall_numbers(arch);
     let mut output = Vec::new();
     for (calls, errno) in [(enosys, 38), (eperm, 1)] {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
@@ -161,11 +155,6 @@ pub fn seccomp_programs(
         output.push(bytes);
     }
     Ok(output)
-}
-
-#[cfg(target_os = "linux")]
-const fn pivot_root_number() -> i64 {
-    155
 }
 
 /// # Errors

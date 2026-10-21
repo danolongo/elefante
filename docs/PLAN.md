@@ -43,7 +43,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 | UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | The same split opencode runs in production, so it is a proven shape rather than one invented here. A headless core is also what lets subagents run as further sessions of the same daemon (M6). |
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. |
 | Storage | Project graph in `<repo>/.elefante/`, self-ignoring; user-level keys and consent in `~/.elefante/` | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
-| Isolation | OS sandbox (Seatbelt on macOS, Landlock on Linux) plus a git worktree per editing subagent | Fast, nothing to install, and the same sandbox already wraps every bash call (M4). Containers were considered and not chosen. |
+| Isolation | OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux) plus a git worktree per editing subagent | Fast, nothing to install, and the same sandbox already wraps every bash call (M4). A microVM backend on macOS is a proposal for later; gVisor was considered and not chosen. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |
 | Provider | OpenRouter only | One transport, one auth, one code path. Reaching Claude via `anthropic/claude-opus-5` means this narrows the *code*, not the *models*. `Capabilities` survives and matters more, now resolved per model. |
 
@@ -517,8 +517,8 @@ rescope: a plan has no lines to cite, so its findings cannot be checked.
 
 ## Agent loop details
 
-Seven tools: `read`, `write`, `edit`, `glob`, `grep`, `bash`, `memory_search`; M6 adds `agent`, the
-eighth. Every tool is permanent prompt cost, so the bar for another is high.
+Seven tools: `read`, `write`, `edit`, `glob`, `grep`, `bash`, `memory_search`; M4 adds `web_search`
+and M6 adds `agent`, the ninth. Every tool is permanent prompt cost, so the bar for another is high.
 
 - Edits are exact-string-replace. Highest reliability, lowest tokens, no whole-file rewrites.
 - The system prompt stays under ~400 tokens because rules live in code: the sandbox *is* "don't touch anything outside the workspace"; the bash classifier *is* "don't run destructive commands"; the path policy *is* "never read .env"; the diff critic *is* "review before done".
@@ -688,36 +688,131 @@ network, inherits the daemon's environment — the API key included, when it was
 timeout. The classifier cannot fix this: every bypass costs another rule (`known_gaps()` lists eight
 classes). M4 moves enforcement to the operating system and lets the classifier go back to intent.
 
+**Threat model.** A prompt-injected model acting with the user's permissions. M4 stops three things:
+secrets leaving, network leaving, and files planted inside the root that something *outside* the
+sandbox later runs (git hooks, editor tasks — the class behind the July 2026 escapes in other agents).
+Kernel exploits are out of scope here; the microVM backend below is the answer to them.
+
+**The key never enters the sandbox.** The model runs at OpenRouter and every request comes from the
+daemon, which is not sandboxed. Sandboxed processes run model-chosen commands and never need the key,
+so there is no mapping or proxy to build: the key lives only in the daemon (and `credentials.toml`).
+
 **Baseline.** Design pass first, with a spike on both platforms.
-- **Policy, in `guard`.** `guard::sandbox::Policy { root, writable, readable, denied, network }`,
-  rendered to a Seatbelt profile (macOS) or a Landlock ruleset (Linux). Pure, and tested by rendering.
-  Writable: the session root and a private temp directory. Denied: `~/.elefante`, `~/.ssh`, and the
-  built-in credential paths. Network: off.
-- **Applied, in `core::tools`.** macOS runs `sandbox-exec -p <profile> bash -c …`. Linux re-runs the
-  binary as `elefante sandbox-exec -- bash -c …`, which restricts itself with Landlock and then execs
-  bash — safe Rust, since the workspace forbids the `unsafe` a `pre_exec` hook would need. Landlock
-  ABI ≥ 4 also restricts TCP; what to do on older kernels is decided in the design pass.
+- **Policy, in `guard`.** `guard::sandbox::Policy { root, readable, writable, protected, network }`,
+  rendered to a Seatbelt profile (macOS) or a Landlock ruleset plus seccomp filter (Linux). Pure, and
+  tested by rendering. Readable: the root, system directories and the toolchains (`CARGO_HOME`,
+  `RUSTUP_HOME`) — an allowlist, because Landlock can only grant. Writable: the root and a private temp
+  directory. Protected (read-only inside the writable root): `.git` — and the directory a `.git` file
+  points to — and `.elefante/`. Never readable: `~/.elefante`, `~/.ssh` and the built-in credential
+  paths. Network: off.
+- **macOS.** `/usr/bin/sandbox-exec -p <profile> bash -c …` with a deny-by-default profile. Protected
+  paths are denied by pattern, so a `.git` created later anywhere in the root is covered too. Network,
+  Unix-socket connections and the DNS resolver's service are denied.
+- **Linux.** The daemon runs `/proc/self/exe sandbox-exec <policy> -- bash -c <command>` — the running
+  binary, never a path, which a `cargo build` inside the root could replace. The helper closes every
+  descriptor except stdin, stdout and stderr (Landlock does not cover files opened before it), sets
+  `no_new_privs`, applies Landlock and seccomp to itself, then starts bash; everything bash starts
+  inherits both, and neither can be undone. Safe Rust through the `landlock` and `seccompiler` crates.
+  - **Landlock** (files and TCP): the path allowlist above; TCP connect and bind with no port allowed;
+    from ABI 6, no signals to and no abstract-socket connections outside the sandbox; from ABI 9, no
+    connections to pathname Unix sockets outside it. ABI 4 is the minimum: below it, bash refuses.
+  - **seccomp** (system calls): `socket()` is refused for every address family but `AF_UNIX` — so no
+    TCP, UDP, ICMP or raw sockets, over IPv4 or IPv6 — and for `AF_UNIX` too below Landlock ABI 9
+    (`socketpair` stays allowed; it reaches nothing outside). Also refused: `io_uring_*` (it opens
+    sockets without calling `socket()`), `ptrace`, namespace creation (`unshare`, `setns`, `clone` and
+    `clone3` with namespace flags), the mount calls, `bpf` and `keyctl`. A system call from another
+    architecture kills the process.
+  - **DNS** is covered by the same rules: every resolver path needs an internet socket or a Unix socket
+    (systemd-resolved, nscd).
+  - **`.git` is detected and restored, not blocked.** Landlock rules only grant, and a grant on the
+    root covers everything beneath it, so a read-only `.git` cannot be carved out of a writable root.
+    Before each command the daemon snapshots `.git` except `objects/`; after it, once every process the
+    command started is dead, it compares, restores any change and says in the tool result what it
+    reverted. The same pass finds any new `.git` elsewhere in the root, deletes it and reports it. The
+    design pass measures the cost of that scan on a large `target/`.
+- **Every process a command started ends with it.** On Linux the helper is a child subreaper: it starts
+  bash rather than becoming it, and when bash exits it kills whatever is left, including processes
+  that left the process group. That closes the window in which a leftover process could rewrite `.git`
+  after the check or swap a symlink under the daemon's `read`. On macOS the process group is killed;
+  the design pass decides whether that is enough.
+- **The daemon's socket requires a token.** At start the daemon writes 128 random bits to
+  `~/.elefante/run/token` (`0600`); every connection presents it first, and the CLI and TUI read it
+  there. The sandbox cannot read `~/.elefante`, so a command that reaches the socket still cannot
+  create a session, resolve an approval, set the key or change memory.
+- **Git goes through the harness.** `.git` is read-only, so the read commands (`status`, `diff`, `log`,
+  `show`, `blame`) run in the sandbox with `GIT_OPTIONAL_LOCKS=0`. A bash call that is a single plain
+  `git <subcommand> …` — no pipe, `&&`, redirection or substitution — is run by the daemon instead,
+  outside the sandbox, through one hardened git helper:
+  - Subcommands are allowlisted (the local ones: `add`, `rm`, `mv`, `restore`, `commit -m`, `switch`,
+    `branch`, `stash`, `tag`, `reset`, `merge`, `cherry-pick`, non-interactive `rebase`, plus the read
+    commands). Refused: anything touching remotes or configuration (`push`, `pull`, `fetch`, `clone`,
+    `remote`, `submodule`, `config`, `credential`), the options `-c`, `-C`, `--git-dir`, `--work-tree`
+    and `--exec-path`, and unknown subcommands, so aliases never resolve. The classifier's destructive
+    forms stay `Deny`. A git write inside a compound command is refused with a message asking for one
+    git command per call.
+  - Every invocation passes `-c protocol.allow=never` (no transport works) and turns off everything
+    that runs a program: hooks (`core.hooksPath=/dev/null`), fsmonitor, the pager, external diff,
+    textconv, the editor, credential helpers and signing. System and global configuration are skipped;
+    `user.name` and `user.email` are passed explicitly.
+  - Output is scrubbed and capped like bash. The argument and environment builder lives in `guard`
+    (pure); the existing hardening in `mem/src/cochange.rs`, the M5 diff critic and the M6 worktree and
+    `git apply` all use it.
+  - **Hooks do not run on the agent's commits** (in effect `--no-verify`). The design pass decides
+    whether `pre-commit` and `commit-msg` hooks run inside the sandbox before the harness commits.
+- **`web_search`, the eighth tool.** Bash never gets the internet for research; the daemon searches
+  instead and returns the results as an ordinary tool result (untrusted content), capped. The query is
+  an outbound channel, so it is scrubbed, length-capped and shown to the user. The design pass picks
+  the backend, preferring OpenRouter's web search because it needs no second key. There is no
+  fetch-a-URL tool: a URL the model chooses is an exfiltration channel.
+- **The standing prompt** gains two lines: `.git` is read-only and git runs one command per call with
+  no remotes; research goes through `web_search`. It stays within the 400-token budget.
 - **Fail closed.** If the sandbox cannot be applied, bash does not run and the error names why.
-  `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set.
+  `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set. Nothing in
+  the workspace can change the policy: it is built from the daemon's own configuration only.
 - **Process hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`, `LANG`, `TERM`,
-  `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`); `OPENROUTER_API_KEY` is never passed. `bash -c`, not a login
-  shell. A wall-clock timeout (120 s default) kills the whole process group. Model-facing output of
-  `bash`, `read` and `grep` is capped, keeping head and tail and stating the size cut.
-- **Network on request.** A command that needs the network escalates; approving it runs that one
-  command with network on.
+  `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `GIT_OPTIONAL_LOCKS`); `OPENROUTER_API_KEY` is never passed.
+  `bash -c`, not a login shell. A wall-clock timeout (120 s default) kills the command. Model-facing
+  output of `bash`, `read` and `grep` is capped, keeping head and tail and stating the size cut.
+- **Network on request.** A command that needs the network (a dependency fetch) escalates; approving
+  it runs that one command without the network rules. It then has the whole internet — there is no
+  per-domain filter in M4. Loopback is network too: a test that binds `127.0.0.1` needs approval,
+  because Landlock matches ports, not addresses, and seccomp cannot read the address.
 - **The classifier shrinks.** With paths enforced by the OS, the `.elefante` argument scanning in
   `guard/src/bash.rs` (glob forms, grep/rg flag tables) is deleted. The classifier keeps intent:
-  destructive and privileged commands are denied, unknown ones ask.
+  destructive and privileged commands are denied, unknown ones ask, plain git is routed.
+
+**Proposals, outside M4's gate.**
+- **A second lock on harness git.** Run the git helper itself under a sandbox profile — network off,
+  `.git` writable except `hooks/`, `config` and `info/` — so a gap in the allowlist still cannot reach
+  the network or plant a hook.
+- **A per-domain egress proxy**, so an approved command reaches only named hosts. On Linux this needs a
+  network namespace, which Landlock and seccomp alone cannot provide.
+- **A microVM backend on macOS** (Apple `container`, which targets macOS 26, or Docker Sandboxes)
+  behind a `Backend` trait that M4 shapes but does not implement. It isolates the kernel too, and is
+  the fallback if Apple removes `sandbox-exec`. gVisor was considered and not chosen: Linux only, so on
+  a Mac it needs Docker Desktop's VM, builds a Linux toolchain rather than the one shipped, and Docker's
+  privileged daemon is itself a known way out.
 
 **Gate.**
 - Each harness-state bypass in `known_gaps()` — a shell variable naming the path, `cd` then a relative
   path, `sqlite3` with an assembled path, `xargs` — is classified `Allow` and blocked by the OS.
-- Reading a `~/.ssh` fixture, writing outside the root, and connecting to a loopback listener all fail;
-  with approval, the connection succeeds.
-- A child sees no `OPENROUTER_API_KEY` while the daemon has one in its environment.
-- The timeout kills the process group, including a grandchild; an oversized output arrives capped.
+- Reading a `~/.ssh` fixture and writing outside the root fail. TCP and UDP to loopback over IPv4 and
+  IPv6, and a DNS lookup of a public name, all fail; with approval, the TCP connection succeeds.
+- Writing `.git/hooks/pre-commit` or `.git/config` is blocked (macOS) or reverted and reported (Linux);
+  a new `sub/.git` is removed and reported. `git status` works inside the sandbox; `git commit -m`
+  through the harness works; `git push`, `git fetch` and `git -c core.hooksPath=… commit` are refused.
+- Connecting to the daemon's socket from inside fails, and a connection without the token is refused.
+- A child sees no `OPENROUTER_API_KEY` while the daemon has one in its environment, and reading the
+  daemon's environment (`/proc/$PPID/environ`, `ps eww` on macOS) fails.
+- Linux: replacing `target/debug/elefante` between two calls does not change the helper; only
+  descriptors 0–2 are open inside; `io_uring_setup` is refused.
+- A symlink and a hard link to a `~/.ssh` fixture are refused by `read`, including a link swapped in
+  while `read` runs.
+- The timeout kills a grandchild, a process that left the group is gone when its command ends (Linux),
+  and an oversized output arrives capped.
+- A `web_search` query containing a secret fixture is scrubbed before it leaves.
 - With the sandbox unavailable, bash refuses and never runs unsandboxed.
-- Green on the macOS and Linux CI runners.
+- Green on the macOS and Linux CI runners; the Linux job first asserts Landlock ABI ≥ 4.
 - **M0–M3 gates still green**, after the classifier shrinks.
 
 ### M5 — Critics
@@ -749,7 +844,7 @@ provider; the critic and triage roles (§ Role configuration).
 ### M6 — Subagents
 
 **Baseline.** Design pass first.
-- **The `agent` tool** (the eighth): `{ prompt, mode: read_only | edit, max_rounds, max_cost }`,
+- **The `agent` tool** (the ninth): `{ prompt, mode: read_only | edit, max_rounds, max_cost }`,
   returning a summary, the diff stat and the critic's findings.
 - **Isolation.** A subagent is a further daemon session. An `edit` subagent works in its own
   `git worktree` under `<repo>/.elefante/worktrees/<id>` — self-ignored, already denied to the parent

@@ -224,6 +224,12 @@ pub fn validate_root(root: &Path, home: &Path, harness_dir: &Path) -> Result<(),
         || home.starts_with(root)
         || root.starts_with(harness_dir)
         || harness_dir.starts_with(root)
+        || root.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".git")
+        })
     {
         return Err(RootError::ProtectedRoot);
     }
@@ -385,7 +391,7 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
         ("TEMP".into(), policy.temp.clone().into_os_string()),
     ];
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(allow process-exec process-fork)\n(allow signal (target self))\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow file-read* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(allow file-write* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(deny file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.[Gg][Ii][Tt](/|$)\")))\n(deny file-read* (require-all (subpath (param \"ROOT\")) (regex #\"/(\\.env(\\.[^/]*)?|\\.netrc|\\.npmrc|\\.git-credentials|id_rsa[^/]*|[^/]*\\.[Pp][Ee][Mm]|[^/]*\\.[Kk][Ee][Yy])(/|$)\")))\n(deny file-read* file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.elefante(/|$)\")))\n",
+        "(version 1)\n(deny default)\n(allow process-exec process-fork)\n(allow signal (target self))\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow file-write* (literal \"/dev/null\"))\n(allow file-read* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(allow file-write* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(deny file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.[Gg][Ii][Tt](/|$)\")))\n(deny file-read* (require-all (subpath (param \"ROOT\")) (regex #\"/(\\.env(\\.[^/]*)?|\\.netrc|\\.npmrc|\\.git-credentials|id_rsa[^/]*|[^/]*\\.[Pp][Ee][Mm]|[^/]*\\.[Kk][Ee][Yy])(/|$)\")))\n(deny file-read* file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.elefante(/|$)\")))\n",
     );
     profile = profile.replace("(target self)", "(target same-sandbox)");
     let mut traversal = BTreeSet::new();
@@ -436,10 +442,9 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
     profile.push_str("(allow mach-lookup (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
     profile.push_str("(allow mach-lookup (global-name \"com.apple.cfprefsd.daemon\") (global-name \"com.apple.cfprefsd.agent\") (global-name \"com.apple.bsd.dirhelper\"))\n");
     if policy.network == Network::Approved {
-        profile.push_str("(allow network*)\n(allow mach-lookup (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.networkd\") (global-name \"com.apple.mDNSResponder\"))\n");
-    } else {
-        profile.push_str("(allow network* (local unix-socket (subpath (param \"ROOT\"))) (remote unix-socket (subpath (param \"ROOT\"))) (local unix-socket (subpath (param \"TEMP\"))) (remote unix-socket (subpath (param \"TEMP\"))))\n");
+        profile.push_str("(allow network-outbound (remote tcp) (remote udp) (literal \"/private/var/run/mDNSResponder\"))\n(allow mach-lookup (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.networkd\") (global-name \"com.apple.mDNSResponder\"))\n");
     }
+    profile.push_str("(allow network* (local unix-socket (subpath (param \"ROOT\"))) (remote unix-socket (subpath (param \"ROOT\"))) (local unix-socket (subpath (param \"TEMP\"))) (remote unix-socket (subpath (param \"TEMP\"))))\n");
     Ok((profile, params))
 }
 

@@ -693,10 +693,12 @@ fn output(event: OutputEvent) -> NotificationEvent {
             approval_id,
             command,
             rule,
+            network,
         } => NotificationEvent::ApprovalRequested {
             approval_id,
             command,
             rule: rule.to_owned(),
+            network,
         },
         OutputEvent::ApprovalResolved {
             approval_id,

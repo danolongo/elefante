@@ -27,6 +27,8 @@ fn roots_cannot_enclose_home_or_overlap_harness() {
         "/users/alice",
         "/users/alice/.elefante",
         "/users/alice/.elefante/x",
+        "/work/project/.git",
+        "/work/project/.GIT/objects",
     ] {
         assert!(
             validate_root(
@@ -40,6 +42,14 @@ fn roots_cannot_enclose_home_or_overlap_harness() {
     assert!(
         validate_root(
             "/work/project".as_ref(),
+            "/users/alice".as_ref(),
+            "/users/alice/.elefante".as_ref()
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_root(
+            "/work/project/.github".as_ref(),
             "/users/alice".as_ref(),
             "/users/alice/.elefante".as_ref()
         )
@@ -68,6 +78,17 @@ fn seatbelt_never_interpolates_paths_and_rejects_injection() {
         p.root = name.into();
         assert!(seatbelt_profile(&p).is_err());
     }
+}
+
+#[test]
+fn approved_seatbelt_network_does_not_grant_arbitrary_unix_sockets() {
+    let mut policy = policy();
+    policy.network = Network::Approved;
+    let (profile, _) = seatbelt_profile(&policy).expect("approved profile");
+    assert!(!profile.contains("(allow network*)\n"));
+    assert!(profile.contains("(allow network-outbound (remote tcp) (remote udp)"));
+    assert!(profile.contains("(literal \"/private/var/run/mDNSResponder\")"));
+    assert!(profile.contains("(remote unix-socket (subpath (param \"TEMP\")))"));
 }
 
 #[test]

@@ -243,6 +243,7 @@ mod tests {
             }],
             effort: None,
             response_schema: None,
+            web_search: None,
         };
         assert!(validate_pairing(&request).is_err());
         let result = Message {

@@ -83,6 +83,13 @@ pub struct ResponseSchema {
     pub schema: Value,
 }
 
+/// Opt-in web grounding. The transport pins Exa rather than allowing native search.
+/// Callers validate result limits before submitting a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebSearch {
+    pub max_results: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub model: ModelId,
@@ -93,6 +100,8 @@ pub struct Request {
     pub effort: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<ResponseSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<WebSearch>,
 }
 
 impl Request {
@@ -106,6 +115,7 @@ impl Request {
             messages,
             effort: None,
             response_schema: None,
+            web_search: None,
         }
     }
 }

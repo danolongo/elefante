@@ -4,6 +4,7 @@
 (allow signal (target same-sandbox))
 (allow sysctl-read)
 (allow file-read-metadata)
+(allow file-write* (literal "/dev/null"))
 (allow file-read* (subpath (param "ROOT")) (subpath (param "TEMP")))
 (allow file-write* (subpath (param "ROOT")) (subpath (param "TEMP")))
 (deny file-write* (require-all (subpath (param "ROOT")) (regex #"/\.[Gg][Ii][Tt](/|$)")))

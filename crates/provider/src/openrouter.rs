@@ -79,6 +79,12 @@ impl OpenRouterProvider {
         // counts and no `cost`, which M5 attribution depends on.
         body.insert("usage".into(), json!({ "include": true }));
 
+        if let Some(search) = request.web_search {
+            body.insert(
+                "plugins".into(),
+                json!([{ "id": "web", "engine": "exa", "max_results": search.max_results }]),
+            );
+        }
         if !request.tools.is_empty() {
             body.insert("tools".into(), tools_json(&request.tools));
             // Confine routing to endpoints that honour every parameter sent.

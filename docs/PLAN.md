@@ -708,21 +708,31 @@ their results remain `not run` through M4 and must be obtained before completion
 The policy phase needed a separately approved gate-fix commit: pinned Linux Clippy saw two
 Linux-only lint errors after the first push. No runtime phase begins until the Linux gate reruns
 green; the test requirements are unchanged.
+The runtime phase moves Linux CI's bubblewrap and SQLite installation and user-namespace probe
+ahead of the later two-OS matrix change, because runtime tests must exercise isolation before
+that phase can pass its gate.
 - **Policy, in `guard`.** `guard::sandbox::Policy { root, home, harness_dir, protected, temp,
   readable, writable, read_only, hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
   programs (Linux). It is pure and tested by rendering. The root is validated before use: `/`,
-  `$HOME`, ancestors of `$HOME`, and paths containing or contained by `~/.elefante` make the
+  `$HOME`, ancestors of `$HOME`, paths containing or contained by `~/.elefante`, and paths with a
+  case-insensitive `.git` component make the
   sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
   harness state. Readable paths are the root, system directories and exact executable/toolchain
   directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
-  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Hidden paths carry
-  an explicit file/directory kind so rendering performs no filesystem lookup. The home,
+  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Linux mounts exact
+  resolver files, not all of `/etc`, so approved DNS can use libc. Hidden paths carry an explicit
+  file/directory kind so rendering performs no filesystem lookup. The home,
   harness directory and exact socket/token paths let renderers reject overlapping readable
   mounts, including custom socket locations. Network is off by default.
 - **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
   Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
   reads and `.git` writes (in any case) are denied by pattern, including new nested directories.
-  Off denies host loopback; approved network enables it. Host process inspection, keychain,
+  An exact literal write exception for `/dev/null` lets Git reads open the cleared global config
+  target read-write; no general out-of-root write grant is made.
+  A Git read with `--output=<outside-scratch-path>` must still fail at the OS; `$HOME` inside
+  the sandbox is private session temp, so it is not a suitable outside-root test target.
+  Off denies host loopback; approved network enables outbound TCP/UDP and the exact system DNS
+  socket while other Unix sockets remain restricted to the root and session temp. Host process inspection, keychain,
   pasteboard, Apple Events and launchd submission are denied. System reads use exact directories;
   the host's whole `/private/var` is excluded, with required descendants tested during the
   runtime gate. The profile grants exact literal reads of directory ancestors needed for path
@@ -768,7 +778,9 @@ green; the test requirements are unchanged.
   run on harness commits. Git attributes can select custom clean/smudge filters or merge drivers,
   so the harness also refuses a repository with any `filter=` or custom `merge=` attribute in
   the worktree, index fallback or `.git/info/attributes`. The invocation disables global
-  attributes and an implicit custom merge default. The pure invocation builder also hardens
+  attributes and an implicit custom merge default. Local repository config defining executable
+  `filter.*` or `merge.*.driver` is refused too, because a target revision may introduce
+  attributes during checkout. The pure invocation builder also hardens
   indexer git.
 - **`web_search`, the eighth tool.** Bash never gets the internet for research; the daemon searches
   instead and returns the results as an ordinary tool result (untrusted content), capped. The query is
@@ -776,7 +788,9 @@ green; the test requirements are unchanged.
   the backend, preferring OpenRouter's web search because it needs no second key. There is no
   fetch-a-URL tool: a URL the model chooses is an exfiltration channel.
 - **The standing prompt** gains two lines: `.git` is read-only and git runs one command per call with
-  no remotes; research goes through `web_search`. It stays within the 400-token budget.
+  no remotes; research goes through `web_search`. It stays within the 400-token budget. The
+  per-session search cap is reserved in `check_with_tools` before parallel dispatch, using state
+  shared by executor clones; `check_in` remains the pure bash policy entry point.
 - **Fail closed.** If the sandbox cannot be applied, bash does not run and the error names why.
   `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set. Nothing in
   the workspace can change the policy: it is built from the daemon's own configuration only.
@@ -792,14 +806,19 @@ green; the test requirements are unchanged.
   regular files and write by same-directory rename. The macOS `rustix` flag for this needs
   `rustix` 1.1.5 or later: 1.1.4 lacks `OFlags::NOFOLLOW_ANY`.
 - **Network on request.** `network: true` escalates and, if approved, enables the network for
-  that one sandboxed call. It then has the whole internet, with no per-domain filter. macOS host
+  that one sandboxed call, including an otherwise unclassified command such as `curl`; denied
+  commands stay denied and harness Git stays network-off. It then has the whole internet, with no per-domain filter. macOS host
   loopback needs approval; Linux's private loopback works inside the network-off sandbox and
   cannot reach the host listener. This repository's existing tests bind host loopback, so a
   full `cargo test` run inside the macOS sandbox requires network approval; the off-profile
   probe failed exactly those ten tests and the approved-profile probe passed all 553.
 - **The classifier shrinks.** With paths enforced by the OS, the `.elefante` argument scanning in
   `guard/src/bash.rs` (glob forms, grep/rg flag tables) is deleted. The classifier keeps intent:
-  destructive and privileged commands are denied, unknown ones ask, plain git is routed.
+  destructive and privileged commands are denied, unknown ones ask, plain git is routed. A
+  directory-only `cd` may name a protected directory so the OS denial is exercised, while
+  literal content readers still deny; only read-only `sqlite3 <db> .schema` and exact `xargs cat`
+  are newly allowed for the bypass gate. When the sandbox is disabled, every Bash call escalates
+  before any of these rules apply.
 
 **Proposals, outside M4's gate.**
 - **Landlock inside bubblewrap**, as an additional Linux restriction if it brings measurable

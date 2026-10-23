@@ -233,20 +233,26 @@ pub fn environment(source, sandboxed: bool) -> Vec<(OsString, OsString)>;
 // Policy::environment adds the exact PATH dirs and per-session HOME/TMPDIR.
 ```
 
-**Root validation.** The root is refused when it is `/`, `$HOME`, an ancestor of `$HOME`, or a
-path containing or contained by `~/.elefante`. A refused root makes the session's sandbox
+**Root validation.** The root is refused when it is `/`, `$HOME`, an ancestor of `$HOME`, a path
+containing or contained by `~/.elefante`, or a path with a case-insensitive `.git` component.
+A refused root makes the session's sandbox
 `Unavailable`, so bash refuses.
 
 **The readable set never contains:**
 - `$HOME` itself, `~/.ssh` or `~/.elefante`;
 - a tool root (exact PATH dirs only);
 - the socket or token path. The renderer asserts this.
+Linux includes only the exact resolver files `/etc/resolv.conf`, `/etc/nsswitch.conf` and
+`/etc/hosts`, so approved DNS can use libc without exposing the rest of `/etc`; Off still has
+an isolated network namespace.
 
 **Seatbelt** (deny default):
 - **No path is pasted into the profile text.** Every path is a `-D KEY=value` parameter referenced
   with `(param "KEY")`. A path containing a quote, backslash or control character is refused. Only
   constant regexes are used, so there is nothing to regex-quote.
-- **Writes:** allowed under `ROOT` and `TEMP`. Denied: `(require-all (subpath ROOT)
+- **Writes:** allowed under `ROOT` and `TEMP`, plus an exact literal `/dev/null` exception
+  needed by sandboxed Git reads using the cleared `GIT_CONFIG_GLOBAL=/dev/null`. No other
+  out-of-root write path is granted. Denied: `(require-all (subpath ROOT)
   (regex #"/\.[Gg][Ii][Tt](/|$)"))`, `.elefante`, and each `read_only` entry.
 - **Reads:** allowed for the readable set; denied for `hidden` and secret-name regexes under `ROOT`.
   `/private/etc` and narrowly required `/private/var` descendants (for example `/private/var/db`)
@@ -256,7 +262,8 @@ path containing or contained by `~/.elefante`. A refused root makes the session'
   process startup; the `$HOME` grant does not include its contents.
 - **Network:**
   - Off: **no** loopback; Unix sockets only under `TEMP` and `ROOT`.
-  - Approved: all network, the DNS service included.
+  - Approved: outbound TCP/UDP and the exact system mDNSResponder socket; Unix sockets remain
+    limited to `TEMP` and `ROOT`. A broad `allow network*` would expose daemon sockets.
 - **Mach services:** a short allowlist from S5.
 - **Denied:** `process-info*` on other processes, Apple Events, and the pasteboard, keychain and
   launchd submission (S5).
@@ -370,6 +377,9 @@ else refused.
   `filter=` or `merge=` driver. Git can execute these during `add`, `checkout`, `merge` and related
   writes. The scan is unpruned and includes the index fallback for a missing worktree file.
   This covers Git LFS too: skipping its global config would otherwise store full blobs.
+- local repository config defines an executable `filter.*` command or `merge.*.driver`, even
+  when current attributes do not select it: a target revision checked out by the agent may
+  introduce attributes that activate the driver.
 
 **`mem/src/cochange.rs:280`** switches to `hardened` with the absolute git path.
 
@@ -448,12 +458,13 @@ post-scan first. Parallel bash calls stay parallel.
   turn until the timeout.
 - Replaces `wait_with_output`.
 
-**Timeout.** `ELEFANTE_BASH_TIMEOUT_SECS` (default 120). On expiry, `BashProcessGroup` kills the
-group (`tools.rs:20`). On Linux the PID namespace also takes down `setsid` orphans.
+**Timeout.** `ELEFANTE_BASH_TIMEOUT_SECS` (default 120). On expiry, the process-group guard in
+`core/src/sandbox.rs` kills the group. On Linux the PID namespace also takes down `setsid`
+orphans.
 
 **Input and output.**
 - Input: optional `network: bool`.
-- Output cap: `clip_middle` (reusing `clip`, `lib.rs:746`). Limits: bash and grep 32 KiB; read
+- Output cap: `clip_middle` in `tools.rs`. Limits: bash, grep and web_search 32 KiB; read
   128 KiB.
 - When stderr shows EROFS on `.git` (from a read-only git command that tried to write), one hint
   is appended: "run git write commands on their own".
@@ -474,10 +485,14 @@ group (`tools.rs:20`). On Linux the PID namespace also takes down `setsid` orpha
    - `Refused`: `Deny`;
    - `Harness`: `Escalate`, then `tools.git` runs it.
 3. The classifier.
-4. `network: true`: `Allow` becomes `Escalate (network-requested)`; `Deny` stays `Deny`.
+4. `network: true`: any non-denied shell command becomes `Escalate (network-requested)`;
+   `Deny` stays `Deny`. Harness Git keeps its own approval and never gets network. This also
+   covers an otherwise unclassified `curl`, so one approved request can actually fetch.
 
-**For `web_search`:** `Allow` up to the per-session cap, then `Escalate`. `check_in` is extended,
-because it currently allows every non-bash tool (`lib.rs:196`).
+**For `web_search`:** `Allow` up to the per-session cap, then `Escalate`. The actual
+`execute_calls` path uses `check_with_tools`, layered over `check_in`, so it can reserve against
+the executor's shared session counter before concurrent calls start; `check_in` remains the pure
+bash policy entry point.
 
 **Approval events** carry a structured `network: bool` field, not a prefix in `command`. An
 approved escalation still runs sandboxed; only `network-requested` switches to
@@ -487,6 +502,10 @@ approved escalation still runs sandboxed; only `network-requested` switches to
 - Delete `names_harness_dir_by_glob`, `searches_harness_state`, and the `GREP_*`/`RG_*` tables.
 - Keep the literal secret-path `Deny`, destructive and privileged `Deny`, and
   `environment-disclosure`.
+- A directory-only `cd` is an explicit exception to literal secret-path `Deny`, so the former
+  `cd .elefante && cat x` bypass reaches the OS test; literal content readers remain denied.
+  Only the read-only `sqlite3 <db> .schema` form and exact `xargs cat` join the intent allowlist.
+  `Disabled` still escalates every Bash call before the classifier runs.
 - In `known_gaps()`, the four harness-state entries become "enforced by the OS sandbox".
 - The asserting tests (`crates/guard/tests/bash_classifier.rs:189-271`) become sandbox tests. The
   old → new mapping is recorded in `docs/M4_milestone.md`; this is the written renegotiation
@@ -535,6 +554,10 @@ Two sentences are added:
 
 ### Phase 2 gate
 
+Linux CI installs `bubblewrap` and `sqlite3` and checks user namespaces in this phase, rather
+than waiting until Phase 4: without them the runtime tests would fail at setup instead of
+testing isolation. Phase 4 keeps the planned two-OS matrix change.
+
 Tests live in `crates/{core,elefante}/tests/sandbox.rs` and run the real sandbox on both CI
 operating systems. Every negative test has a positive control.
 
@@ -544,8 +567,8 @@ operating systems. Every negative test has a positive control.
 | Outside the root | A `~/.ssh` fixture read and a write outside the root fail; `$CARGO_HOME/credentials.toml` is hidden; reading the root and toolchains works |
 | Network off | TCP and UDP over IPv4 and IPv6, and DNS, fail; loopback to a listener **started by the test process** fails on both platforms; Linux: loopback inside the sandbox works |
 | Network approved | With approval, TCP to a test listener works and a name resolves; Linux: an abstract-socket connect still fails |
-| `.git` | Writes to `.git/hooks/pre-commit`, `.git/config` and `.GIT/config` fail; a hard link to `.git/config` cannot be written; Linux: a new `sub/.git` and `target/.git` are quarantined. `git status` and `git log -p` work in the sandbox. Harness `git add` + `commit -m` work and `.git/hooks` stays unchanged. Refused: `git push`, `git fetch`, `git commit --amen`, `git commit -S`, `git merge -s x`, `git commit` without `-m`, `git log \| git commit`; `git diff --output=$HOME/x` fails at the OS |
-| Repo-config traps | `include.path` into the root, `hooksPath=.husky`, LFS and custom filter/merge attributes: harness git refuses, and `.husky/` is read-only in the sandbox. A synthetic filter or merge-driver marker is not executed; the same Git write succeeds in a repository without those attributes. |
+| `.git` | Writes to `.git/hooks/pre-commit`, `.git/config` and `.GIT/config` fail; a hard link to `.git/config` cannot be written; Linux: a new `sub/.git` and `target/.git` are quarantined. `git status` and `git log -p` work in the sandbox. Harness `git add` + `commit -m` work and `.git/hooks` stays unchanged. Refused: `git push`, `git fetch`, `git commit --amen`, `git commit -S`, `git merge -s x`, `git commit` without `-m`, `git log \| git commit`; `git diff --output=<outside-scratch-path>` fails at the OS. `$HOME` is private session temp, so it is not an outside-root control. |
+| Repo-config traps | `include.path` into the root, `hooksPath=.husky`, LFS, custom filter/merge attributes or configured executable filter/merge drivers: harness git refuses, and `.husky/` is read-only in the sandbox. A synthetic filter or merge-driver marker is not executed; the same Git write succeeds in a repository without those traps. |
 | Harness state and secrets | `.elefante/` reads empty or is refused; in-root `.env` and `*.pem` are refused |
 | Root validation | A session rooted at `$HOME` or `/` gets `Unavailable`, and bash runs nothing |
 | Daemon and local services | A socket fixture at the daemon path, `$XDG_RUNTIME_DIR`, `/run` and `/private/tmp/…`: none reachable; a socket in the session temp dir is reachable |
@@ -611,8 +634,8 @@ fetch URLs named in a query. The daemon's `WebSearch` implementation runs one re
 
 **CI:**
 - `rust` becomes a matrix of `ubuntu-24.04` and `macos-latest`, each running fmt, clippy and test.
-- Linux setup: `apt-get install bubblewrap`, plus S1's userns step, then assert
-  `bwrap --unshare-all --disable-userns --die-with-parent true`.
+- Linux setup for the existing Rust leg moved to Phase 2 so its runtime gate can execute;
+  Phase 4 retains that setup in the new matrix.
 - msrv stays Linux-only and checks all targets; the advisory lints job is unchanged.
 - `credentialed.yml` gains the `web_search` test.
 

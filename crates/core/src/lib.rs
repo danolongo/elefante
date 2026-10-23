@@ -1,7 +1,10 @@
 //! Provider-neutral agent loop.
 
+pub mod file_access;
+pub mod harness_git;
 pub mod learn;
 pub mod memory;
+pub mod sandbox;
 pub mod tools;
 
 use std::{
@@ -13,8 +16,9 @@ use std::{
     time::Instant,
 };
 
+use crate::sandbox::Sandbox;
 use crate::tools::{ToolExecutor, ToolResult, definitions as tool_definitions};
-use elefante_guard::{BashClassifier, Verdict};
+use elefante_guard::{BashClassifier, Verdict, git::GitRoute};
 use elefante_provider::{
     ContentBlock, Effort, Event, Message, ModelId, Provider, ProviderError, ReasoningDetail,
     Request, Role, StopReason, ToolDefinition, Usage,
@@ -29,7 +33,7 @@ use tokio::{
 pub use tokio_util::sync::CancellationToken;
 
 /// The stable standing instructions. Safety and filesystem policy live in code.
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. Never read or edit `.elefante/`, which belongs to the harness.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Elefante, a coding agent working in the current repository. Inspect before editing. Use tools when they provide evidence or are needed to make a change. Keep changes focused, preserve existing behavior unless the request changes it, and verify completed work. Report the result and any remaining uncertainty plainly. Never read or edit `.elefante/`, which belongs to the harness. The shell has no internet; use web_search to research, or set `network` to ask the user for one command. `.git` is read-only in the shell: git reads work there; run each git write command on its own and the harness runs it, with no remote access.";
 
 /// Added to the system prompt of a session in which learning can run (memory on, learning not
 /// switched off): without it the claim that the harness may save preferences would be false.
@@ -96,6 +100,7 @@ pub enum OutputEvent {
         approval_id: String,
         command: String,
         rule: &'static str,
+        network: bool,
     },
     ApprovalResolved {
         approval_id: String,
@@ -157,8 +162,14 @@ impl ApprovalSink for DenyApprovalSink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateDecision {
     Allow,
-    Deny { rule: &'static str },
-    Escalate { rule: &'static str, command: String },
+    Deny {
+        rule: &'static str,
+    },
+    Escalate {
+        rule: &'static str,
+        command: String,
+        network: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -189,10 +200,40 @@ impl ToolGate {
 
     #[must_use]
     pub fn check(&self, name: &str, input: &Value) -> GateDecision {
-        self.check_in(name, input, std::path::Path::new("."))
+        self.check_in(name, input, std::path::Path::new("."), &Sandbox::Seatbelt)
     }
 
-    fn check_in(&self, name: &str, input: &Value, root: &std::path::Path) -> GateDecision {
+    #[must_use]
+    pub fn check_with_tools(
+        &self,
+        name: &str,
+        input: &Value,
+        tools: &ToolExecutor,
+    ) -> GateDecision {
+        if name == "web_search" {
+            let Ok(request) = tools.web_search_request(input.clone()) else {
+                return GateDecision::Allow;
+            };
+            if !tools.reserve_web_search() {
+                return GateDecision::Escalate {
+                    rule: "web-search-cap",
+                    command: request.query,
+                    network: false,
+                };
+            }
+            return GateDecision::Allow;
+        }
+        self.check_in(name, input, tools.root(), tools.sandbox_state())
+    }
+
+    #[must_use]
+    pub fn check_in(
+        &self,
+        name: &str,
+        input: &Value,
+        root: &std::path::Path,
+        sandbox: &Sandbox,
+    ) -> GateDecision {
         if name != "bash" {
             return GateDecision::Allow;
         }
@@ -201,16 +242,52 @@ impl ToolGate {
                 rule: "invalid-bash-input",
             };
         };
+        if matches!(sandbox, Sandbox::Disabled) {
+            return GateDecision::Escalate {
+                rule: "sandbox-off",
+                command: command.to_owned(),
+                network: false,
+            };
+        }
+        if matches!(sandbox, Sandbox::Unavailable(_)) {
+            return GateDecision::Allow;
+        }
+        match elefante_guard::git::route(command, root) {
+            GitRoute::Refused(_) => {
+                return GateDecision::Deny {
+                    rule: "git-write-refused",
+                };
+            }
+            GitRoute::Harness(_) => {
+                return GateDecision::Escalate {
+                    rule: "git-write",
+                    command: command.to_owned(),
+                    network: false,
+                };
+            }
+            GitRoute::NotHarness => {}
+        }
         let decision = self.classifier.classify_in(command, root);
+        if decision.verdict == Verdict::Deny {
+            return GateDecision::Deny {
+                rule: decision.rule,
+            };
+        }
+        if input.get("network").and_then(Value::as_bool) == Some(true) {
+            return GateDecision::Escalate {
+                rule: "network-requested",
+                command: command.to_owned(),
+                network: true,
+            };
+        }
         match decision.verdict {
             Verdict::Allow => GateDecision::Allow,
-            Verdict::Deny => GateDecision::Deny {
-                rule: decision.rule,
-            },
             Verdict::Escalate => GateDecision::Escalate {
                 rule: decision.rule,
                 command: command.to_owned(),
+                network: false,
             },
+            Verdict::Deny => unreachable!("denials returned above"),
         }
     }
 }
@@ -423,6 +500,7 @@ impl Session {
                 messages: self.request_messages(turn),
                 effort: self.config.effort,
                 response_schema: None,
+                web_search: None,
             };
             let completed = receive_round(provider, request, cancel, usage, emit).await?;
             full_text.push_str(&completed.text);
@@ -838,13 +916,19 @@ async fn execute_one(
         clock,
     } = control;
     match decision {
-        GateDecision::Deny { rule } => tool_error(format!("bash denied by policy: {rule}")),
+        GateDecision::Deny { rule } => {
+            tool_error(format!("{} denied by policy: {rule}", call.name))
+        }
         GateDecision::Allow if cancel.is_cancelled() => tool_error("interrupted"),
         GateDecision::Allow => {
             let _ = clock.set(Instant::now());
-            tools.execute(&call.name, call.input).await
+            tools.execute_approved(&call.name, call.input, false).await
         }
-        GateDecision::Escalate { rule, command } => {
+        GateDecision::Escalate {
+            rule,
+            command,
+            network,
+        } => {
             static APPROVAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
             let slot = tokio::select! {
                 biased;
@@ -861,6 +945,7 @@ async fn execute_one(
                     approval_id: id.clone(),
                     command,
                     rule,
+                    network,
                 },
                 published: Some(published),
             });
@@ -886,11 +971,13 @@ async fn execute_one(
             drop(slot);
             if approved {
                 let _ = clock.set(Instant::now());
-                tools.execute(&call.name, call.input).await
+                tools
+                    .execute_approved(&call.name, call.input, network)
+                    .await
             } else if outcome == ApprovalOutcome::Cancelled || cancel.is_cancelled() {
                 tool_error("interrupted")
             } else {
-                tool_error("bash approval denied")
+                tool_error(format!("{} approval denied", call.name))
             }
         }
     }
@@ -919,7 +1006,7 @@ where
             name: call.name.clone(),
             input_preview: input_preview(&call.name, &call.input),
         });
-        let decision = gate.check_in(&call.name, &call.input, tools.root());
+        let decision = gate.check_with_tools(&call.name, &call.input, tools);
         let tools = tools.clone();
         let call = call.clone();
         let approvals = Arc::clone(&gate.approvals);

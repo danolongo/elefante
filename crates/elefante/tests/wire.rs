@@ -136,6 +136,10 @@ fn every_notification_has_one_fixed_envelope() {
             json!({"approval_id":"a1","command":"echo ok","rule":"shell"}),
         ),
         (
+            "approval.requested",
+            json!({"approval_id":"a2","command":"curl example.com","rule":"network-requested","network":true}),
+        ),
+        (
             "approval.resolved",
             json!({"approval_id":"a1","approved":false}),
         ),

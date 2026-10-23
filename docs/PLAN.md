@@ -724,6 +724,8 @@ that phase can pass its gate.
   file/directory kind so rendering performs no filesystem lookup. The home,
   harness directory and exact socket/token paths let renderers reject overlapping readable
   mounts, including custom socket locations. Network is off by default.
+  Bubblewrap's `--dev /dev` supplies writable standard device nodes; the readable mount loop
+  must not overlay `/dev/null`, `/dev/random` or `/dev/urandom` read-only.
 - **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
   Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
   reads and `.git` writes (in any case) are denied by pattern, including new nested directories.

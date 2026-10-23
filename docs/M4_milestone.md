@@ -273,7 +273,8 @@ an isolated network namespace.
 - `--unshare-net` unless `Approved`
 - `--die-with-parent --new-session --clearenv`
 - `--proc /proc --dev /dev --tmpfs /tmp --dir /tmp/home`
-- `--ro-bind-try` for each readable path, then `--bind <root> <root>`
+- `--ro-bind-try` for each readable path except `/dev/null`, `/dev/random` and `/dev/urandom`,
+  which `--dev /dev` already supplies writable; then `--bind <root> <root>`
 - then, layered over the root: `--ro-bind` for each `read_only`; `--tmpfs` over hidden
   directories; `--ro-bind /dev/null` over hidden files
 - under `Approved`, also `--ro-bind-try /run/systemd/resolve`

@@ -58,6 +58,29 @@ fn roots_cannot_enclose_home_or_overlap_harness() {
 }
 
 #[test]
+fn bubblewrap_keeps_its_private_devices_writable() {
+    let mut p = policy();
+    p.readable
+        .extend(["/dev/null", "/dev/random", "/dev/urandom"].map(PathBuf::from));
+    let launch = LaunchSpec {
+        bash: "/bin/bash".into(),
+        command: "true".into(),
+        environment: vec![("TERM".into(), "dumb".into())],
+        seccomp_fds: vec![3, 4],
+    };
+    let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
+    assert!(args.windows(2).any(|parts| parts == ["--dev", "/dev"]));
+    for device in ["/dev/null", "/dev/random", "/dev/urandom"] {
+        assert!(
+            !args
+                .windows(3)
+                .any(|parts| parts == ["--ro-bind-try", device, device]),
+            "{device} was covered by a read-only overlay"
+        );
+    }
+}
+
+#[test]
 fn seatbelt_never_interpolates_paths_and_rejects_injection() {
     let p = policy();
     let (profile, params) = seatbelt_profile(&p).unwrap();

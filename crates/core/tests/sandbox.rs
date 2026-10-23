@@ -453,10 +453,17 @@ async fn fresh_cargo_fixture_builds_inside_sandbox() {
         .expect(
             "sandboxed Cargo failed; install bubblewrap and enable unprivileged user namespaces",
         );
-    assert!(
-        output.success && output.content.contains("1 passed"),
-        "{output:?}"
-    );
+    if !output.success {
+        let diagnostic = session
+            .run_shell(
+                "R=$(rustup which rustc); printf 'rustc=%s\\n' \"$R\"; readlink -f \"$R\"; ls -ld \"$R\"; test -x \"$R\"; printf 'executable=%s\\n' \"$?\"; \"$R\" -vV",
+                Network::Off,
+            )
+            .await
+            .expect("toolchain diagnostic runs in the same sandbox");
+        panic!("sandbox Cargo fixture failed: {output:?}; toolchain diagnostic: {diagnostic:?}");
+    }
+    assert!(output.content.contains("1 passed"), "{output:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -850,9 +857,26 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .output()
             .await
             .expect("isolated probe subprocess");
+        let child_report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stage = [
+            "synthetic key was not present in the unsandboxed control",
+            "synthetic key was inherited by the shell",
+            "unsandboxed parent process should be inspectable",
+            "sandbox exposed its host parent process",
+            "synthetic key exposed in sandbox /proc",
+            "fd probe cannot detect an extra descriptor",
+            "sandbox inherited an extra descriptor",
+        ]
+        .into_iter()
+        .find(|marker| child_report.contains(marker))
+        .unwrap_or("unclassified child failure");
         assert!(
             output.status.success(),
-            "synthetic-key child failed; inspect the test without printing its environment"
+            "synthetic-key child failed at {stage}; its environment remains unprinted"
         );
         return;
     }

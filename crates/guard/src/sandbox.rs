@@ -502,6 +502,12 @@ pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>,
         .map(Into::into),
     );
     for path in &policy.readable {
+        if matches!(
+            path.to_str(),
+            Some("/dev/null" | "/dev/random" | "/dev/urandom")
+        ) {
+            continue;
+        }
         mount(&mut args, "--ro-bind-try", path, path);
     }
     mount(&mut args, "--bind", &policy.root, &policy.root);

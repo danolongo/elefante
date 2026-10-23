@@ -272,7 +272,8 @@ an isolated network namespace.
 - `--unshare-user --disable-userns --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try`
 - `--unshare-net` unless `Approved`
 - `--die-with-parent --new-session --clearenv`
-- `--proc /proc --dev /dev --tmpfs /tmp --dir /tmp/home`
+- `--proc /proc --tmpfs /proc/1 --dev /dev --tmpfs /tmp --dir /tmp/home`; PID 1 is
+  bubblewrap's minimal reaper, not the host parent, and its process details are hidden from tools
 - `--ro-bind-try` for each readable path except `/dev/null`, `/dev/random` and `/dev/urandom`,
   which `--dev /dev` already supplies writable; then `--bind <root> <root>`
 - then, layered over the root: `--ro-bind` for each `read_only`; `--tmpfs` over hidden

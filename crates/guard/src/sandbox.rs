@@ -492,6 +492,8 @@ pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>,
         [
             "--proc",
             "/proc",
+            "--tmpfs",
+            "/proc/1",
             "--dev",
             "/dev",
             "--tmpfs",

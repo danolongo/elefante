@@ -81,6 +81,22 @@ fn bubblewrap_keeps_its_private_devices_writable() {
 }
 
 #[test]
+fn bubblewrap_masks_its_init_process_from_shell_inspection() {
+    let p = policy();
+    let launch = LaunchSpec {
+        bash: "/bin/bash".into(),
+        command: "ps eww $PPID".into(),
+        environment: vec![("TERM".into(), "dumb".into())],
+        seccomp_fds: vec![3, 4],
+    };
+    let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
+    assert!(
+        args.windows(4)
+            .any(|parts| parts == ["--proc", "/proc", "--tmpfs", "/proc/1"])
+    );
+}
+
+#[test]
 fn seatbelt_never_interpolates_paths_and_rejects_injection() {
     let p = policy();
     let (profile, params) = seatbelt_profile(&p).unwrap();
@@ -188,6 +204,8 @@ fn bubblewrap_snapshot_preserves_overlay_and_descriptor_order() {
         "--unshare-net",
         "--proc",
         "/proc",
+        "--tmpfs",
+        "/proc/1",
         "--dev",
         "/dev",
         "--tmpfs",

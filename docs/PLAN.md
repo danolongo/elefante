@@ -726,6 +726,8 @@ that phase can pass its gate.
   mounts, including custom socket locations. Network is off by default.
   Bubblewrap's `--dev /dev` supplies writable standard device nodes; the readable mount loop
   must not overlay `/dev/null`, `/dev/random` or `/dev/urandom` read-only.
+  Its minimal PID 1 reaper is masked with a tmpfs overlay on `/proc/1`, so shell tools cannot
+  inspect that parent process even though the PID namespace still reaps children.
 - **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
   Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
   reads and `.git` writes (in any case) are denied by pattern, including new nested directories.

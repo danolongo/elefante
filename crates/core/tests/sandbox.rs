@@ -924,21 +924,19 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .await
             .expect("sandboxed process inspection");
         assert!(proc.success, "synthetic key exposed in sandbox /proc");
+        let fd_probe = "for fd in /proc/$$/fd/*; do number=${fd##*/}; if test \"$number\" -gt 2 && test -L \"$fd\"; then exit 1; fi; done";
+        let control = run_process(
+            shell(&format!("exec 3< /dev/null; {fd_probe}")),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("unsandboxed fd control");
         assert!(
-            run_process(
-                shell("exec 3< /dev/null; test -e /proc/$$/fd/3"),
-                Duration::from_secs(3)
-            )
-            .await
-            .expect("unsandboxed fd control")
-            .success,
-            "fd probe cannot detect an extra descriptor"
+            !control.success,
+            "fd probe missed an intentionally open descriptor"
         );
         let fds = session
-            .run_shell(
-                "for fd in /proc/$$/fd/*; do number=${fd##*/}; if test \"$number\" -gt 2; then exit 1; fi; done",
-                Network::Off,
-            )
+            .run_shell(fd_probe, Network::Off)
             .await
             .expect("sandboxed fd inspection");
         assert!(fds.success, "sandbox inherited an extra descriptor");

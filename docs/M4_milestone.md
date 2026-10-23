@@ -583,6 +583,10 @@ operating systems. Every negative test has a positive control.
 | Fail closed | `Unavailable` means bash refuses and a marker file is never created; `Disabled` means every bash call escalates |
 | `web_search` | A query with a secret fixture or a URL is refused; the 31st call escalates; results are capped (stub backend) |
 
+The FD gate probes live `/proc/$$/fd` symlinks rather than rejecting every globbed number:
+shell globbing itself can briefly open and close a directory descriptor. Its unsandboxed control
+keeps FD 3 open and must be detected by the same probe.
+
 **Existing core bash tests** (`tests/tools.rs:45,236`) run under `Disabled` with an approving
 sink. A copy of the cancellation test runs sandboxed.
 

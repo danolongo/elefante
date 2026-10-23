@@ -555,7 +555,7 @@ Two sentences are added:
 ### Phase 2 gate
 
 Linux CI installs `bubblewrap` and `sqlite3` and checks user namespaces with an explicit
-`--unshare-user` flag in this phase, rather
+`--unshare-user` flag after S1's AppArmor sysctl step in this phase, rather
 than waiting until Phase 4: without them the runtime tests would fail at setup instead of
 testing isolation. Phase 4 keeps the planned two-OS matrix change.
 

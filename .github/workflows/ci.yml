@@ -31,6 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap sqlite3
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --unshare-user --unshare-all --disable-userns --die-with-parent --ro-bind / / true
       # Pinned, not `stable`. With clippy::pedantic at warn and -D warnings, a floating
       # toolchain turns CI red on someone else's PR whenever Rust ships a new lint — which

@@ -153,11 +153,21 @@ impl ToolExecutor {
     /// Reserves one search before concurrent tool calls start; returns false past the cap.
     #[must_use]
     pub fn reserve_web_search(&self) -> bool {
-        self.web_search_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < WEB_SEARCH_CAP).then_some(count + 1)
-            })
-            .is_ok()
+        let mut count = self.web_search_count.load(Ordering::Acquire);
+        loop {
+            if count >= WEB_SEARCH_CAP {
+                return false;
+            }
+            match self.web_search_count.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => count = observed,
+            }
+        }
     }
 
     /// Whether `memory_search` has an index behind it.

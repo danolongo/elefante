@@ -1051,6 +1051,10 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
     assert!(!parent.success, "sandbox exposed its host parent process");
     #[cfg(target_os = "linux")]
     {
+        assert!(
+            std::path::Path::new("/usr/bin/python3").is_file(),
+            "install python3 for the Linux inherited-fd gate"
+        );
         let proc = session
             .run_shell(
                 "for entry in /proc/[0-9]*/environ; do if grep -a -q OPENROUTER_API_KEY \"$entry\" 2>/dev/null; then exit 1; fi; done",
@@ -1059,7 +1063,7 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .await
             .expect("sandboxed process inspection");
         assert!(proc.success, "synthetic key exposed in sandbox /proc");
-        let fd_probe = "for fd in /proc/$$/fd/*; do number=${fd##*/}; if test \"$number\" -gt 2 && test -L \"$fd\"; then printf 'open_fd=%s\\n' \"$number\"; exit 1; fi; done";
+        let fd_probe = "/usr/bin/python3 -c 'import os,sys; fds=sorted(int(fd) for fd in os.listdir(f\"/proc/{os.getppid()}/fd\") if int(fd)>2); print(f\"open_fd={fds[0]}\") if fds else None; sys.exit(bool(fds))'; status=$?; exit \"$status\"";
         let clean_control = run_process(shell(fd_probe), Duration::from_secs(3))
             .await
             .expect("clean host fd control");
@@ -1211,15 +1215,20 @@ async fn pid_namespace_kills_setsid_orphans_after_the_command() {
         "install util-linux setsid for the Linux lifetime gate"
     );
     let control = tempfile::tempdir().expect("host control root");
-    let mut host = shell(
-        "setsid /bin/bash -c 'sleep 0.2; printf marker > orphan' </dev/null >/dev/null 2>&1 & printf done",
-    );
+    let source = "setsid /bin/bash -c 'printf ready > ready; sleep 0.2; printf marker > orphan' </dev/null >/dev/null 2>&1 & for i in $(seq 1 100); do test -f ready && break; sleep 0.01; done; test -f ready";
+    let mut host = shell(source);
     host.current_dir(control.path());
     let host = run_process(host, Duration::from_secs(2))
         .await
         .expect("host setsid control executes");
     assert!(host.success, "host setsid control: {host:?}");
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !control.path().join("orphan").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("host orphan wrote its marker after detaching");
     assert_eq!(
         std::fs::read(control.path().join("orphan")).expect("host orphan ran"),
         b"marker"
@@ -1229,11 +1238,11 @@ async fn pid_namespace_kills_setsid_orphans_after_the_command() {
     let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
         .expect("session setup");
     let result = session
-        .run_shell("setsid /bin/bash -c 'sleep 0.2; printf marker > orphan' </dev/null >/dev/null 2>&1 & printf done", Network::Off)
+        .run_shell(source, Network::Off)
         .await
         .expect("sandbox runs; install bubblewrap and enable user namespaces on Linux");
     assert!(result.success, "sandbox command failed: {result:?}");
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
         !root.path().join("orphan").exists(),
         "setsid orphan survived the PID namespace"

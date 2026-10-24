@@ -583,10 +583,12 @@ operating systems. Every negative test has a positive control.
 | Fail closed | `Unavailable` means bash refuses and a marker file is never created; `Disabled` means every bash call escalates |
 | `web_search` | A query with a secret fixture or a URL is refused; the 31st call escalates; results are capped (stub backend) |
 
-The FD gate probes live `/proc/$$/fd` symlinks rather than rejecting every globbed number:
-shell globbing itself can briefly open and close a directory descriptor. Its unsandboxed control
-first verifies a clean shell has no live extra descriptor, then keeps FD 3 open and must detect
-it with the same probe. CI reports only an FD number on failure, never the child environment.
+The FD gate uses a Python child to inspect its parent Bash process's `/proc/<pid>/fd` entries:
+the probe's own directory descriptor is therefore not counted. Its unsandboxed control first
+verifies a clean shell has no extra descriptor, then keeps FD 3 open and must detect it with the
+same probe. CI reports only an FD number on failure, never the child environment. The `setsid`
+control waits for its detached child to write a `ready` marker before the parent exits, so the
+process-group cleanup cannot race the control's detachment.
 The io_uring gate compiles a test-only C syscall fixture with the existing compiler, requires
 `io_uring_setup` to succeed on the host, then expects ENOSYS in the sandbox. If the CI host
 rejects the control, the row is red until its test strategy is amended in both plans; it does

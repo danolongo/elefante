@@ -1,0 +1,751 @@
+//! Fail-closed shell launch and bounded process output.
+use elefante_guard::sandbox::{self, HiddenKind, HiddenPath, Network, Policy};
+use std::{collections::VecDeque, fmt::Write as _, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    path::Path,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+};
+
+type RootLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>;
+static ROOT_LOCKS: OnceLock<RootLocks> = OnceLock::new();
+static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DETECTED: OnceLock<Sandbox> = OnceLock::new();
+static PROBED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Session-owned policy and scratch directory. Clones of the executor share this value.
+#[derive(Debug)]
+pub struct SessionSandbox {
+    state: Sandbox,
+    policy: Policy,
+    bash: PathBuf,
+    pub git: PathBuf,
+    pub lock: Arc<tokio::sync::RwLock<()>>,
+    initial_git: BTreeSet<PathBuf>,
+    tool_dirs: Vec<PathBuf>,
+    rustup_home: Option<PathBuf>,
+    main_git: Option<PathBuf>,
+}
+
+impl Drop for SessionSandbox {
+    fn drop(&mut self) {
+        // This exact directory was created exclusively by this session.
+        let _ = fs::remove_dir_all(&self.policy.temp);
+    }
+}
+
+fn binary(name: &str) -> Result<PathBuf, String> {
+    let override_name = format!("ELEFANTE_{}", name.to_ascii_uppercase());
+    if let Some(path) = std::env::var_os(override_name) {
+        return fs::canonicalize(path).map_err(|error| error.to_string());
+    }
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{name} is unavailable in fixed system directories"))
+        .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
+}
+
+fn detect() -> Sandbox {
+    if std::env::var_os("ELEFANTE_SANDBOX").is_some_and(|value| value == "0") {
+        return Sandbox::Disabled;
+    }
+    if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").is_file() {
+        Sandbox::Seatbelt
+    } else if cfg!(target_os = "linux") {
+        binary("bwrap").map_or_else(Sandbox::Unavailable, |bwrap| Sandbox::Bubblewrap { bwrap })
+    } else {
+        Sandbox::Unavailable(
+            "install Seatbelt on macOS or bubblewrap with user namespaces on Linux".into(),
+        )
+    }
+}
+
+fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Policy, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = fs::canonicalize(std::env::temp_dir())
+        .map_err(|error| error.to_string())?
+        .join(format!("elefante-sandbox-{}-{id}", std::process::id()));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&temp)
+        .map_err(|error| error.to_string())?;
+    let mut protected = vec![
+        harness_dir.join("run/elefante.sock"),
+        harness_dir.join("run/token"),
+    ];
+    if let Some(path) = std::env::var_os("ELEFANTE_SOCKET") {
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            protected.push(parent.join("token"));
+        }
+        protected.push(path);
+    }
+    if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR") {
+        protected.push(PathBuf::from(directory).join("elefante.sock"));
+    }
+    Ok(Policy {
+        root: root.into(),
+        home,
+        harness_dir,
+        protected,
+        temp,
+        readable: Vec::new(),
+        writable: Vec::new(),
+        read_only: Vec::new(),
+        hidden: Vec::new(),
+        network: Network::Off,
+    })
+}
+
+impl SessionSandbox {
+    /// Creates a private session policy without opening any credential file.
+    ///
+    /// # Errors
+    /// Fails closed for invalid roots, unavailable binaries, or incomplete root scans.
+    pub fn new(root: &Path) -> Result<Self, String> {
+        let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
+        let home = fs::canonicalize(home).map_err(|error| error.to_string())?;
+        let harness_dir = home.join(".elefante");
+        let root_error = sandbox::validate_root(root, &home, &harness_dir).err();
+        let bash = binary("bash")?;
+        let git = binary("git")?;
+        let mut state = DETECTED.get_or_init(detect).clone();
+        if let Some(error) = root_error {
+            state = Sandbox::Unavailable(error.to_string());
+        }
+        let mut programs = vec![bash.clone(), git.clone()];
+        if let Sandbox::Bubblewrap { bwrap } = &state {
+            programs.push(bwrap.clone());
+        }
+        for program in programs {
+            if program.starts_with(root) {
+                state =
+                    Sandbox::Unavailable("sandbox executable is inside the session root".into());
+                break;
+            }
+        }
+        let policy = base_policy(root, home, harness_dir)?;
+        let mut locks = ROOT_LOCKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| "root lock poisoned")?;
+        let lock = locks.get(root).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::RwLock::new(()));
+            locks.insert(root.into(), Arc::downgrade(&lock));
+            lock
+        });
+        drop(locks);
+        let mut session = Self {
+            state,
+            policy,
+            bash,
+            git,
+            lock,
+            initial_git: BTreeSet::new(),
+            tool_dirs: Vec::new(),
+            rustup_home: None,
+            main_git: None,
+        };
+        for name in ["home", "cargo", "rustup"] {
+            fs::create_dir(session.policy.temp.join(name)).map_err(|error| error.to_string())?;
+        }
+        session.policy.readable = [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc/ld.so.cache",
+            "/etc/alternatives",
+            "/etc/ssl/certs",
+            "/etc/resolv.conf",
+            "/etc/nsswitch.conf",
+            "/etc/hosts",
+            "/System/Library",
+            "/Library/Apple",
+            "/Library/Developer/CommandLineTools",
+            "/private/etc",
+            "/dev/null",
+            "/dev/random",
+            "/dev/urandom",
+            "/private/var/db/dyld",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+        for program in [&session.bash, &session.git] {
+            let parent = program
+                .parent()
+                .ok_or("binary has no directory")?
+                .to_path_buf();
+            if !session
+                .policy
+                .readable
+                .iter()
+                .any(|path| parent.starts_with(path))
+            {
+                session.policy.readable.push(parent);
+            }
+        }
+        if let Err(error) = session.configure_toolchains() {
+            session.state = Sandbox::Unavailable(error);
+        }
+        if !matches!(session.state, Sandbox::Unavailable(_) | Sandbox::Disabled) {
+            match initial_git_directory(root) {
+                Ok(directory) => session.main_git = directory,
+                Err(error) => session.state = Sandbox::Unavailable(error),
+            }
+            match session.scan() {
+                Ok(policy) => session.initial_git = policy.read_only.into_iter().collect(),
+                Err(error) => session.state = Sandbox::Unavailable(error),
+            }
+        }
+        Ok(session)
+    }
+
+    fn configure_toolchains(&mut self) -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+        let cargo = std::env::var_os("CARGO_HOME")
+            .map_or_else(|| self.policy.home.join(".cargo"), PathBuf::from);
+        let rustup = std::env::var_os("RUSTUP_HOME")
+            .map_or_else(|| self.policy.home.join(".rustup"), PathBuf::from);
+        for directory in [cargo.join("bin"), self.policy.home.join(".bun/bin")] {
+            if directory.is_dir() {
+                self.policy.readable.push(directory.clone());
+                self.tool_dirs.push(directory);
+            }
+        }
+        let registry = cargo.join("registry");
+        if registry.is_dir() {
+            self.policy.readable.push(registry.clone());
+            symlink(registry, self.policy.temp.join("cargo/registry"))
+                .map_err(|error| error.to_string())?;
+        }
+        // Settings contain only toolchain selection; Cargo credentials are never opened.
+        let settings = rustup.join("settings.toml");
+        if settings.is_file() {
+            let text = fs::read_to_string(&settings).map_err(|error| error.to_string())?;
+            let selected = text.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "default_toolchain").then(|| value.trim().trim_matches('"'))
+            });
+            if let Some(selected) = selected {
+                if selected.is_empty()
+                    || selected.contains(['/', '\\'])
+                    || selected == "."
+                    || selected == ".."
+                {
+                    return Err("invalid rustup default toolchain".into());
+                }
+                let toolchain = rustup.join("toolchains").join(selected);
+                if toolchain.is_dir() {
+                    self.policy.readable.extend([settings, toolchain]);
+                    self.rustup_home = Some(rustup);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &Sandbox {
+        &self.state
+    }
+
+    /// Explicit host configuration opt-out; model input cannot change this state.
+    pub fn disable(&mut self) {
+        self.state = Sandbox::Disabled;
+    }
+
+    /// Rescans every directory for git metadata, and secret names without reading their contents.
+    ///
+    /// # Errors
+    /// Any unreadable directory or unsupported git indirection fails closed.
+    pub fn scan(&self) -> Result<Policy, String> {
+        use std::os::unix::fs::MetadataExt;
+        let mut policy = self.policy.clone();
+        let mut queue = vec![(policy.root.clone(), false)];
+        while let Some((directory, secret_pruned)) = queue.pop() {
+            for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let path = entry.path();
+                let kind = entry.file_type().map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.eq_ignore_ascii_case(".git") {
+                    policy.read_only.push(path.clone());
+                    if kind.is_symlink() {
+                        return Err("symlink Git metadata is refused".into());
+                    }
+                    let gitdir = if kind.is_dir() {
+                        path.clone()
+                    } else {
+                        git_reference(&path, true)?
+                    };
+                    let mut targets = vec![gitdir.clone()];
+                    if gitdir.join("commondir").exists() {
+                        targets.push(git_reference(&gitdir.join("commondir"), false)?);
+                    }
+                    for target in targets {
+                        if !target.starts_with(&policy.root)
+                            && !self
+                                .main_git
+                                .as_ref()
+                                .is_some_and(|main| target.starts_with(main))
+                        {
+                            return Err(
+                                "Git metadata points outside the root and its initial repository"
+                                    .into(),
+                            );
+                        }
+                        if !target.starts_with(&policy.root) {
+                            policy.readable.push(target.clone());
+                        }
+                        if !policy.read_only.contains(&target) {
+                            policy.read_only.push(target);
+                        }
+                    }
+                }
+                let in_git_metadata = path.components().any(|component| {
+                    component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(".git")
+                });
+                let hard_link = kind.is_file()
+                    && !in_git_metadata
+                    && !secret_pruned
+                    && entry.metadata().map_err(|error| error.to_string())?.nlink() > 1;
+                let secret = hard_link
+                    || !secret_pruned
+                        && (name == ".elefante"
+                            || name == ".ssh"
+                            || name == ".env"
+                            || name.starts_with(".env.")
+                            || matches!(
+                                name.as_ref(),
+                                ".netrc"
+                                    | ".npmrc"
+                                    | ".git-credentials"
+                                    | "credentials"
+                                    | "credentials.toml"
+                            )
+                            || name.starts_with("id_rsa")
+                            || name.to_ascii_lowercase().ends_with(".pem")
+                            || name.to_ascii_lowercase().ends_with(".key"));
+                if secret {
+                    policy.hidden.push(HiddenPath {
+                        path: path.clone(),
+                        kind: if kind.is_dir() {
+                            HiddenKind::Directory
+                        } else {
+                            HiddenKind::File
+                        },
+                    });
+                }
+                if kind.is_dir() {
+                    queue.push((
+                        path,
+                        secret_pruned || matches!(name.as_ref(), "target" | "node_modules"),
+                    ));
+                }
+            }
+        }
+        policy.validate().map_err(|error| error.to_string())?;
+        Ok(policy)
+    }
+
+    /// Executes a shell command under the scanned policy.
+    ///
+    /// # Errors
+    /// Fails closed for unavailable isolation, policy errors, or failed process launch.
+    pub async fn run_shell(&self, source: &str, network: Network) -> Result<ProcessOutput, String> {
+        if let Sandbox::Unavailable(reason) = &self.state {
+            return Err(format!(
+                "sandbox unavailable: {reason}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out"
+            ));
+        }
+        if !matches!(self.state, Sandbox::Disabled) {
+            PROBED.get_or_try_init(|| async {
+                let output = self.run_shell_unprobed("true", Network::Off).await?;
+                if output.success { Ok(()) } else { Err(format!("sandbox probe failed: {}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out", output.content)) }
+            }).await?;
+        }
+        self.run_shell_unprobed(source, network).await
+    }
+
+    async fn run_shell_unprobed(
+        &self,
+        source: &str,
+        network: Network,
+    ) -> Result<ProcessOutput, String> {
+        let _lock = self.lock.read().await;
+        let mut policy = if matches!(self.state, Sandbox::Disabled) {
+            self.policy.clone()
+        } else {
+            self.scan()?
+        };
+        policy.network = network;
+        if let Sandbox::Unavailable(reason) = &self.state {
+            return Err(format!(
+                "sandbox unavailable: {reason}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out"
+            ));
+        }
+        let sandboxed = !matches!(self.state, Sandbox::Disabled);
+        let env_source = self
+            .rustup_home
+            .as_ref()
+            .map(|path| ("RUSTUP_HOME".into(), path.as_os_str().to_owned()));
+        let environment = if sandboxed {
+            policy
+                .environment(env_source, &self.tool_dirs, true)
+                .map_err(|error| error.to_string())?
+        } else {
+            sandbox::environment(env_source, false)
+        };
+        #[cfg(target_os = "linux")]
+        let filters = if sandboxed {
+            seccomp_filters(&policy, network)?
+        } else {
+            Vec::new()
+        };
+        let mut command = match &self.state {
+            Sandbox::Seatbelt => {
+                let (profile, params) =
+                    sandbox::seatbelt_profile(&policy).map_err(|error| error.to_string())?;
+                let mut command = Command::new("/usr/bin/sandbox-exec");
+                command.args(["-p", &profile]);
+                for (key, value) in params {
+                    command
+                        .arg("-D")
+                        .arg(format!("{key}={}", value.to_string_lossy()));
+                }
+                command.arg(&self.bash).args(["-c", source]);
+                command
+            }
+            Sandbox::Disabled => {
+                let mut command = Command::new(&self.bash);
+                command.args(["-c", source]);
+                command
+            }
+            Sandbox::Bubblewrap { bwrap } => {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    let spec = sandbox::LaunchSpec {
+                        bash: self.bash.clone(),
+                        command: source.into(),
+                        environment: environment.clone(),
+                        seccomp_fds: filters
+                            .iter()
+                            .map(|file| {
+                                u32::try_from(file.as_raw_fd())
+                                    .expect("file descriptor is nonnegative")
+                            })
+                            .collect(),
+                    };
+                    let args =
+                        sandbox::bwrap_args(&policy, &spec).map_err(|error| error.to_string())?;
+                    let mut command = Command::new(bwrap);
+                    command.args(args);
+                    command
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = bwrap;
+                    return Err("bubblewrap requires Linux".into());
+                }
+            }
+            Sandbox::Unavailable(_) => unreachable!(),
+        };
+        command
+            .env_clear()
+            .envs(environment)
+            .current_dir(&policy.root);
+        let timeout = std::env::var("ELEFANTE_BASH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+        let result = run_process(command, Duration::from_secs(timeout)).await;
+        #[cfg(target_os = "linux")]
+        if sandboxed {
+            self.quarantine_new_git()?;
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn quarantine_new_git(&self) -> Result<(), String> {
+        // Discovery must not parse gitdir/commondir: a malformed new file still needs moving.
+        let mut queue = vec![self.policy.root.clone()];
+        let mut found = Vec::new();
+        while let Some(directory) = queue.pop() {
+            for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let path = entry.path();
+                let kind = entry.file_type().map_err(|error| error.to_string())?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(".git")
+                {
+                    if !self.initial_git.contains(&path) {
+                        found.push(path);
+                    }
+                } else if kind.is_dir() {
+                    queue.push(path);
+                }
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        let session = self
+            .policy
+            .temp
+            .file_name()
+            .ok_or("missing session identifier")?;
+        let quarantine = self.policy.harness_dir.join("quarantine").join(session);
+        fs::create_dir_all(&quarantine).map_err(|error| error.to_string())?;
+        for path in &found {
+            let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs::rename(path, quarantine.join(id.to_string())).map_err(|error| {
+                format!(
+                    "new Git metadata at {} could not be quarantined: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Err(format!(
+            "{} new Git metadata entr{} quarantined",
+            found.len(),
+            if found.len() == 1 { "y" } else { "ies" }
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn seccomp_filters(policy: &Policy, network: Network) -> Result<Vec<fs::File>, String> {
+    use rustix::io::{FdFlags, fcntl_setfd};
+    let architecture = if cfg!(target_arch = "x86_64") {
+        sandbox::Architecture::X86_64
+    } else {
+        sandbox::Architecture::Aarch64
+    };
+    let programs =
+        sandbox::seccomp_programs(architecture, network).map_err(|error| error.to_string())?;
+    let mut files = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = policy.temp.join(format!("seccomp-{index}-{id}"));
+        fs::write(&path, program).map_err(|error| error.to_string())?;
+        let file = fs::File::open(&path).map_err(|error| error.to_string())?;
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        fcntl_setfd(&file, FdFlags::empty()).map_err(|error| error.to_string())?;
+        files.push(file);
+    }
+    Ok(files)
+}
+
+fn git_reference(path: &Path, gitfile: bool) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.nlink() > 1 || metadata.len() > 4096 {
+        return Err("Git indirection must be a small regular file with one link".into());
+    }
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let value = if gitfile {
+        text.strip_prefix("gitdir:")
+            .ok_or("invalid gitdir file")?
+            .trim()
+    } else {
+        text.trim()
+    };
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return Err("invalid Git metadata target".into());
+    }
+    let target = path
+        .parent()
+        .ok_or("Git metadata has no parent")?
+        .join(value)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !target.is_dir() {
+        return Err("Git metadata target is not a directory".into());
+    }
+    Ok(target)
+}
+
+fn initial_git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
+    let path = root.join(".git");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err("symlink Git metadata is refused".into());
+    }
+    let directory = if metadata.is_dir() {
+        path
+    } else {
+        git_reference(&path, true)?
+    };
+    let common = if directory.join("commondir").exists() {
+        git_reference(&directory.join("commondir"), false)?
+    } else {
+        directory
+    };
+    if !common.starts_with(root)
+        && (!common.join("objects").is_dir()
+            || !common.join("refs").is_dir()
+            || !common.join("HEAD").is_file())
+    {
+        return Err("external Git metadata is not a repository".into());
+    }
+    Ok(Some(common))
+}
+
+const OUTPUT_LIMIT: usize = 32 * 1024;
+
+/// The host isolation mechanism discovered at startup.
+#[derive(Debug, Clone)]
+pub enum Sandbox {
+    Seatbelt,
+    Bubblewrap { bwrap: PathBuf },
+    Disabled,
+    Unavailable(String),
+}
+
+/// A completed process, with bounded combined output.
+#[derive(Debug)]
+pub struct ProcessOutput {
+    pub content: String,
+    pub success: bool,
+}
+
+struct ProcessGroup(Option<u32>);
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[derive(Default)]
+struct CappedOutput {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+}
+impl CappedOutput {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let head_count = (OUTPUT_LIMIT / 4 - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_count]);
+        for byte in &bytes[head_count..] {
+            if self.tail.len() == OUTPUT_LIMIT / 4 {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(*byte);
+        }
+    }
+
+    fn text(self) -> String {
+        let kept = self.head.len() + self.tail.len();
+        let mut result = String::from_utf8_lossy(&self.head).into_owned();
+        if self.total > kept {
+            let _ = write!(result, "\n[{} bytes omitted]\n", self.total - kept);
+        }
+        result.push_str(&String::from_utf8_lossy(
+            &self.tail.into_iter().collect::<Vec<_>>(),
+        ));
+        result
+    }
+}
+
+async fn drain(
+    mut pipe: impl AsyncRead + Unpin,
+    output: std::sync::Arc<tokio::sync::Mutex<CappedOutput>>,
+) -> std::io::Result<()> {
+    let mut bytes = vec![0; 8192];
+    loop {
+        let count = pipe.read(&mut bytes).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        output.lock().await.push(&bytes[..count]);
+    }
+}
+
+/// Runs an already configured command with a deadline and bounded output.
+///
+/// # Errors
+/// Returns launch, wait, pipe, or deadline failures. The process group is killed on every exit.
+pub async fn run_process(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("process launch failed: {error}"))?;
+    let _group = ProcessGroup(child.id());
+    let stdout = child.stdout.take().ok_or("missing stdout pipe")?;
+    let stderr = child.stderr.take().ok_or("missing stderr pipe")?;
+    let out = std::sync::Arc::new(tokio::sync::Mutex::new(CappedOutput::default()));
+    let err = std::sync::Arc::new(tokio::sync::Mutex::new(CappedOutput::default()));
+    // These futures remain owned here: cancellation drops both readers immediately.
+    let readers = async {
+        let (a, b) = tokio::join!(drain(stdout, out.clone()), drain(stderr, err.clone()));
+        a.and(b)
+    };
+    tokio::pin!(readers);
+    let wait = async {
+        let mut read_result = None;
+        let status = tokio::select! {
+            status = child.wait() => status,
+            result = &mut readers => {
+                read_result = Some(result);
+                child.wait().await
+            }
+        }
+        .map_err(|error| format!("process wait failed: {error}"))?;
+        if let Some(result) = read_result {
+            result.map_err(|error| format!("process output failed: {error}"))?;
+        } else if let Ok(result) = tokio::time::timeout(Duration::from_secs(2), &mut readers).await
+        {
+            result.map_err(|error| format!("process output failed: {error}"))?;
+        }
+        Ok::<_, String>(status)
+    };
+    let status = tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| "bash timed out; process group terminated".to_owned())??;
+    let mut content = std::mem::take(&mut *out.lock().await).text();
+    content.push_str(&std::mem::take(&mut *err.lock().await).text());
+    if !status.success() {
+        content.insert_str(0, &format!("exit status {status}\n"));
+    }
+    Ok(ProcessOutput {
+        content,
+        success: status.success(),
+    })
+}

@@ -41,7 +41,7 @@ fn classifies_full_fixture_table() {
         ("cat <<'EOF'\nsafe\nEOF", Verdict::Allow),
         ("cat .elefante", Verdict::Deny),
         ("ls ./.elefante/", Verdict::Deny),
-        ("rg --hidden x", Verdict::Escalate),
+        ("rg --hidden x", Verdict::Allow),
         ("grep -rn x src/", Verdict::Allow),
         ("rg x", Verdict::Allow),
         ("find . -name '*.rs'", Verdict::Allow),
@@ -115,22 +115,46 @@ fn denies_workspace_relative_symlink_to_credentials() {
 }
 
 #[test]
-fn denies_final_component_and_glob_spellings_of_harness_state() {
+fn denies_literal_harness_state_paths() {
     for command in [
         "cat .elefante",
         "grep -ra statement .elefante",
         "grep -ra statement ./.elefante/",
         "ls -a .elefante",
+    ] {
+        assert_eq!(
+            BashClassifier::new().classify(command).verdict,
+            Verdict::Deny,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn leaves_harness_glob_expansion_to_the_os_sandbox() {
+    // Sandbox tests pair denied reads with ordinary files; this gate only classifies intent.
+    for command in [
         "cat .elef*/memory.db",
         "cat .elefant?/memory.db",
         "cat .[e]lefante/memory.db",
         "cat ./.[e]lefante/memory.db",
         "cat .*/memory.db",
-        "sqlite3 .elef*/memory.db .schema",
+        "cat data*/memory.db",
     ] {
         assert_eq!(
             BashClassifier::new().classify(command).verdict,
-            Verdict::Deny,
+            Verdict::Allow,
+            "{command}"
+        );
+    }
+    // Only sqlite3's narrow schema inspection form is allowed.
+    for command in [
+        "sqlite3 .elef*/memory.db .schema",
+        "sqlite3 data*/memory.db .schema",
+    ] {
+        assert_eq!(
+            BashClassifier::new().classify(command).verdict,
+            Verdict::Allow,
             "{command}"
         );
     }
@@ -155,7 +179,7 @@ fn glob_check_leaves_ordinary_patterns_alone() {
 }
 
 #[test]
-fn escalates_recursive_content_readers_over_the_workspace_root() {
+fn leaves_recursive_reader_path_enforcement_to_the_os_sandbox() {
     let classifier = BashClassifier::new();
     for command in [
         "grep -r x .",
@@ -184,22 +208,19 @@ fn escalates_recursive_content_readers_over_the_workspace_root() {
         "rg --max-depth 3 -uuu x",
     ] {
         let decision = classifier.classify(command);
-        assert_eq!(decision.verdict, Verdict::Escalate, "{command}");
-        assert_eq!(
-            decision.rule, "recursive-search-includes-harness-state",
-            "{command}"
-        );
+        assert_eq!(decision.verdict, Verdict::Allow, "{command}");
+        assert_eq!(decision.rule, "read-only-allowlist", "{command}");
     }
     let root = tempfile::tempdir().unwrap();
     let absolute = format!("grep -r x {}", root.path().display());
     assert_eq!(
         classifier.classify_in(&absolute, root.path()).rule,
-        "recursive-search-includes-harness-state"
+        "read-only-allowlist"
     );
 }
 
 #[test]
-fn recursive_readers_stay_allowed_when_they_cannot_reach_harness_state() {
+fn recursive_readers_allow_ordinary_paths_and_exclusions() {
     let classifier = BashClassifier::new();
     for command in [
         "grep -rn x src/",
@@ -231,22 +252,21 @@ fn recursive_readers_stay_allowed_when_they_cannot_reach_harness_state() {
 }
 
 #[test]
-fn documents_remaining_harness_state_gaps() {
+fn documents_harness_state_paths_enforced_by_the_os_sandbox() {
     let classifier = BashClassifier::new();
-    // None of these name the protected path in the command text, so the guard cannot see it. The
-    // guard reduces accidental reads; it is not a sandbox.
+    // Runtime path enforcement belongs to the sandbox. Unknown program intent still escalates.
     for (command, gap, verdict) in [
         (
             "D=.elefante; cat $D/memory.db",
             "shell variables",
             Verdict::Allow,
         ),
-        ("cd \"$D\" && cat memory.db", "`cd` into", Verdict::Escalate),
+        ("cd \"$D\" && cat memory.db", "`cd` into", Verdict::Allow),
         ("cat memory.db", "`cd` into", Verdict::Allow),
         (
             "sqlite3 \"$DB\" .schema",
             "interpreters and `sqlite3`",
-            Verdict::Escalate,
+            Verdict::Allow,
         ),
         (
             "python -c 'import os; open(os.environ[\"P\"])'",
@@ -256,7 +276,7 @@ fn documents_remaining_harness_state_gaps() {
         (
             "echo \"$P\" | xargs cat",
             "`xargs` or command substitution",
-            Verdict::Escalate,
+            Verdict::Allow,
         ),
         (
             "cat $(printf '%s' \"$P\")",
@@ -270,10 +290,51 @@ fn documents_remaining_harness_state_gaps() {
                 .any(|known| known.contains(gap)),
             "{gap} is not listed in known_gaps()"
         );
+        assert!(
+            BashClassifier::known_gaps()
+                .iter()
+                .any(|known| known.contains(gap) && known.contains("enforced by the OS sandbox")),
+            "{gap} must identify its runtime enforcement"
+        );
         assert_eq!(
             classifier.classify(command).verdict,
             verdict,
             "known-not-caught fixture changed: {command}"
+        );
+    }
+}
+
+#[test]
+fn allows_narrow_runtime_path_readers_with_ordinary_path_controls() {
+    for command in [
+        "D=.elefante; cat $D/memory.db",
+        "D=data; cat $D/memory.db",
+        "cd .elefante && cat memory.db",
+        "cd data && cat memory.db",
+        "DB=.elefante/memory.db; sqlite3 \"$DB\" .schema",
+        "DB=data/memory.db; sqlite3 \"$DB\" .schema",
+        "D=.elefante; echo $D/memory.db | xargs cat",
+        "D=data; echo $D/memory.db | xargs cat",
+        "cd",
+    ] {
+        assert_eq!(
+            BashClassifier::new().classify(command).verdict,
+            Verdict::Allow,
+            "{command}"
+        );
+    }
+    for command in [
+        "cd data extra",
+        "sqlite3 \"$DB\" 'delete from notes'",
+        "sqlite3 \"$DB\" .shell",
+        "sqlite3 -cmd .shell \"$DB\" .schema",
+        "xargs rm",
+        "xargs cat extra",
+    ] {
+        assert_eq!(
+            BashClassifier::new().classify(command).verdict,
+            Verdict::Escalate,
+            "{command}"
         );
     }
 }
@@ -309,10 +370,10 @@ fn workspace_under_an_elefante_directory_classifies_normally() {
             "{command}"
         );
     }
-    // `grep -r x .` still reaches the workspace's own `.elefante/`.
+    // The sandbox hides the workspace's own `.elefante/` during recursive reads.
     assert_eq!(
         classifier.classify_in("grep -r x .", &root).verdict,
-        Verdict::Escalate
+        Verdict::Allow
     );
 }
 

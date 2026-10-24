@@ -157,6 +157,31 @@ impl PathPolicy {
         Ok(resolved)
     }
 
+    /// Resolves a write target, additionally protecting git metadata in any case.
+    ///
+    /// # Errors
+    /// Returns a policy error for secret, escaping, or git metadata paths.
+    pub fn resolve_for_write(&self, path: impl AsRef<Path>) -> Result<PathBuf, PolicyError> {
+        let input = path.as_ref();
+        let resolved = self.resolve(input)?;
+        if [
+            input,
+            resolved.strip_prefix(&self.root).unwrap_or(&resolved),
+        ]
+        .into_iter()
+        .any(|path| {
+            path.components().any(
+                |part| matches!(part, Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+            )
+        }) {
+            return Err(PolicyError::Denied {
+                path: input.display().to_string(),
+                rule: "git-metadata-write",
+            });
+        }
+        Ok(resolved)
+    }
+
     fn check_denied(
         &self,
         input: &Path,

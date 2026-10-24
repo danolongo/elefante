@@ -2,6 +2,27 @@ use elefante_guard::{PathPolicy, PolicyError};
 use std::fs;
 
 #[test]
+fn write_policy_protects_git_metadata_lexically_and_through_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    let policy = PathPolicy::new(root.path()).unwrap();
+    for path in [
+        ".git/config",
+        ".GIT/config",
+        "nested/.GiT/hooks/new",
+        ".git/../safe",
+    ] {
+        assert!(policy.resolve_for_write(path).is_err(), "{path}");
+    }
+    assert!(policy.resolve_for_write("src/new.rs").is_ok());
+    #[cfg(unix)]
+    {
+        fs::create_dir(root.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(".git", root.path().join("alias")).unwrap();
+        assert!(policy.resolve_for_write("alias/config").is_err());
+    }
+}
+
+#[test]
 fn resolves_safe_existing_and_new_paths() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("src")).unwrap();

@@ -605,6 +605,75 @@ fn head_is_a_full_object_name_once_there_is_a_commit() {
 }
 
 #[test]
+fn git_reads_ignore_inherited_repository_and_executable_overrides() {
+    const CHILD_ROOT: &str = "ELEFANTE_TEST_COCHANGE_ROOT";
+    const EXPECTED_HEAD: &str = "ELEFANTE_TEST_COCHANGE_HEAD";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let expected = std::env::var(EXPECTED_HEAD).unwrap();
+        assert_eq!(cochange::head(root.as_ref()), Some(expected));
+        let commits = cochange::log(
+            root.as_ref(),
+            &CoChangeConfig::default(),
+            Duration::from_secs(10),
+        )
+        .expect("history remains readable with hostile inherited environment");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].changes, [touch("intended.rs")]);
+        return;
+    }
+
+    let mut intended = GitRepo::init();
+    intended.write("intended.rs", "// intended repository\n");
+    intended.commit("intended");
+    let expected = String::from_utf8(intended.git(&["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut foreign = GitRepo::init();
+    foreign.write("foreign.rs", "// wrong repository\n");
+    foreign.commit("foreign");
+    let bin = tempfile::tempdir().unwrap();
+    let impostor = bin.path().join("git");
+    fs::write(&impostor, "#!/bin/sh\nexit 97\n").unwrap();
+    fs::set_permissions(&impostor, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = bin.path().join("executed");
+    let hook = bin.path().join("hook");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\n/usr/bin/touch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // A separate test process avoids changing global environment while other tests run.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "git_reads_ignore_inherited_repository_and_executable_overrides",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, intended.path())
+        .env(EXPECTED_HEAD, expected)
+        .env("PATH", bin.path())
+        .env("GIT_DIR", foreign.path().join(".git"))
+        .env("GIT_WORK_TREE", foreign.path())
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "log.showSignature")
+        .env("GIT_CONFIG_VALUE_0", "true")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", hook)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cochange child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "inherited git config executed a program");
+}
+
+#[test]
 fn a_repositorys_own_config_cannot_run_programs_on_our_behalf() {
     let mut git = GitRepo::init();
     for f in ["a.rs", "b.rs"] {

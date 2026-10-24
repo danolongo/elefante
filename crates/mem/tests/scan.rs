@@ -383,7 +383,7 @@ fn file_state_round_trips_including_the_skip_flag() {
 
 #[test]
 fn hashing_matches_the_reference_and_detects_binaries_at_the_sniff_boundary() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let write = |name: &str, bytes: &[u8]| {
         let path = tmp.path().join(name);
         fs::write(&path, bytes).unwrap();

@@ -78,6 +78,7 @@ fn definitions_are_stable_sorted_and_strict() {
             "grep",
             "memory_search",
             "read",
+            "web_search",
             "write"
         ]
     );
@@ -230,6 +231,98 @@ async fn write_does_not_follow_dangling_symlink_outside_workspace() {
     assert!(result.is_error);
     assert!(!missing_directory.join("escaped.txt").exists());
     assert!(!missing_directory.exists());
+}
+
+#[tokio::test]
+async fn file_tools_refuse_hardlinks_while_ordinary_files_work() {
+    let outside = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("payload.txt");
+    fs::write(&outside_file, "marker outside").unwrap();
+    fs::hard_link(&outside_file, root.path().join("linked.txt")).unwrap();
+    fs::write(root.path().join("ordinary.txt"), "marker inside").unwrap();
+    let tools = ToolExecutor::new(root.path()).unwrap();
+
+    assert!(
+        tools
+            .execute("read", json!({"path":"linked.txt"}))
+            .await
+            .is_error
+    );
+    assert_eq!(
+        tools
+            .execute("read", json!({"path":"ordinary.txt"}))
+            .await
+            .content,
+        "marker inside"
+    );
+    assert!(
+        tools
+            .execute("write", json!({"path":"linked.txt","content":"changed"}))
+            .await
+            .is_error
+    );
+    assert!(
+        !tools
+            .execute(
+                "write",
+                json!({"path":"ordinary.txt","content":"marker new"})
+            )
+            .await
+            .is_error
+    );
+    assert!(
+        tools
+            .execute(
+                "edit",
+                json!({"path":"linked.txt","old_string":"marker","new_string":"changed"})
+            )
+            .await
+            .is_error
+    );
+    assert!(
+        !tools
+            .execute(
+                "edit",
+                json!({"path":"ordinary.txt","old_string":"new","new_string":"inside"})
+            )
+            .await
+            .is_error
+    );
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "marker outside");
+
+    let glob = tools.execute("glob", json!({"pattern":"*.txt"})).await;
+    assert!(glob.content.contains("ordinary.txt"));
+    assert!(!glob.content.contains("linked.txt"));
+    let grep = tools.execute("grep", json!({"pattern":"marker"})).await;
+    assert!(grep.content.contains("ordinary.txt"));
+    assert!(!grep.content.contains("linked.txt"));
+}
+
+#[tokio::test]
+async fn read_and_grep_keep_head_tail_and_state_original_size() {
+    let (root, tools) = executor();
+    let long_line = format!("HEAD{}TAIL", "x".repeat(200_000));
+    fs::write(root.path().join("large.txt"), &long_line).unwrap();
+    for (name, input, cap, original_size) in [
+        ("read", json!({"path":"large.txt"}), 128 * 1024, 200_008),
+        (
+            "grep",
+            json!({"pattern":"HEAD","path":"large.txt"}),
+            32 * 1024,
+            200_020,
+        ),
+    ] {
+        let result = tools.execute(name, input).await;
+        assert!(!result.is_error, "{name}: {}", result.content);
+        assert!(result.content.len() <= cap, "{name} exceeded {cap} bytes");
+        assert!(result.content.contains("HEAD"), "{name} lost the head");
+        assert!(result.content.contains("TAIL"), "{name} lost the tail");
+        assert!(
+            result.content.contains(&format!("{original_size} bytes")),
+            "{name} hid original size"
+        );
+    }
 }
 
 #[tokio::test]

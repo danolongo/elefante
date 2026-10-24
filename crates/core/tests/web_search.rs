@@ -61,6 +61,20 @@ async fn web_search_validates_queries_before_backend_and_caps_results() {
     assert_eq!(definitions().len(), 8);
 }
 
+#[tokio::test]
+async fn web_search_without_a_backend_has_a_fixed_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let tools = ToolExecutor::new(root.path()).unwrap();
+    let result = tools
+        .execute("web_search", json!({"query":"Rust release"}))
+        .await;
+    assert!(result.is_error);
+    assert_eq!(
+        result.content,
+        "web_search is unavailable: this session has no search backend"
+    );
+}
+
 #[test]
 fn the_thirty_first_search_escalates_across_executor_clones() {
     let root = tempfile::tempdir().unwrap();

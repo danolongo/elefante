@@ -843,6 +843,10 @@ network off and approved network differ correctly on both operating systems, `.g
 read-only in shell and write git routes through the harness, and repository config traps are
 refused. The daemon socket requires a token even if reached. Process, key, link, timeout,
 output-cap, seccomp and fail-closed cases are exercised. `web_search` rejects secrets and URLs.
+The socket gate uses a fake home and synthetic runtime/override sockets; the `/run` case is a
+pure no-broad-mount assertion plus runtime outside/abstract-socket controls, because CI does not
+guarantee a writable `/run` location for a listener. This retains the service boundary without
+opening or disturbing the real daemon socket.
 Sandbox tests fail with setup instructions if the sandbox is missing, and each negative test has
 a positive control. Both macOS and Linux CI legs, MSRV, TUI checks and **all M0–M3 gates** must
 be green before M4.1 starts. Credentialed tests are run separately by the maintainer at the end

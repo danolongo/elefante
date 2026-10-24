@@ -382,7 +382,7 @@ async fn udp_ipv4_and_ipv6_cannot_reach_host_without_approval() {
 async fn quarantines_all_new_git_metadata_even_when_one_is_malformed() {
     use elefante_core::sandbox::SessionSandbox;
     use elefante_guard::sandbox::Network;
-    let source = "mkdir -p first/.git second/.git third; printf malformed > third/.git; printf ordinary > ordinary";
+    let source = "mkdir -p first/.git second/.git third target/.git; printf malformed > third/.git; printf ordinary > ordinary";
     let control = tempfile::tempdir().expect("unsandboxed control root");
     let output = Command::new("/bin/bash")
         .args(["-c", source])
@@ -391,7 +391,7 @@ async fn quarantines_all_new_git_metadata_even_when_one_is_malformed() {
         .await
         .expect("control launches");
     assert!(output.status.success());
-    for name in ["first/.git", "second/.git", "third/.git"] {
+    for name in ["first/.git", "second/.git", "third/.git", "target/.git"] {
         assert!(
             control.path().join(name).exists(),
             "positive control: {name}"
@@ -404,10 +404,10 @@ async fn quarantines_all_new_git_metadata_even_when_one_is_malformed() {
     let error = session.run_shell(source, Network::Off).await
         .expect_err("new Git metadata must be quarantined; install bubblewrap and enable unprivileged user namespaces on Linux");
     assert!(
-        error.contains("3 new Git metadata entries quarantined"),
+        error.contains("4 new Git metadata entries quarantined"),
         "{error}"
     );
-    for name in ["first/.git", "second/.git", "third/.git"] {
+    for name in ["first/.git", "second/.git", "third/.git", "target/.git"] {
         assert!(!root.path().join(name).exists(), "{name} remained in root");
     }
     assert_eq!(
@@ -845,6 +845,157 @@ async fn unix_socket_outside_session_is_blocked_while_private_socket_works() {
     );
 }
 
+async fn assert_protected_socket_inaccessible(
+    session: &elefante_core::sandbox::SessionSandbox,
+    path: &std::path::Path,
+) {
+    use tokio::{io::AsyncWriteExt, net::UnixListener};
+    let listener = UnixListener::bind(path).expect("synthetic service socket");
+    let command = format!(
+        "/usr/bin/curl --silent --max-time 2 --unix-socket '{}' http://localhost/",
+        path.display()
+    );
+    let control = tokio::spawn(run_process(shell(&command), Duration::from_secs(4)));
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("unsandboxed service connection reaches fixture")
+        .expect("accept host control");
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nfixture")
+        .await
+        .expect("respond to host control");
+    assert!(
+        control
+            .await
+            .expect("control task")
+            .expect("control process")
+            .success
+    );
+    for network in [Network::Off, Network::Approved] {
+        let result = session
+            .run_shell(&command, network)
+            .await
+            .expect("sandbox runs");
+        assert!(
+            !result.success,
+            "protected socket reached under {network:?}: {result:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "protected listener accepted a sandboxed connection under {network:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn configured_daemon_socket_paths_reject_connections() {
+    use elefante_core::sandbox::SessionSandbox;
+    let child_mode = std::env::var_os("ELEFANTE_SOCKET_FIXTURE_CHILD").is_some();
+    let fixture = (!child_mode).then(|| {
+        #[cfg(target_os = "macos")]
+        let fixture = tempfile::tempdir_in("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let fixture = tempfile::tempdir();
+        fixture.expect("synthetic service fixture")
+    });
+    let base = fixture.as_ref().map_or_else(
+        || {
+            std::path::PathBuf::from(
+                std::env::var_os("ELEFANTE_SOCKET_FIXTURE_BASE").expect("fixture base"),
+            )
+        },
+        |fixture| {
+            fixture
+                .path()
+                .canonicalize()
+                .expect("canonical fixture base")
+        },
+    );
+    let home = base.join("home");
+    let runtime = base.join("runtime");
+    let override_dir = base.join("override");
+    for directory in [&home, &runtime, &override_dir] {
+        std::fs::create_dir_all(directory).expect("synthetic directory");
+    }
+    let override_socket = override_dir.join("custom.sock");
+    if !child_mode {
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "configured_daemon_socket_paths_reject_connections",
+            ])
+            .env("ELEFANTE_SOCKET_FIXTURE_CHILD", "1")
+            .env("ELEFANTE_SOCKET_FIXTURE_BASE", &base)
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("ELEFANTE_SOCKET", &override_socket)
+            .env_remove("OPENROUTER_API_KEY")
+            .output()
+            .await
+            .expect("isolated service fixture child");
+        assert!(
+            child.status.success(),
+            "synthetic service child failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        return;
+    }
+    let harness_run = home.join(".elefante/run");
+    std::fs::create_dir_all(&harness_run).expect("synthetic harness run directory");
+    let workspace = base.join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace fixture");
+    let session = SessionSandbox::new(&workspace.canonicalize().expect("canonical workspace"))
+        .expect("sandbox session");
+    let paths = [
+        harness_run.join("elefante.sock"),
+        runtime.join("elefante.sock"),
+        override_socket,
+    ];
+    let policy = session.scan().expect("session policy");
+    for path in &paths {
+        assert!(
+            policy.protected.contains(path),
+            "synthetic socket was not protected"
+        );
+        assert_protected_socket_inaccessible(&session, path).await;
+    }
+}
+
+fn synthetic_child_failure_stage(output: &std::process::Output) -> String {
+    let child_report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stage = [
+        "synthetic key was not present in the unsandboxed control",
+        "synthetic key was inherited by the shell",
+        "unsandboxed parent process should be inspectable",
+        "sandbox exposed its host parent process",
+        "synthetic key exposed in sandbox /proc",
+        "fd probe cannot detect an extra descriptor",
+        "probe counted a transient host descriptor",
+        "sandbox inherited an extra descriptor",
+    ]
+    .into_iter()
+    .find(|marker| child_report.contains(marker))
+    .unwrap_or("unclassified child failure");
+    if stage == "sandbox inherited an extra descriptor" {
+        let number = child_report
+            .split("open_fd=")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .filter(|value| value.len() <= 3 && value.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or("unknown");
+        format!("{stage} (fd {number})")
+    } else {
+        stage.to_owned()
+    }
+}
+
 #[tokio::test]
 async fn synthetic_key_does_not_enter_sandboxed_process() {
     use elefante_core::sandbox::SessionSandbox;
@@ -857,23 +1008,7 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .output()
             .await
             .expect("isolated probe subprocess");
-        let child_report = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stage = [
-            "synthetic key was not present in the unsandboxed control",
-            "synthetic key was inherited by the shell",
-            "unsandboxed parent process should be inspectable",
-            "sandbox exposed its host parent process",
-            "synthetic key exposed in sandbox /proc",
-            "fd probe cannot detect an extra descriptor",
-            "sandbox inherited an extra descriptor",
-        ]
-        .into_iter()
-        .find(|marker| child_report.contains(marker))
-        .unwrap_or("unclassified child failure");
+        let stage = synthetic_child_failure_stage(&output);
         assert!(
             output.status.success(),
             "synthetic-key child failed at {stage}; its environment remains unprinted"
@@ -924,7 +1059,14 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .await
             .expect("sandboxed process inspection");
         assert!(proc.success, "synthetic key exposed in sandbox /proc");
-        let fd_probe = "for fd in /proc/$$/fd/*; do number=${fd##*/}; if test \"$number\" -gt 2 && test -L \"$fd\"; then exit 1; fi; done";
+        let fd_probe = "for fd in /proc/$$/fd/*; do number=${fd##*/}; if test \"$number\" -gt 2 && test -L \"$fd\"; then printf 'open_fd=%s\\n' \"$number\"; exit 1; fi; done";
+        let clean_control = run_process(shell(fd_probe), Duration::from_secs(3))
+            .await
+            .expect("clean host fd control");
+        assert!(
+            clean_control.success,
+            "probe counted a transient host descriptor: {clean_control:?}"
+        );
         let control = run_process(
             shell(&format!("exec 3< /dev/null; {fd_probe}")),
             Duration::from_secs(3),
@@ -939,6 +1081,258 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .run_shell(fd_probe, Network::Off)
             .await
             .expect("sandboxed fd inspection");
-        assert!(fds.success, "sandbox inherited an extra descriptor");
+        assert!(
+            fds.success,
+            "sandbox inherited an extra descriptor: {}",
+            fds.content
+        );
     }
+}
+
+#[tokio::test]
+async fn synthetic_pem_is_hidden_while_ordinary_text_is_readable() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("fixture root");
+    let root = root.path().canonicalize().expect("canonical root");
+    for name in ["synthetic.pem", "ordinary.txt"] {
+        std::fs::write(root.join(name), "synthetic-pem-marker\n").expect("synthetic file");
+    }
+    let mut host = shell("cat synthetic.pem");
+    host.current_dir(&root);
+    let control = run_process(host, Duration::from_secs(3))
+        .await
+        .expect("host read control");
+    assert!(control.success && control.content.contains("synthetic-pem-marker"));
+    let session = SessionSandbox::new(&root).expect("session setup");
+    let secret = session
+        .run_shell("cat synthetic.pem", Network::Off)
+        .await
+        .expect("sandbox executes; install bubblewrap and enable user namespaces on Linux, or enable sandbox-exec on macOS");
+    assert!(!secret.success || !secret.content.contains("synthetic-pem-marker"));
+    let ordinary = session
+        .run_shell("cat ordinary.txt", Network::Off)
+        .await
+        .expect("ordinary read executes");
+    assert!(ordinary.success && ordinary.content.contains("synthetic-pem-marker"));
+}
+
+#[tokio::test]
+async fn synthetic_cargo_credentials_are_hidden_from_shell_reads() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("fixture root");
+    let root = root.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join(".cargo")).expect("synthetic Cargo directory");
+    std::fs::write(
+        root.join(".cargo/credentials.toml"),
+        "synthetic-cargo-marker\n",
+    )
+    .expect("synthetic credential fixture");
+    std::fs::write(root.join("ordinary.txt"), "synthetic-cargo-marker\n")
+        .expect("ordinary fixture");
+    let source = "CARGO_HOME=$PWD/.cargo; cat \"$CARGO_HOME/credentials.toml\"";
+    let mut host = shell(source);
+    host.current_dir(&root);
+    let control = run_process(host, Duration::from_secs(3))
+        .await
+        .expect("unsandboxed Cargo fixture control");
+    assert!(control.success && control.content.contains("synthetic-cargo-marker"));
+    let session = SessionSandbox::new(&root).expect("sandbox session");
+    let blocked = session
+        .run_shell(source, Network::Off)
+        .await
+        .expect("sandbox runs");
+    assert!(
+        !blocked.content.contains("synthetic-cargo-marker"),
+        "synthetic credential leaked"
+    );
+    let ordinary = session
+        .run_shell("cat ordinary.txt", Network::Off)
+        .await
+        .expect("ordinary read");
+    assert!(ordinary.success && ordinary.content.contains("synthetic-cargo-marker"));
+}
+
+#[tokio::test]
+async fn home_root_is_unavailable_and_never_runs_a_marker_command() {
+    use elefante_core::sandbox::{Sandbox, SessionSandbox};
+    let home = std::fs::canonicalize(std::env::var_os("HOME").expect("HOME for root validation"))
+        .expect("canonical HOME");
+    let fixture = tempfile::tempdir().expect("scratch marker root");
+    let marker = fixture.path().join("marker");
+    let source = format!("printf marker > '{}'", marker.display());
+    let control = run_process(shell(&source), Duration::from_secs(3))
+        .await
+        .expect("host marker control");
+    assert!(control.success && marker.exists());
+    std::fs::remove_file(&marker).expect("clear the exact scratch marker");
+    let session = SessionSandbox::new(&home).expect("unavailable session is representable");
+    assert!(matches!(session.state(), Sandbox::Unavailable(_)));
+    let error = session
+        .run_shell(&source, Network::Off)
+        .await
+        .expect_err("HOME-rooted session must not execute");
+    assert!(error.contains("sandbox unavailable"), "{error}");
+    assert!(
+        !marker.exists(),
+        "HOME-rooted sandbox ran the marker command"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn private_loopback_works_without_reaching_the_host() {
+    use elefante_core::sandbox::SessionSandbox;
+    assert!(
+        std::path::Path::new("/usr/bin/python3").is_file(),
+        "install python3 for the Linux private-loopback gate"
+    );
+    let source = r#"python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(1); c=socket.socket(); c.connect(s.getsockname()); a,_=s.accept(); c.sendall(b"ok"); assert a.recv(2)==b"ok"'"#;
+    let control = run_process(shell(source), Duration::from_secs(3))
+        .await
+        .expect("host loopback control");
+    assert!(control.success, "host loopback control: {control:?}");
+    let root = tempfile::tempdir().expect("fixture root");
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let private = session
+        .run_shell(source, Network::Off)
+        .await
+        .expect("sandbox runs; install bubblewrap and enable user namespaces on Linux");
+    assert!(private.success, "private loopback failed: {private:?}");
+    // The paired host-listener test proves this same Off policy cannot reach host loopback.
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pid_namespace_kills_setsid_orphans_after_the_command() {
+    use elefante_core::sandbox::SessionSandbox;
+    assert!(
+        std::path::Path::new("/usr/bin/setsid").is_file(),
+        "install util-linux setsid for the Linux lifetime gate"
+    );
+    let control = tempfile::tempdir().expect("host control root");
+    let mut host = shell(
+        "setsid /bin/bash -c 'sleep 0.2; printf marker > orphan' </dev/null >/dev/null 2>&1 & printf done",
+    );
+    host.current_dir(control.path());
+    let host = run_process(host, Duration::from_secs(2))
+        .await
+        .expect("host setsid control executes");
+    assert!(host.success, "host setsid control: {host:?}");
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(
+        std::fs::read(control.path().join("orphan")).expect("host orphan ran"),
+        b"marker"
+    );
+
+    let root = tempfile::tempdir().expect("sandbox root");
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let result = session
+        .run_shell("setsid /bin/bash -c 'sleep 0.2; printf marker > orphan' </dev/null >/dev/null 2>&1 & printf done", Network::Off)
+        .await
+        .expect("sandbox runs; install bubblewrap and enable user namespaces on Linux");
+    assert!(result.success, "sandbox command failed: {result:?}");
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        !root.path().join("orphan").exists(),
+        "setsid orphan survived the PID namespace"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn seccomp_refuses_mount_with_a_disposable_namespace_control() {
+    use elefante_core::sandbox::SessionSandbox;
+    for program in ["/usr/bin/unshare", "/usr/bin/mount", "/usr/bin/umount"] {
+        assert!(
+            std::path::Path::new(program).is_file(),
+            "install util-linux for the Linux mount gate: {program}"
+        );
+    }
+    let root = tempfile::tempdir().expect("scratch mount root");
+    std::fs::create_dir(root.path().join("mnt")).expect("mount target");
+    let control = format!(
+        "unshare -Ur -m /bin/sh -c 'mount -t tmpfs tmpfs \"$1\"; umount \"$1\"' sh '{}'",
+        root.path().join("mnt").display()
+    );
+    let host = run_process(shell(&control), Duration::from_secs(5))
+        .await
+        .expect("disposable mount namespace control");
+    assert!(
+        host.success,
+        "enable unprivileged user namespaces and tmpfs mounts for this gate: {host:?}"
+    );
+
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let blocked = session
+        .run_shell("mount -t tmpfs tmpfs mnt", Network::Off)
+        .await
+        .expect("sandbox runs; install bubblewrap and enable user namespaces on Linux");
+    assert!(
+        !blocked.success,
+        "sandbox mounted tmpfs despite seccomp: {blocked:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn seccomp_returns_enosys_for_io_uring_setup_with_a_host_control() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("scratch syscall probe root");
+    let source = root.path().join("io_uring_probe.c");
+    let binary = root.path().join("io_uring_probe");
+    std::fs::write(
+        &source,
+        r#"
+#include <errno.h>
+#include <linux/io_uring.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    struct io_uring_params params = {0};
+    int fd = syscall(__NR_io_uring_setup, 1, &params);
+    if (fd < 0) { printf("errno=%d\n", errno); return 2; }
+    close(fd);
+    puts("io_uring_setup succeeded");
+    return 0;
+}
+"#,
+    )
+    .expect("write syscall probe source");
+    let compiled = Command::new("/usr/bin/cc")
+        .args([
+            "-o",
+            binary.to_str().expect("UTF-8 fixture path"),
+            source.to_str().expect("UTF-8 fixture path"),
+        ])
+        .output()
+        .await
+        .expect("install a C compiler for the Linux syscall gate");
+    assert!(
+        compiled.status.success(),
+        "syscall fixture compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let host = Command::new(&binary)
+        .output()
+        .await
+        .expect("host syscall control runs");
+    assert!(
+        host.status.success(),
+        "host io_uring_setup unavailable: {}; the runtime gate cannot claim a positive control",
+        String::from_utf8_lossy(&host.stdout)
+    );
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("sandbox session");
+    let blocked = session
+        .run_shell("./io_uring_probe", Network::Off)
+        .await
+        .expect("sandbox runs");
+    assert!(
+        !blocked.success && blocked.content.contains("errno=38"),
+        "sandbox did not return ENOSYS: {blocked:?}"
+    );
 }

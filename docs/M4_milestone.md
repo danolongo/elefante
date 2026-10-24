@@ -574,7 +574,7 @@ operating systems. Every negative test has a positive control.
 | Repo-config traps | `include.path` into the root, `hooksPath=.husky`, LFS, custom filter/merge attributes or configured executable filter/merge drivers: harness git refuses, and `.husky/` is read-only in the sandbox. A synthetic filter or merge-driver marker is not executed; the same Git write succeeds in a repository without those traps. |
 | Harness state and secrets | `.elefante/` reads empty or is refused; in-root `.env` and `*.pem` are refused |
 | Root validation | A session rooted at `$HOME` or `/` gets `Unavailable`, and bash runs nothing |
-| Daemon and local services | A socket fixture at the daemon path, `$XDG_RUNTIME_DIR`, `/run` and `/private/tmp/…`: none reachable; a socket in the session temp dir is reachable |
+| Daemon and local services | A child process with a fake home connects to synthetic fallback, `$XDG_RUNTIME_DIR` and `ELEFANTE_SOCKET` override fixtures outside the root (under `/private/tmp` on macOS); sandboxed Off and Approved cannot connect, while the session-temp socket works. `/run` has no guaranteed writable fixture on CI, so the pure policy test rejects its broad mount and the runtime outside-socket and abstract-socket tests cover the reachable service classes. No real daemon or user state is touched. |
 | macOS host | `security find-generic-password`, `pbpaste`, `open -a`, `launchctl submit` and `osascript` fail |
 | Key and processes | The test process has `OPENROUTER_API_KEY` set; inside, `env` and every readable `/proc/*/environ` lack it, `ps eww $PPID` fails, and only fds 0–2 are open |
 | Symlinks and links | `read` and `write` refuse a symlink to an outside fixture, a link swapped in during the call (loop test), and a hard link. The indexer skips them too |
@@ -585,7 +585,12 @@ operating systems. Every negative test has a positive control.
 
 The FD gate probes live `/proc/$$/fd` symlinks rather than rejecting every globbed number:
 shell globbing itself can briefly open and close a directory descriptor. Its unsandboxed control
-keeps FD 3 open and must be detected by the same probe.
+first verifies a clean shell has no live extra descriptor, then keeps FD 3 open and must detect
+it with the same probe. CI reports only an FD number on failure, never the child environment.
+The io_uring gate compiles a test-only C syscall fixture with the existing compiler, requires
+`io_uring_setup` to succeed on the host, then expects ENOSYS in the sandbox. If the CI host
+rejects the control, the row is red until its test strategy is amended in both plans; it does
+not skip or claim a pass.
 
 **Existing core bash tests** (`tests/tools.rs:45,236`) run under `Disabled` with an approving
 sink. A copy of the cancellation test runs sandboxed.

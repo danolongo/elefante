@@ -9,6 +9,7 @@ pub const NO_API_KEY: i32 = -32004;
 pub const UNKNOWN_APPROVAL: i32 = -32005;
 pub const UNKNOWN_NOTE: i32 = -32006;
 pub const MEMORY_OFF: i32 = -32007;
+pub const UNAUTHORIZED: i32 = -32008;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;

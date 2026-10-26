@@ -16,13 +16,22 @@ struct Client {
     write: OwnedWriteHalf,
 }
 impl Client {
-    async fn connect(path: &Path) -> Self {
+    /// A connection that has not yet authenticated.
+    async fn unauthenticated(path: &Path) -> Self {
         let stream = UnixStream::connect(path).await.unwrap();
         let (read, write) = stream.into_split();
         Self {
             read: BufReader::new(read),
             write,
         }
+    }
+
+    async fn connect(path: &Path) -> Self {
+        let mut client = Self::unauthenticated(path).await;
+        let token = fs::read_to_string(elefante::daemon::token_path(path)).unwrap();
+        let reply = client.rpc(0, "auth", json!({"token":token})).await;
+        assert_eq!(reply["result"], json!({}), "{reply}");
+        client
     }
 
     async fn send(&mut self, id: u64, method: &str, params: Value) {
@@ -426,9 +435,106 @@ async fn stale_socket_recovers_and_concurrent_start_converges() {
     })
     .await
     .unwrap();
-    assert!(UnixStream::connect(&path).await.is_ok());
+    // The starter that lost wrote no token, so the token on disk is the live daemon's.
+    Client::connect(&path).await;
     first.abort();
     second.abort();
+}
+
+#[tokio::test]
+async fn the_first_request_must_present_the_daemons_token() {
+    let daemon = Daemon::start(None, Duration::from_secs(20)).await;
+    let path = elefante::daemon::token_path(&daemon.config.socket);
+    assert_eq!(path, daemon.config.socket.with_file_name("token"));
+    let token = fs::read_to_string(&path).unwrap();
+    assert_eq!(token.len(), 32, "128 bits as hex");
+    assert!(
+        token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{token}"
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let wrong = format!(
+        "{}{}",
+        if token.starts_with('0') { "1" } else { "0" },
+        &token[1..]
+    );
+    let frame = |request: Value| format!("{request}\n");
+    for (case, request) in [
+        ("invalid JSON", "not json\n".to_owned()),
+        (
+            "another method",
+            frame(json!({"id":1,"method":"session.create","params":{"cwd":daemon.dir.path()}})),
+        ),
+        (
+            "a wrong token",
+            frame(json!({"id":1,"method":"auth","params":{"token":wrong}})),
+        ),
+        (
+            "an empty token",
+            frame(json!({"id":1,"method":"auth","params":{"token":""}})),
+        ),
+        (
+            "no token",
+            frame(json!({"id":1,"method":"auth","params":{}})),
+        ),
+    ] {
+        let mut client = Client::unauthenticated(&daemon.config.socket).await;
+        client.write.write_all(request.as_bytes()).await.unwrap();
+        let reply = client.next().await;
+        assert_eq!(reply["error"]["code"], -32008, "{case}: {reply}");
+        let mut line = String::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read.read_line(&mut line))
+            .await
+            .unwrap();
+        assert!(closed.is_err() || closed.unwrap() == 0, "{case}: {line}");
+    }
+    // Positive control: the right token opens the same daemon to the same request.
+    let mut client = daemon.client().await;
+    daemon.create(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_client_that_arrives_before_the_daemon_authenticates() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/elefante.sock");
+    let waiting = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            // The client polls only for the socket. The daemon writes the token before it
+            // listens, so the token is there to read the moment a connection succeeds.
+            while UnixStream::connect(&socket).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Client::connect(&socket).await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    let config = DaemonConfig {
+        socket,
+        credentials: dir.path().join("home/.elefante/credentials.toml"),
+        api_key: None,
+        base_url: None,
+        stub_provider: None,
+        memory: false,
+        learn: LearnMode::Off,
+        learn_idle: Duration::from_secs(300),
+        learn_timeout: Duration::from_secs(60),
+        idle_timeout: Duration::from_secs(20),
+    };
+    let daemon = tokio::spawn(run(config));
+    let mut client = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let reply = client
+        .rpc(1, "session.create", json!({"cwd":dir.path()}))
+        .await;
+    assert!(reply["result"]["session_id"].is_string(), "{reply}");
+    daemon.abort();
 }
 
 #[tokio::test]

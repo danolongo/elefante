@@ -46,12 +46,23 @@ pub(crate) fn read(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 pub(crate) fn write(path: &Path, key: &str) -> anyhow::Result<()> {
+    write_private(
+        path,
+        &format!("api_key = {}\n", serde_json::to_string(key)?),
+    )?;
+    Ok(())
+}
+
+/// Replaces `path` with `contents` in one rename: a reader sees the old file or the whole new one,
+/// never a partial write. The file is `0600` and its directory is private.
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("credential path has no parent"))?;
+        .ok_or_else(|| io::Error::other("private file path has no parent"))?;
     private_directory(parent)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = parent.join(format!(
-        ".credentials-{}-{}.tmp",
+        ".{name}-{}-{}.tmp",
         std::process::id(),
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
@@ -61,10 +72,9 @@ pub(crate) fn write(path: &Path, key: &str) -> anyhow::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        writeln!(file, "api_key = {}", serde_json::to_string(key)?)?;
+        file.write_all(contents.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
-        Ok(())
+        fs::rename(&temp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);

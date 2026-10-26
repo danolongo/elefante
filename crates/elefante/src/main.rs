@@ -167,6 +167,35 @@ fn connect(path: &Path) -> anyhow::Result<UnixStream> {
     }
 }
 
+/// Connects to the daemon at `path`, starting one when none is listening, and authenticates.
+fn open(path: &Path) -> anyhow::Result<Client> {
+    let mut client = Client::new(connect(path)?);
+    let token = read_token(&elefante::daemon::token_path(path))?;
+    match client.request("auth", json!({ "token": token })) {
+        Ok(_) => Ok(client),
+        Err(error) if rpc_code(&error) == Some(-32601) => bail!(OLDER_DAEMON),
+        Err(error) => Err(error),
+    }
+}
+/// Reads the daemon's token, waiting briefly while a starting daemon has yet to write it. A daemon
+/// that never writes one predates the token; the client then sends an empty token, so that daemon
+/// answers `auth` with "unknown method" and the person learns to restart it.
+fn read_token(path: &Path) -> anyhow::Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(token) => return Ok(token.trim().to_owned()),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| {
+                    format!("cannot read the daemon token at {}", path.display())
+                });
+            }
+            Err(_) if Instant::now() >= deadline => return Ok(String::new()),
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 struct Client {
     reader: BufReader<UnixStream>,
     next_id: u64,
@@ -310,7 +339,7 @@ fn prompt_with_key(client: &mut Client, session: &str, prompt: &str) -> anyhow::
     Ok(())
 }
 fn resume(client: &mut Client, path: &Path, session: &str, since: u64) -> anyhow::Result<()> {
-    *client = Client::new(connect(path)?);
+    *client = open(path)?;
     let result = client.request(
         "session.attach",
         json!({"session_id":session,"since":since}),
@@ -441,7 +470,7 @@ fn run_memory(args: &[String]) -> anyhow::Result<i32> {
         ),
         MemoryCommand::Repository(method, params) => (method, params, None),
     };
-    let mut client = Client::new(connect(&socket_path()?)?);
+    let mut client = open(&socket_path()?)?;
     let result = match client.request(method, params) {
         Ok(result) => result,
         Err(error) if rpc_code(&error) == Some(-32601) => bail!(OLDER_DAEMON),
@@ -489,7 +518,7 @@ fn main() -> anyhow::Result<()> {
     }
     let options = Options::parse()?;
     let path = socket_path()?;
-    let mut client = Client::new(connect(&path)?);
+    let mut client = open(&path)?;
     let Some(prompt) = &options.prompt else {
         return launch_tui(&options, &path);
     };

@@ -1,4 +1,6 @@
+import { readFile } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
+import { dirname, join } from "node:path";
 
 export const MAX_LINE_BYTES = 8 * 1024 * 1024;
 export type Usage = { input_tokens: number; output_tokens: number; reasoning_tokens: number; cached_input_tokens: number; cache_write_tokens: number; cost: number | null };
@@ -40,6 +42,27 @@ export type Notification = { [K in keyof EventParams]: { session_id: string; tur
 export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemoryInfo };
 export class ProtocolError extends Error {}
 export class RpcError extends Error { constructor(public code: number, message: string) { super(message); } }
+export const OLDER_DAEMON = "the running daemon is from an older build of elefante; stop it (`pkill -f elefante-srv` or `pkill -f 'elefante daemon'`) and try again";
+/** A daemon that answers `auth` with "unknown method" predates the socket token. */
+export class OlderDaemonError extends Error { constructor() { super(OLDER_DAEMON); } }
+/** The daemon writes its token beside its socket. */
+export const tokenPath = (socketPath: string) => join(dirname(socketPath), "token");
+/**
+ * Reads the daemon's token, waiting briefly while a starting daemon has yet to write it. A daemon
+ * that never writes one predates the token; the client then sends an empty token, so that daemon
+ * answers `auth` with "unknown method" and the person learns to restart it.
+ */
+export async function readToken(path: string): Promise<string> {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try { return (await readFile(path, "utf8")).trim(); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (Date.now() >= deadline) return "";
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+}
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const strings = (v: Record<string, unknown>, ...keys: string[]) => keys.every(k => typeof v[k] === "string");
@@ -215,6 +238,13 @@ export class RpcClient {
       this.onDisconnect(failure);
     });
     await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+    try { await this.request("auth", { token: await readToken(tokenPath(path)) }); }
+    catch (error) {
+      // Detach first, so a refused handshake is not reported as a disconnect.
+      this.socket = null;
+      socket.destroy();
+      throw error instanceof RpcError && error.code === -32601 ? new OlderDaemonError() : error;
+    }
   }
   request<T = unknown>(method: string, params: unknown): Promise<T> {
     if (!this.socket || this.socket.destroyed) return Promise.reject(new Error("Disconnected"));
@@ -304,6 +334,8 @@ export async function connectOrExplain(rpc: RpcClient, socketPath: string): Prom
     return null;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    // A daemon answered but refused the handshake: say so, not that none is listening.
+    if (error instanceof OlderDaemonError || error instanceof RpcError) return `elefante: ${detail}`;
     return `elefante: no daemon listening at ${socketPath}\n`
       + "Run `elefante` to start one; this client does not spawn it.\n"
       + `(${detail})`;

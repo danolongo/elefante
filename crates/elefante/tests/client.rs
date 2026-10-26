@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
+    path::Path,
     process::Command,
     thread,
     time::Duration,
@@ -54,6 +55,26 @@ fn elefante_daemon_serves_the_socket_in_the_foreground() {
     assert!(daemon.wait().unwrap().success(), "exits cleanly when idle");
 }
 
+const TOKEN: &str = "fake-daemon-token";
+
+/// Listens at `socket` with a token beside it, as a daemon does.
+fn fake_daemon(socket: &Path) -> UnixListener {
+    std::fs::write(elefante::daemon::token_path(socket), TOKEN).unwrap();
+    UnixListener::bind(socket).unwrap()
+}
+/// Accepts one client and answers its `auth`, which must carry the token.
+fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
+    let (stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut peer = BufReader::new(stream);
+    let auth = receive(&mut peer, "auth");
+    assert_eq!(auth["params"], json!({"token":TOKEN}));
+    answer(&mut peer, &auth, &json!({}));
+    peer
+}
+
 fn receive(peer: &mut BufReader<UnixStream>, method: &str) -> Value {
     let mut line = String::new();
     peer.read_line(&mut line).unwrap();
@@ -77,10 +98,9 @@ fn memory_learn_goes_to_the_listening_daemon_without_touching_the_local_file() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
     let home = directory.path().join("home");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = fake_daemon(&socket);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let request = receive(&mut peer, "memory.consent");
         assert_eq!(
             request["params"],
@@ -110,11 +130,10 @@ fn memory_learn_goes_to_the_listening_daemon_without_touching_the_local_file() {
 fn memory_list_goes_to_the_listening_daemon_and_renders_safe_rows() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = fake_daemon(&socket);
     let cwd = std::fs::canonicalize(directory.path()).unwrap();
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let request = receive(&mut peer, "memory.list");
         assert_eq!(request["params"]["cwd"], cwd.to_string_lossy().as_ref());
         assert_eq!(request["params"]["all"], false);
@@ -146,13 +165,9 @@ fn memory_list_goes_to_the_listening_daemon_and_renders_safe_rows() {
 fn budgets_reach_daemon_and_coalesced_duplicates_render_once() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = fake_daemon(&socket);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let create = receive(&mut peer, "session.create");
         assert_eq!(create["params"]["max_rounds"], 8);
         assert_eq!(create["params"]["max_tokens"], 2048);
@@ -204,13 +219,9 @@ fn budgets_reach_daemon_and_coalesced_duplicates_render_once() {
 fn disconnected_headless_client_resumes_from_its_last_delivered_event() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = fake_daemon(&socket);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let create = receive(&mut peer, "session.create");
         answer(&mut peer, &create, &json!({"session_id":"s1","seq":0}));
         let attach = receive(&mut peer, "session.attach");
@@ -226,11 +237,7 @@ fn disconnected_headless_client_resumes_from_its_last_delivered_event() {
             &json!({"session_id":"s1","seq":1,"turn_id":"t1","method":"text.delta","params":{"text":"first "}}),
         );
         drop(peer);
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let attach = receive(&mut peer, "session.attach");
         assert_eq!(attach["params"]["since"], 1);
         answer(
@@ -276,10 +283,9 @@ fn a_daemon_that_predates_a_memory_command_is_named_not_worked_around() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("socket");
         let home = directory.path().join("home");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = fake_daemon(&socket);
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut peer = BufReader::new(stream);
+            let mut peer = accept(&listener);
             let request = receive(&mut peer, method);
             refuse(&mut peer, &request, -32601);
         });
@@ -307,10 +313,9 @@ fn a_daemon_that_predates_a_memory_command_is_named_not_worked_around() {
 fn another_daemon_error_is_still_an_error() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("socket");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = fake_daemon(&socket);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut peer = BufReader::new(stream);
+        let mut peer = accept(&listener);
         let request = receive(&mut peer, "memory.list");
         refuse(&mut peer, &request, -32007);
     });
@@ -323,4 +328,78 @@ fn another_daemon_error_is_still_an_error() {
         .unwrap();
     server.join().unwrap();
     assert!(!output.status.success(), "{output:?}");
+}
+
+fn learn_on(directory: &Path, socket: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_elefante"))
+        .current_dir(directory)
+        .env("HOME", directory.join("home"))
+        .env("ELEFANTE_SOCKET", socket)
+        .env("ELEFANTE_EXTRACT_MODEL", "vendor/extractor")
+        .args(["memory", "learn", "on"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_daemon_that_predates_the_token_is_named() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("socket");
+    // An older daemon writes no token and does not know `auth`.
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut peer = BufReader::new(stream);
+        let auth = receive(&mut peer, "auth");
+        assert_eq!(auth["params"], json!({"token":""}));
+        refuse(&mut peer, &auth, -32601);
+    });
+    let output = learn_on(directory.path(), &socket);
+    server.join().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("older build"), "{stderr}");
+}
+
+#[test]
+fn a_client_waits_for_a_token_the_daemon_is_still_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("socket");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = elefante::daemon::token_path(&socket);
+    let server = thread::spawn(move || {
+        // The client connects at once, then finds no token for a while.
+        thread::sleep(Duration::from_millis(300));
+        std::fs::write(token, TOKEN).unwrap();
+        let mut peer = accept(&listener);
+        let request = receive(&mut peer, "memory.consent");
+        answer(&mut peer, &request, &json!({"consent":"granted"}));
+    });
+    let output = learn_on(directory.path(), &socket);
+    server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"memory learning is granted for vendor/extractor\n"
+    );
+}
+
+#[test]
+fn a_refused_token_is_an_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("socket");
+    let listener = fake_daemon(&socket);
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut peer = BufReader::new(stream);
+        let auth = receive(&mut peer, "auth");
+        refuse(&mut peer, &auth, -32008);
+    });
+    let output = learn_on(directory.path(), &socket);
+    server.join().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(output.stdout.len(), 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("-32008"), "{stderr}");
+    assert!(!stderr.contains("older build"), "{stderr}");
 }

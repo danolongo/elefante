@@ -2,7 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, parseMemoryList, type CreateResult, type MemoryRow, type MemorySeed } from "./protocol";
+import { OlderDaemonError, RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, parseMemoryList, type CreateResult, type MemoryRow, type MemorySeed } from "./protocol";
 import type { Command } from "./commands";
 import { learningLine } from "./memoryView";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
@@ -131,6 +131,7 @@ async function recover() {
     }
     catch (error) {
       if (error instanceof RpcError && error.code === -32001) { message = "Session no longer exists. Restart elefante to create a new session."; break; }
+      if (error instanceof OlderDaemonError || error instanceof RpcError && error.code === -32008) { message = error.message; break; }
     }
   }
   reconnecting = false;

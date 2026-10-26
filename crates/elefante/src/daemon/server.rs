@@ -13,7 +13,7 @@ use std::{
 use crate::wire::{
     MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
     MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
-    UNKNOWN_NOTE, Usage, truncate_preview,
+    UNAUTHORIZED, UNKNOWN_NOTE, Usage, truncate_preview,
 };
 use anyhow::Context as _;
 use elefante_core::tools::ToolExecutor;
@@ -38,8 +38,11 @@ use elefante_provider::{Message, OpenRouterProvider, Provider};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader},
-    net::{UnixListener, UnixStream},
+    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+    net::{
+        UnixListener, UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::oneshot,
     time::Instant,
 };
@@ -88,6 +91,12 @@ pub fn socket_path() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(path).join("elefante.sock"));
     }
     Ok(home()?.join(".elefante/run/elefante.sock"))
+}
+
+/// The daemon writes its token beside its socket: `~/.elefante/run/token` by default.
+#[must_use]
+pub fn token_path(socket: &Path) -> PathBuf {
+    socket.with_file_name("token")
 }
 
 fn home() -> anyhow::Result<PathBuf> {
@@ -181,7 +190,9 @@ impl Drop for SocketGuard {
     }
 }
 
-async fn bind(path: &Path) -> anyhow::Result<Option<(UnixListener, SocketGuard)>> {
+/// Binds the socket and, just before, writes `token` for its clients. Only the starter that wins
+/// the directory lock writes, so a losing starter never replaces a live daemon's token.
+async fn bind(path: &Path, token: &str) -> anyhow::Result<Option<(UnixListener, SocketGuard)>> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -218,6 +229,7 @@ async fn bind(path: &Path) -> anyhow::Result<Option<(UnixListener, SocketGuard)>
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    credentials::write_private(&token_path(path), token)?;
     match UnixListener::bind(path) {
         Ok(listener) => {
             let guard = SocketGuard {
@@ -415,11 +427,19 @@ struct Shared {
     turns: AtomicUsize,
 }
 
-fn instance_id() -> io::Result<String> {
+fn random_bits() -> io::Result<[u8; 16]> {
     use std::io::Read as _;
     let mut bytes = [0_u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(u128::from_ne_bytes(bytes).to_string())
+    Ok(bytes)
+}
+
+fn instance_id() -> io::Result<String> {
+    Ok(u128::from_ne_bytes(random_bits()?).to_string())
+}
+
+fn new_token() -> io::Result<String> {
+    Ok(format!("{:032x}", u128::from_ne_bytes(random_bits()?)))
 }
 
 fn standalone_extractor() -> String {
@@ -471,9 +491,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     };
     let provider = make_provider(&config, stored_key)?;
     let instance_id = instance_id()?;
+    let token: Arc<str> = new_token()?.into();
     // Recheck under directory ownership: another starter may have become ready
     // while we prepared the provider and credentials.
-    let Some((listener, _socket_guard)) = bind(&config.socket).await? else {
+    let Some((listener, _socket_guard)) = bind(&config.socket, &token).await? else {
         return Ok(());
     };
     let consent = ConsentGate::new(&config);
@@ -499,8 +520,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 state.clients.fetch_add(1, Ordering::SeqCst);
                 idle_since = None;
                 let state = state.clone();
+                let token = token.clone();
                 tokio::spawn(async move {
-                    let _ = connection(stream, state.clone()).await;
+                    let _ = connection(stream, state.clone(), &token).await;
                     state.clients.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -793,8 +815,65 @@ impl ApprovalSink for Approvals {
     }
 }
 
-async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()> {
+/// Reads one NDJSON line, or `None` when the client closed, failed, or sent an oversized or
+/// unterminated frame.
+async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((MAX_LINE_BYTES + 2) as u64);
+    match limited.read_until(b'\n', &mut bytes).await {
+        Ok(0) | Err(_) => return None,
+        Ok(_) => {}
+    }
+    (bytes.len() <= MAX_LINE_BYTES + 1 && bytes.last() == Some(&b'\n')).then_some(bytes)
+}
+
+/// Compares every byte, so the time taken does not reveal how much of a guess was right.
+fn same_token(given: &[u8], token: &[u8]) -> bool {
+    given.len() == token.len()
+        && given
+            .iter()
+            .zip(token)
+            .fold(0, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/// The first request must be `auth { token }` with the daemon's token. The daemon answers anything
+/// else with `UNAUTHORIZED` and the caller closes the connection.
+async fn authenticate(
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+    token: &str,
+) -> bool {
+    let Some(bytes) = read_line(reader).await else {
+        return false;
+    };
+    let request = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let accepted = request["method"] == "auth"
+        && request["params"]["token"]
+            .as_str()
+            .is_some_and(|given| same_token(given.as_bytes(), token.as_bytes()));
+    let reply = if accepted {
+        response(id, json!({}))
+    } else {
+        error(
+            id,
+            UNAUTHORIZED,
+            "the first request must be auth with the daemon's token",
+        )
+    };
+    let Ok(frame) = crate::wire::encode_frame(&reply) else {
+        return false;
+    };
+    write.write_all(&frame).await.is_ok() && accepted
+}
+
+async fn connection(stream: UnixStream, state: Arc<Shared>, token: &str) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    if !authenticate(&mut reader, &mut write, token).await {
+        return Ok(());
+    }
     let queue = Arc::new(ClientQueue::new());
     let writer_queue = queue.clone();
     let writer = tokio::spawn(async move {
@@ -803,22 +882,13 @@ async fn connection(stream: UnixStream, state: Arc<Shared>) -> anyhow::Result<()
             .await;
         writer_queue.closed.cancel();
     });
-    let mut reader = BufReader::new(read);
     let mut consent_target = Some(state.standalone_extractor.clone());
     loop {
-        let mut bytes = Vec::new();
-        let mut limited = (&mut reader).take((MAX_LINE_BYTES + 2) as u64);
-        let result = tokio::select! {
+        let bytes = tokio::select! {
             () = queue.closed.cancelled() => break,
-            result = limited.read_until(b'\n', &mut bytes) => result,
+            bytes = read_line(&mut reader) => bytes,
         };
-        match result {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if bytes.len() > MAX_LINE_BYTES + 1 || bytes.last() != Some(&b'\n') {
-            break;
-        }
+        let Some(bytes) = bytes else { break };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(request) => handle(&state, &queue, &request, &mut consent_target).await,
             Err(_) => queue.push(error(Value::Null, -32700, "invalid JSON")),

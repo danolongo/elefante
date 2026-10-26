@@ -633,10 +633,10 @@ that phase can pass its gate.
   bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
   process that leaves the group can survive, but remains sandboxed; the output reader stops two
   seconds after bash exits so a held pipe cannot stall the turn.
-- **The daemon's socket requires a token.** At start the daemon writes 128 random bits to
-  `~/.elefante/run/token` (`0600`); every connection presents it first, and the CLI and TUI read it
-  there. The sandbox cannot read `~/.elefante`, so a command that reaches the socket still cannot
-  create a session, resolve an approval, set the key or change memory.
+- **The daemon's socket requires a token.** At start the daemon writes 128 random bits beside its
+  socket (`~/.elefante/run/token` by default, `0600`); every connection presents it first, and the
+  CLI and TUI read it there. The sandbox cannot read the token, so a command that reaches the
+  socket still cannot create a session, resolve an approval, set the key or change memory.
 - **Git goes through the harness for writes.** Read git runs in the shell sandbox with
   `GIT_OPTIONAL_LOCKS=0`. A write routes only when the whole bash call is one plain `git`
   command with literal words or single-quoted strings. Pipes, lists, substitutions, expansions,

@@ -556,14 +556,16 @@ attach results and the snapshot as `sandbox: { state, detail }`, mirrored in
 CLI prints one warning line.
 
 **Socket token.**
-- Kept in the daemon's private directory: `~/.elefante/run/token` by default, or beside an
-  explicit `ELEFANTE_SOCKET` (tests).
+- The daemon keeps the token beside its socket: `~/.elefante/run/token` by default,
+  `$XDG_RUNTIME_DIR/token` when that sets the socket, or beside an explicit `ELEFANTE_SOCKET`
+  (tests).
 - 128 random bits from `/dev/urandom` (as `server.rs:418`), mode 0600, written atomically (temp
-  file, then rename) **before** `listen`.
+  file, then rename) **before** `listen`. Only the starter that holds the socket directory's lock
+  writes it, so a losing starter never replaces a live daemon's token.
 - The first request must be `auth { token }`, compared in constant time; otherwise the daemon
-  answers `-32001` and closes.
+  answers `-32008` (`UNAUTHORIZED`) and closes. `-32001` stays "unknown session".
 - The CLI (`main.rs`) and the TUI (`protocol.ts`) authenticate first, retrying briefly while the
-  file is absent during auto-start.
+  file is absent during auto-start. When the file never appears, the client sends an empty token.
 - An older daemon answers `-32601`, which the client maps to `OLDER_DAEMON`.
 - The policy renderer asserts that neither the socket nor the token path is readable inside.
 

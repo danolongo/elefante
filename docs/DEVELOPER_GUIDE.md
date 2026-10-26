@@ -607,6 +607,7 @@ Standard JSON-RPC error objects, application codes in the `-32000` range:
 | `-32005` | Unknown approval id, or approval already resolved |
 | `-32006` | `UNKNOWN_NOTE`: `memory.forget` or `memory.approve` named a note that is absent, is not a learned note, or (for approve) is not pending |
 | `-32007` | `MEMORY_OFF`: a `memory.list`, `forget`, `approve`, `clear` or `status` for a `cwd` whose repository has no usable store — `ELEFANTE_MEMORY=0`, no repository root (`/`, `$HOME`), or the store could not be opened |
+| `-32008` | `UNAUTHORIZED`: the connection's first request was not `auth { token }` with the token the daemon wrote beside its socket. The daemon then closes the connection. A daemon that answers `auth` with `-32601` predates the token; the CLI and the TUI report it as `OLDER_DAEMON`. |
 
 Transport and provider failures *inside* a turn are not RPC errors — the request already
 succeeded. They arrive as `session.error` followed by `turn.finished`.

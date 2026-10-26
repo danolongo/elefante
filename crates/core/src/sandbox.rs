@@ -158,9 +158,6 @@ fn sweep_stale_temp_dirs_in(base: &Path) -> usize {
 }
 
 fn process_alive(pid: i32) -> bool {
-    if u32::try_from(pid).is_ok_and(|pid| pid == std::process::id()) {
-        return true;
-    }
     rustix::process::Pid::from_raw(pid).is_none_or(|pid| {
         // EPERM means the process exists under another user; only ESRCH proves it is gone.
         rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH)

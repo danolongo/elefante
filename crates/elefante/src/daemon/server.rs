@@ -495,34 +495,40 @@ async fn git_identity_in(
         .unwrap_or_else(|| home.join(".config"))
         .join("git/config");
     let files = [home.join(".gitconfig"), xdg];
-    let mut values = Vec::new();
-    for key in ["user.name", "user.email"] {
-        let mut value = None;
-        for file in files.iter().filter(|file| file.is_file()) {
-            let invocation = elefante_guard::git::hardened(&git, home);
-            let mut command = tokio::process::Command::new(&invocation.program);
-            command
-                .args(&invocation.args)
-                .args(["config", "--includes", "--file"])
-                .arg(file)
-                .args(["--get", key])
-                .current_dir(&invocation.cwd)
-                .env_clear()
-                .envs(&invocation.environment);
-            let output = elefante_core::sandbox::run_process(command, Duration::from_secs(10))
-                .await
-                .ok()?;
-            let text = output.content.trim();
-            if output.success && !text.is_empty() {
-                value = Some(text.to_owned());
-                break;
+    let (mut name, mut email) = (None, None);
+    for file in files.iter().filter(|file| file.is_file()) {
+        let invocation = elefante_guard::git::hardened(&git, home);
+        let mut command = tokio::process::Command::new(&invocation.program);
+        command
+            .args(&invocation.args)
+            .args(["config", "--includes", "--null", "--file"])
+            .arg(file)
+            .args(["--get-regexp", r"^user\.(name|email)$"])
+            .current_dir(&invocation.cwd)
+            .env_clear()
+            .envs(&invocation.environment);
+        let output = elefante_core::sandbox::run_process(command, Duration::from_secs(10))
+            .await
+            .ok()?;
+        if !output.success {
+            continue;
+        }
+        // Git prints each entry as `key\nvalue\0`. The last value of a key wins, as with `--get`.
+        let (mut file_name, mut file_email) = ("", "");
+        for entry in output.content.split('\0') {
+            match entry.split_once('\n').unwrap_or((entry, "")) {
+                ("user.name", value) => file_name = value.trim(),
+                ("user.email", value) => file_email = value.trim(),
+                _ => {}
             }
         }
-        values.push(value?);
+        name = name.or_else(|| (!file_name.is_empty()).then(|| file_name.to_owned()));
+        email = email.or_else(|| (!file_email.is_empty()).then(|| file_email.to_owned()));
     }
-    let email = values.pop()?;
-    let name = values.pop()?;
-    Some(elefante_guard::git::Identity { name, email })
+    Some(elefante_guard::git::Identity {
+        name: name?,
+        email: email?,
+    })
 }
 
 fn sandbox_status(sandbox: &Sandbox) -> SandboxStatus {

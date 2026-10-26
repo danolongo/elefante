@@ -75,7 +75,8 @@ async fn late_repository_does_not_gain_harness_writes() {
     let temp = tempfile::tempdir().unwrap();
     let runner = harness(temp.path());
     git(temp.path(), &["init", "-q"]);
-    assert!(add(temp.path(), &runner).await.is_err());
+    let error = add(temp.path(), &runner).await.unwrap_err();
+    assert!(error.contains("present at session start"), "{error}");
 }
 
 #[tokio::test]
@@ -97,7 +98,8 @@ async fn custom_attribute_drivers_are_refused_before_execution() {
         )
         .unwrap();
         fs::write(temp.path().join("file"), "hello").unwrap();
-        assert!(add(temp.path(), &harness(temp.path())).await.is_err());
+        let error = add(temp.path(), &harness(temp.path())).await.unwrap_err();
+        assert!(error.contains("custom Git drivers"), "{attribute}: {error}");
         assert!(!temp.path().join("marker").exists());
         if attribute == "filter=trap" {
             git(temp.path(), &["add", "file"]);
@@ -128,9 +130,10 @@ async fn index_fallback_info_and_unpruned_attributes_are_checked() {
                 fs::write(temp.path().join("target/.gitattributes"), "* filter=trap\n").unwrap();
             }
         }
+        let error = add(temp.path(), &harness(temp.path())).await.unwrap_err();
         assert!(
-            add(temp.path(), &harness(temp.path())).await.is_err(),
-            "{location}"
+            error.contains("custom filter or merge attributes"),
+            "{location}: {error}"
         );
     }
 }
@@ -158,10 +161,12 @@ async fn in_root_config_targets_are_refused() {
         let temp = tempfile::tempdir().unwrap();
         git(temp.path(), &["init", "-q"]);
         git(temp.path(), &["config", key, value]);
-        assert!(
-            add(temp.path(), &harness(temp.path())).await.is_err(),
-            "{key}"
-        );
+        let error = add(temp.path(), &harness(temp.path())).await.unwrap_err();
+        assert!(error.contains("in-root"), "{key}: {error}");
+        git(temp.path(), &["config", "--unset", key]);
+        add(temp.path(), &harness(temp.path()))
+            .await
+            .unwrap_or_else(|error| panic!("control without {key}: {error}"));
     }
 }
 
@@ -192,7 +197,8 @@ async fn merge_driver_refusal_has_an_executable_positive_control() {
     let GitRoute::Harness(write) = route("git merge other", temp.path()) else {
         panic!("route")
     };
-    assert!(harness(temp.path()).execute(&write).await.is_err());
+    let error = harness(temp.path()).execute(&write).await.unwrap_err();
+    assert!(error.contains("custom Git drivers"), "{error}");
     assert!(!temp.path().join("marker").exists());
     assert!(
         !Command::new("/usr/bin/git")
@@ -234,7 +240,8 @@ async fn target_revision_attributes_cannot_activate_configured_driver() {
     let GitRoute::Harness(write) = route("git checkout other", temp.path()) else {
         panic!("route")
     };
-    assert!(harness(temp.path()).execute(&write).await.is_err());
+    let error = harness(temp.path()).execute(&write).await.unwrap_err();
+    assert!(error.contains("custom Git drivers"), "{error}");
     assert!(!temp.path().join("marker").exists());
     git(temp.path(), &["checkout", "-q", "other"]);
     assert!(

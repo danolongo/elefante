@@ -487,9 +487,7 @@ impl ToolExecutor {
             Err(result) => return result,
         };
         if let crate::sandbox::Sandbox::Unavailable(reason) = self.sandbox.state() {
-            return ToolResult::error(format!(
-                "sandbox unavailable: {reason}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out"
-            ));
+            return ToolResult::error(crate::sandbox::unavailable(reason));
         }
         if input.network && !network_approved {
             return ToolResult::error("network access requires explicit approval");

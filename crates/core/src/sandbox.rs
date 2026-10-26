@@ -52,6 +52,19 @@ pub fn binary(name: &str) -> Result<PathBuf, String> {
         .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
 }
 
+/// Setup advice for a host whose sandbox mechanism is missing or cannot launch.
+const SETUP: &str = if cfg!(target_os = "linux") {
+    "install bubblewrap and enable unprivileged user namespaces, or set ELEFANTE_SANDBOX=0 to opt out"
+} else {
+    "set ELEFANTE_SANDBOX=0 to opt out"
+};
+
+/// The refusal every bash or harness caller returns for an `Unavailable` session.
+#[must_use]
+pub fn unavailable(reason: &str) -> String {
+    format!("sandbox unavailable: {reason}")
+}
+
 fn detect() -> Sandbox {
     if std::env::var_os("ELEFANTE_SANDBOX").is_some_and(|value| value == "0") {
         return Sandbox::Disabled;
@@ -59,11 +72,14 @@ fn detect() -> Sandbox {
     if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").is_file() {
         Sandbox::Seatbelt
     } else if cfg!(target_os = "linux") {
-        binary("bwrap").map_or_else(Sandbox::Unavailable, |bwrap| Sandbox::Bubblewrap { bwrap })
-    } else {
-        Sandbox::Unavailable(
-            "install Seatbelt on macOS or bubblewrap with user namespaces on Linux".into(),
+        binary("bwrap").map_or_else(
+            |error| Sandbox::Unavailable(format!("{error}; {SETUP}")),
+            |bwrap| Sandbox::Bubblewrap { bwrap },
         )
+    } else if cfg!(target_os = "macos") {
+        Sandbox::Unavailable(format!("/usr/bin/sandbox-exec is missing; {SETUP}"))
+    } else {
+        Sandbox::Unavailable(format!("this OS has no supported sandbox; {SETUP}"))
     }
 }
 
@@ -499,15 +515,22 @@ impl SessionSandbox {
     /// Fails closed for unavailable isolation, policy errors, or failed process launch.
     pub async fn run_shell(&self, source: &str, network: Network) -> Result<ProcessOutput, String> {
         if let Sandbox::Unavailable(reason) = &self.state {
-            return Err(format!(
-                "sandbox unavailable: {reason}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out"
-            ));
+            return Err(unavailable(reason));
         }
         if !matches!(self.state, Sandbox::Disabled) {
-            PROBED.get_or_try_init(|| async {
-                let output = self.run_shell_unprobed("true", Network::Off).await?;
-                if output.success { Ok(()) } else { Err(format!("sandbox probe failed: {}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out", output.content)) }
-            }).await?;
+            PROBED
+                .get_or_try_init(|| async {
+                    let output = self.run_shell_unprobed("true", Network::Off).await?;
+                    if output.success {
+                        Ok(())
+                    } else {
+                        Err(unavailable(&format!(
+                            "probe failed: {}; {SETUP}",
+                            output.content
+                        )))
+                    }
+                })
+                .await?;
         }
         self.run_shell_unprobed(source, network).await
     }
@@ -524,11 +547,6 @@ impl SessionSandbox {
             self.scan()?
         };
         policy.network = network;
-        if let Sandbox::Unavailable(reason) = &self.state {
-            return Err(format!(
-                "sandbox unavailable: {reason}; install bubblewrap and enable unprivileged user namespaces on Linux; ELEFANTE_SANDBOX=0 opts out"
-            ));
-        }
         let sandboxed = !matches!(self.state, Sandbox::Disabled);
         let env_source = self
             .rustup_home

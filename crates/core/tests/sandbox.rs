@@ -153,11 +153,8 @@ async fn invalid_root_is_unavailable_and_cannot_poison_a_valid_session() {
         .expect("session can describe an unavailable sandbox");
     assert!(matches!(invalid.state(), Sandbox::Unavailable(_)));
     assert!(
-        invalid
-            .run_shell("true", Network::Off)
-            .await
-            .expect_err("invalid root refuses")
-            .contains("opts out")
+        !error.contains("ELEFANTE_SANDBOX=0"),
+        "opting out cannot fix an invalid root: {error}"
     );
     let root = tempfile::tempdir().expect("valid root");
     let valid = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))

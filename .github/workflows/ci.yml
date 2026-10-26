@@ -22,12 +22,18 @@ env:
   BUN_VERSION: 1.4.2
 
 jobs:
+  # Both legs run the sandbox gate: bubblewrap on Linux, Seatbelt on macOS.
   rust:
-    name: rust
-    runs-on: ubuntu-24.04
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: sandbox prerequisites
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap sqlite3
@@ -50,6 +56,7 @@ jobs:
       # Catches a ninth crate added without one. It cannot catch a stale README — that needs
       # the rustdoc include_str! wiring noted in docs/DEVELOPER_GUIDE.md §13.
       - name: crate readmes exist
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           missing=0

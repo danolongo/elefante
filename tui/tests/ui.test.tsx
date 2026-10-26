@@ -474,3 +474,48 @@ test("Esc in the open memory panel closes it and does not interrupt another clie
     expect(interrupts).toBe(0); expect(closed).toBe(1);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
+test("the status line names an off or unavailable sandbox in the warning colour and says nothing when it is on", async () => {
+  const render = async (sandbox: ReturnType<typeof initialSession>["sandbox"]) => {
+    const setup = await testRender(<Status state={{ ...initialSession("s"), sandbox }} now={0} />, { width: 120, height: 5 });
+    try {
+      await setup.renderOnce();
+      const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+      const warning = spans.find(span => span.text.includes("sandbox:"));
+      return { frame: setup.captureCharFrame(), fg: warning?.fg.toInts().slice(0, 3) };
+    } finally { await act(async () => setup.renderer.destroy()); }
+  };
+  for (const state of ["off", "unavailable"] as const) {
+    const { frame, fg } = await render({ state, detail: "why" });
+    expect(frame).toContain(`sandbox: ${state}`);
+    expect(fg).toEqual([0xe5, 0xc0, 0x7b]);
+  }
+  for (const sandbox of [{ state: "on" as const, detail: "seatbelt" }, null]) {
+    const { frame, fg } = await render(sandbox);
+    expect(frame).not.toContain("sandbox");
+    expect(fg).toBeUndefined();
+  }
+});
+test("the approval modal escapes the command and shows a network badge only for a network request", async () => {
+  const render = async (network: boolean | undefined) => {
+    const approval = { approval_id: "a", command: "curl\x1b[2J example.com\n‮rm -rf ~", rule: "network-requested", ...(network === undefined ? {} : { network }) };
+    const setup = await testRender(<Modal kind="approval" approval={approval} busy={false} onDecision={() => {}} />, { width: 80, height: 15 });
+    try {
+      await setup.renderOnce();
+      const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+      const badge = spans.find(span => span.text.includes("[network]"));
+      return { frame: setup.captureCharFrame(), fg: badge?.fg.toInts().slice(0, 3) };
+    } finally { await act(async () => setup.renderer.destroy()); }
+  };
+  const networked = await render(true);
+  expect(networked.frame).toContain("[network]");
+  expect(networked.fg).toEqual([0xe5, 0xc0, 0x7b]);
+  // displaySafe drops control and format characters and folds the newline into one line.
+  expect(networked.frame).toContain("curl[2J example.com rm -rf ~");
+  expect(networked.frame).not.toContain("\x1b");
+  expect(networked.frame).not.toContain("‮");
+  for (const network of [false, undefined]) {
+    const plain = await render(network);
+    expect(plain.frame).not.toContain("[network]");
+    expect(plain.frame).toContain("curl[2J example.com rm -rf ~");
+  }
+});

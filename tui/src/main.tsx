@@ -124,6 +124,7 @@ async function recover() {
       connected = true; message = null;
       // The snapshot callback restored state with the old status; the attach result's is current.
       // A consent question already asked (or put off) is not reopened, only closed if answered elsewhere.
+      if (attached?.sandbox) state = { ...state, sandbox: attached.sandbox };
       if (isMemoryStatus(attached?.memory)) {
         state = { ...state, memory: attached.memory };
         if (attached.memory.consent !== "unset") consentPrompt = null;
@@ -147,6 +148,8 @@ try {
   const attached = await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort, state.memory, state.memory_lines); draw(); });
   const memory = attached.memory ?? created.memory;
   if (isMemoryStatus(memory)) state = { ...state, memory };
+  const sandbox = attached.sandbox ?? created.sandbox;
+  if (sandbox) state = { ...state, sandbox };
   if (memory?.consent === "unset" && memory.extractor !== null) consentPrompt = memory;
   timer = setInterval(draw, 250);
   draw();                 // seeds the store before the first read

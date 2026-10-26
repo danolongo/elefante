@@ -4,3 +4,5 @@
 export const BORDER = "#4e7ea3";
 export const STATUS_TEXT = "#9dbad2";
 export const PLACEHOLDER = "#5f809b";
+/// Amber, for states the user must know about: an unsandboxed shell, a network request.
+export const WARNING = "#e5c07b";

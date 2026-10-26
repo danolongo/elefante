@@ -2,6 +2,7 @@ import { useKeyboard, usePaste } from "@opentui/react";
 import { useState } from "react";
 import { displaySafe, type Approval } from "../protocol";
 import type { MemoryPanelProps } from "./MemoryPanel";
+import { WARNING } from "./theme";
 type DialogProps =
   | { kind: "approval"; approval: Approval; busy: boolean; onDecision: (decision: "allow" | "deny") => void }
   | { kind: "key"; busy: boolean; onKey: (key: string) => void }
@@ -28,7 +29,9 @@ export function Modal(props: DialogProps) {
   });
   return <box position="absolute" top={2} left={2} right={2} border padding={1} backgroundColor="#222233" flexDirection="column">
     {props.kind === "approval" ? <>
-      <text>Approval required · {props.approval.rule}</text><text>{props.approval.command}</text><text>{props.busy ? "Resolving…" : "Y allow · N deny"}</text>
+      <text>Approval required · {props.approval.rule}</text>
+      {props.approval.network && <text id="network-badge" fg={WARNING}>[network] this command asks for internet access</text>}
+      <text>{displaySafe(props.approval.command)}</text><text>{props.busy ? "Resolving…" : "Y allow · N deny"}</text>
     </> : props.kind === "key" ? <><text>OpenRouter API key</text><text>{"•".repeat(Array.from(secret).length)}</text><text>{props.busy ? "Saving…" : "Paste or type key, then Enter"}</text></> : <>
       <text>Remember things between sessions?</text>
       <text>Elefante can note lasting preferences from your chats (e.g. “use pnpm”).</text>

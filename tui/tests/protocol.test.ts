@@ -327,3 +327,29 @@ test("a daemon that predates the token is named as an older daemon", async () =>
     expect(await connectOrExplain(new RpcClient(), daemon.path)).toBe(`elefante: ${OLDER_DAEMON}`);
   } finally { await daemon.close(); }
 }, 10_000);
+test("create, attach and snapshot carry an optional, validated sandbox state", () => {
+  for (const sandbox of [{ state: "on" as const, detail: "seatbelt" }, { state: "off" as const, detail: "ELEFANTE_SANDBOX=0" }, { state: "unavailable" as const, detail: "bubblewrap is unavailable" }]) {
+    expect(parseCreate({ session_id: "s", seq: 0, sandbox }).sandbox).toEqual(sandbox);
+    expect(parseAttach({ kind: "resumed", from: 2, events: [note(2, "turn.started")], sandbox }, "s", 1).sandbox).toEqual(sandbox);
+    const attached = parseAttach({ kind: "snapshot", seq: 0, snapshot: { ...snapshot(), sandbox }, sandbox }, "s");
+    expect(attached.sandbox).toEqual(sandbox);
+    expect(attached.kind === "snapshot" && attached.snapshot.sandbox).toEqual(sandbox);
+  }
+  // An older daemon sends no state; that is not an error.
+  expect(parseCreate({ session_id: "s", seq: 0 })).not.toHaveProperty("sandbox");
+  expect(parseAttach({ kind: "snapshot", seq: 0, snapshot: snapshot() }, "s")).not.toHaveProperty("sandbox");
+  for (const invalid of [null, { state: "partial", detail: "" }, { state: "on" }, { state: "off", detail: 3 }]) {
+    expect(() => parseCreate({ session_id: "s", seq: 0, sandbox: invalid })).toThrow(ProtocolError);
+    expect(() => parseAttach({ kind: "snapshot", seq: 0, snapshot: snapshot(), sandbox: invalid }, "s")).toThrow(ProtocolError);
+    expect(() => parseAttach({ kind: "snapshot", seq: 0, snapshot: { ...snapshot(), sandbox: invalid } }, "s")).toThrow(ProtocolError);
+  }
+});
+test("approval network flags are structured booleans on events and pending snapshot approvals", () => {
+  const requested = { approval_id: "a", command: "curl example.com", rule: "network-requested", network: true };
+  expect(parseNotification(note(1, "approval.requested", requested)).params).toEqual(requested);
+  expect(() => parseNotification(note(1, "approval.requested", { ...requested, network: "yes" }))).toThrow(ProtocolError);
+  const active = { turn_id: "t", text_so_far: "", reasoning_so_far: "", tools: [], pending_approval: requested };
+  const attached = parseAttach({ kind: "snapshot", seq: 0, snapshot: { ...snapshot(), active_turn: active } }, "s");
+  expect(attached.kind === "snapshot" && attached.snapshot.active_turn?.pending_approval?.network).toBe(true);
+  expect(() => parseAttach({ kind: "snapshot", seq: 0, snapshot: { ...snapshot(), active_turn: { ...active, pending_approval: { ...requested, network: 1 } } } }, "s")).toThrow(ProtocolError);
+});

@@ -106,10 +106,11 @@ pub fn route(source: &str, root: &Path) -> GitRoute {
     if words.first().is_none_or(|word| word != "git") {
         return refuse_if(contains_write(source));
     }
-    if !source.trim_start_matches([' ', '\t']).starts_with("git ")
-        && !source.trim_start_matches([' ', '\t']).starts_with("git\t")
-        && source.trim() != "git"
-    {
+    let start = source.trim_start_matches([' ', '\t']);
+    let git_first = start
+        .strip_prefix("git")
+        .is_some_and(|rest| rest.starts_with([' ', '\t']));
+    if !git_first && source.trim() != "git" {
         return GitRoute::Refused(REFUSAL);
     }
     let rest = &words[1..];

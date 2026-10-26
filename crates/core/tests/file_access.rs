@@ -53,15 +53,28 @@ fn concurrent_link_swaps_never_touch_the_outside_file() {
     let stopped = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stopped);
     let outside_path = outside.path().to_owned();
+    let plain = canonical.join("swapped/file");
     let swapper = std::thread::spawn(move || {
         while !signal.load(Ordering::Relaxed) {
-            let _ = fs::rename(canonical.join("swapped"), canonical.join("parked"));
-            let _ = symlink(&outside_path, canonical.join("swapped"));
-            let _ = fs::remove_file(canonical.join("swapped"));
-            let _ = fs::rename(canonical.join("parked"), canonical.join("swapped"));
+            let (swapped, parked) = (canonical.join("swapped"), canonical.join("parked"));
+            let _ = fs::rename(&swapped, &parked);
+            let _ = symlink(&outside_path, &swapped);
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            let _ = fs::remove_file(&swapped);
+            // A write in the gap can create a fresh directory here, which blocks the return.
+            if fs::rename(&parked, &swapped).is_err() {
+                let _ = fs::remove_dir_all(&swapped);
+                let _ = fs::rename(&parked, &swapped);
+            }
         }
     });
-    for _ in 0..300 {
+    // A plain read follows the link, so it proves the swap happened while FileAccess ran.
+    let mut raced = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut rounds = 0;
+    while rounds < 300 || (!raced && std::time::Instant::now() < deadline) {
+        rounds += 1;
+        raced |= fs::read(&plain).is_ok_and(|bytes| bytes == b"outside-secret");
         if let Ok(bytes) = access.read("swapped/file") {
             assert_eq!(bytes, b"inside");
         }
@@ -69,6 +82,7 @@ fn concurrent_link_swaps_never_touch_the_outside_file() {
     }
     stopped.store(true, Ordering::Relaxed);
     swapper.join().unwrap();
+    assert!(raced, "a plain read never followed the swapped link");
     assert_eq!(
         fs::read(outside.path().join("file")).unwrap(),
         b"outside-secret"

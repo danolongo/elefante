@@ -21,12 +21,12 @@ ordered, testable work, and records the decisions taken since then:
 - **A contextless adversarial review (2026-10-21) changed this plan**; the
   [mapping](#review-findings--changes) is at the end.
 
-**Today:**
-- bash runs `bash -lc` with the daemon's full environment, no timeout, and uncapped output
-  (`crates/core/src/tools.rs:333`);
-- the daemon socket authenticates nobody (`crates/elefante/src/daemon/server.rs:794`);
-- `session.create` accepts any cwd, and `key.set` exists. A command that reaches the socket
-  therefore escapes fully.
+**Before M4 (on `main`):**
+- bash ran `bash -lc` with the daemon's full environment, no timeout, and uncapped output
+  (`ToolExecutor::bash` in `crates/core/src/tools.rs`);
+- the daemon socket authenticated nobody (`crates/elefante/src/daemon/server.rs`);
+- `session.create` accepted any cwd, and `key.set` existed. A command that reached the socket
+  therefore escaped fully.
 
 **Outcome:** every bash call runs in an OS sandbox that fails closed. Inside it:
 - no network (and on macOS not even the host's loopback);
@@ -143,6 +143,11 @@ pushes to `sandboxing` instead.
 **Further CI iterations:** fix the temporary probe if its own setup fails. Do not treat a
 probe-harness failure as a sandbox result.
 **Results commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
+
+**Recorded commits.** fd50d37 and 0843aca carry the first two subjects above. The CI iterations
+are ffc3d4f `fix(ci): make sandbox spike controls exercise the intended paths`, d420cc6
+`fix(ci): expose compiler links and CA roots in sandbox spike` and 464169a `test(ci): verify
+sandbox toolchains from a cold build`. 1e76818 carries the results subject.
 
 ---
 
@@ -364,6 +369,9 @@ else refused.
 
 **Commit:** `feat(guard): render sandbox profiles and route git writes`.
 
+**Recorded commits.** 7fc0b99 carries that subject. The separately approved gate fix is 62394d4
+`fix(guard): keep Linux seccomp policy lint-clean`.
+
 ---
 
 ## Phase 2 — `core`: run every bash call in the sandbox
@@ -407,16 +415,20 @@ The results feed `read_only` and `hidden`.
 **Per-root `RwLock`.** Sandboxed bash takes it shared; harness git takes it exclusive and runs the
 post-scan first. Parallel bash calls stay parallel.
 
-### 2b. Bash runner (rewrite `ToolExecutor::bash`, `tools.rs:333`)
+### 2b. Bash runner (rewrite `ToolExecutor::bash`)
 
 **Launch:**
-- macOS: `/usr/bin/sandbox-exec -p <profile> -D… <bash> -c <cmd>`.
-- Linux: `/bin/sh -c <trampoline> <bwrap> /proc/<daemon>/fd/<a> /proc/<daemon>/fd/<b> <args>`.
+- Every state starts the fixed `bash` with a launcher script. The script closes every descriptor
+  above stderr that the daemon inherited, then execs the next program.
+- macOS: the launcher execs `/usr/bin/sandbox-exec -p <profile> -D… <bash> -c <cmd>`.
+- Linux: `<bash> -c <launcher> <bwrap> /proc/<daemon>/fd/<a> /proc/<daemon>/fd/<b> <args>`.
   The daemon writes the two seccomp programs into anonymous memory files with close-on-exec set.
-  The trampoline reopens them as fds 3 and 4 and execs bubblewrap with
+  The launcher reopens them as fds 3 and 4 and execs bubblewrap with
   `--add-seccomp-fd 3 --add-seccomp-fd 4` (per S2). A failed reopen stops the `exec`. The daemon
   never writes a program at a path the sandbox can reach and never holds an inheritable
   descriptor, so concurrent spawns inherit nothing. Bash receives `/dev/null` on stdin.
+  (The S2 row above names a `/bin/sh` trampoline; f1d745a and 022c503 replaced it with this
+  `bash` launcher.)
 - In every case: the environment comes from `guard::sandbox::environment`, there is a process
   group, and `kill_on_drop` is set.
 
@@ -476,9 +488,30 @@ approved escalation still runs sandboxed; only `network-requested` switches to
   Only the read-only `sqlite3 <db> .schema` form and exact `xargs cat` join the intent allowlist.
   `Disabled` still escalates every Bash call before the classifier runs.
 - In `known_gaps()`, the four harness-state entries become "enforced by the OS sandbox".
-- The asserting tests (`crates/guard/tests/bash_classifier.rs:189-271`) become sandbox tests. The
-  old → new mapping is recorded in `docs/M4_milestone.md`; this is the written renegotiation
-  of those M0/M3 gate items.
+- The asserting tests in `crates/guard/tests/bash_classifier.rs` become sandbox tests. The
+  table below maps old to new; it is the written renegotiation of those M0/M3 gate items.
+
+**Old → new test mapping.** The left column names the test on `main`. The OS column names the
+sandbox test that now carries the assertion. Every sandbox test there pairs the blocked read with
+an unsandboxed control and an ordinary-file control.
+
+| Test on `main` | Classifier test now | Old verdict → new | OS test |
+|---|---|---|---|
+| `denies_final_component_and_glob_spellings_of_harness_state`, literal forms (`cat .elefante`, `grep -ra x .elefante`, `ls -a .elefante`) | `denies_literal_harness_state_paths` | `Deny` → `Deny` | Not needed: the classifier still denies. |
+| the same test, glob forms (`cat .elef*/memory.db`, `.[e]lefante`, `.*`, `sqlite3 .elef*/memory.db .schema`) | `leaves_harness_glob_expansion_to_the_os_sandbox`, with `data*` controls | `Deny` → `Allow` | None runs a glob spelling. `former_harness_state_bypasses_reach_the_os_boundary` (`crates/core/tests/sandbox.rs`) exercises the name rule that hides `.elefante/`. |
+| `escalates_recursive_content_readers_over_the_workspace_root` (`grep -r x .`, `rg -uuu x`, rule `recursive-search-includes-harness-state`) | `leaves_recursive_reader_path_enforcement_to_the_os_sandbox` | `Escalate` → `Allow` (`read-only-allowlist`) | None runs a recursive reader over a root that holds `.elefante/`. The same name rule applies. |
+| `recursive_readers_stay_allowed_when_they_cannot_reach_harness_state` | `recursive_readers_allow_ordinary_paths_and_exclusions` | `Allow` → `Allow` | Not needed. |
+| `documents_remaining_harness_state_gaps`: `D=.elefante; cat $D/memory.db` | `documents_harness_state_paths_enforced_by_the_os_sandbox` | `Allow` → `Allow` | `former_harness_state_bypasses_reach_the_os_boundary` |
+| the same test: `cd "$D" && cat memory.db` | the same test, plus `allows_narrow_runtime_path_readers_with_ordinary_path_controls` | `Escalate` → `Allow` | `former_harness_state_bypasses_reach_the_os_boundary` (`cd .elefante && cat x`) |
+| the same test: `sqlite3 "$DB" .schema` | the same two tests | `Escalate` → `Allow` | `assembled_sqlite_path_cannot_read_harness_state` |
+| the same test: `echo "$P" \| xargs cat` | the same two tests | `Escalate` → `Allow` | `former_harness_state_bypasses_reach_the_os_boundary` (`… \| xargs cat`) |
+| `classifies_full_fixture_table`: `rg --hidden x` | the same test | `Escalate` → `Allow` | As the recursive-reader row. |
+| `workspace_under_an_elefante_directory_classifies_normally`: `grep -r x .` | the same test | `Escalate` → `Allow` | As the recursive-reader row. |
+
+Each gap that `documents_harness_state_paths_enforced_by_the_os_sandbox` checks must now say
+"enforced by the OS sandbox" in `known_gaps()`. `allows_narrow_runtime_path_readers_with_ordinary_path_controls`
+keeps `Escalate` for every other `cd`, `sqlite3` and `xargs` form, such as `sqlite3 "$DB" .shell`
+and `xargs rm`.
 
 ### 2e. Hardened file access, in the daemon and the indexer
 
@@ -570,6 +603,18 @@ sink. A copy of the cancellation test runs sandboxed.
 
 **Commit:** `feat(core): run bash in an OS sandbox and route git writes through the harness`.
 
+**Recorded commits.** The phase landed as 652b2ff `feat(core): confine shell execution and harden
+tool access`. Its CI and gate fixes followed:
+- 6717683 `fix(ci): run Linux sandbox tests after a valid namespace probe`;
+- 3e694e1 `fix(ci): enable Ubuntu user namespaces for sandbox tests`;
+- c12a39e `fix(guard): preserve writable sandbox devices on Linux`;
+- 652f061 `fix(guard): hide sandbox init process details`;
+- ea8dda4 `test(core): distinguish live descriptors from shell globbing`;
+- d133a01 `test(core): exercise sandbox lifetime and service controls`;
+- 9578fb0 `test(core): keep sandbox controls independent of their probes`;
+- aa9d09d `ci: run the macOS host-service sandbox controls on a disposable runner`;
+- 365d02c `test(core): probe inherited descriptors with a compiled helper`.
+
 ---
 
 ## Phase 3 — `elefante`: daemon, protocol, TUI, `web_search` backend
@@ -618,6 +663,17 @@ Git write (rule `git-identity-missing`), so the user never approves a write that
 
 **Commit:** `feat(elefante): authenticate the socket, report sandbox state, add web search`.
 
+**Recorded commits.** The phase landed as several commits instead of that one:
+- f594ff6 `fix(core): protect the daemon token beside a runtime-directory socket`;
+- b3dfdeb `feat: authenticate the daemon socket with a token`;
+- db18a9a `feat(core): probe the sandbox once and sweep stale temp directories`;
+- 8d3c507 `fix(core): deny harness git writes when no identity is attached`;
+- 290d1bb `feat(elefante): report sandbox state and wire identity and web search`;
+- 34b5c10 `feat(tui): show sandbox state and escape approval commands`.
+
+Review fixes followed: f429740, e198cde, 658127e, 4ab5d4f, f1d745a, 344949a, 05c7340, 022c503,
+cb22490, cc8c989, 3089c60, 399356e, 52ab1b0, 4c4f0ac, da9a602, 9a4b37d, 7807123 and 9c8da06.
+
 ---
 
 ## Phase 4 — CI and docs, then M4's gate
@@ -653,6 +709,9 @@ Git write (rule `git-identity-missing`), so the user never approves a write that
 **Commit:** `ci: test on macOS and Linux with the sandbox` (docs travel in the same commit, or in a
 separate `docs:` commit if they are large).
 
+**Recorded commits.** The CI change landed as e540ad7 `ci: run the Rust gate on macOS and Linux`.
+The docs landed in four separate `docs:` commits, from 9d89cc9 to the one that adds this line.
+
 ## Phase 5 — M4.1 (after M4 is green)
 
 **Baseline:**
@@ -671,21 +730,10 @@ separate `docs:` commit if they are large).
 
 ---
 
-## Residual risks (recorded in DEVELOPER_GUIDE)
+## Residual risks
 
-- **Approved network.** It reaches the whole internet (and, on Linux, the host's loopback
-  services). A per-domain proxy is a Proposal.
-- **Code the user later runs is out of scope.** This covers their build, their IDE's tasks,
-  rust-analyzer's `build.rs`, hook managers' config files (`.pre-commit-config.yaml`,
-  `lefthook.yml`), and, when developing elefante itself, the dev-mode TUI source
-  (`main.rs:261`).
-- **Leftover processes on macOS.** A process that calls `setsid` outlives its command. It stays
-  sandboxed but keeps approved network.
-- **`web_search` queries leave without per-call approval** up to the cap. They are scrubbed and
-  URL-refused, but they remain an outbound channel.
-- **The secret scan is name-based** and prunes `target/` and `node_modules/`.
-- **Kernel exploits.** The opt-in microVM backend in M4.2 (macOS) and M4.3 (Linux) addresses
-  them.
+The residual risks moved to `DEVELOPER_GUIDE.md` § 9 **Sandbox** › **Residual risks**, which now
+owns them.
 
 ---
 
@@ -715,4 +763,4 @@ separate `docs:` commit if they are large).
 | 20 | Raw approval text; ambiguous network prefix | `displaySafe` + structured `network` field |
 | 21 | seccomp action limits | Two programs; ENOSYS for `clone3`/io_uring; `--disable-userns` |
 | 22 | Weak gate items | Positive controls; host-listener and `/proc/*/environ` checks; EROFS hint test |
-| 23 | Minor items | `--ro-bind-try`, `/private/etc`, resolved bash, LFS refusal; TIOCSTI filter and `Event::Citation` cut |
+| 23 | Minor items | `--ro-bind-try`, `/private/etc`, resolved bash, LFS refusal; `ioctl(TIOCSTI)` filter added to the EPERM program; `Event::Citation` cut |

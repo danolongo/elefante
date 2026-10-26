@@ -1,6 +1,6 @@
 //! Fail-closed shell launch and bounded process output.
 use elefante_guard::sandbox::{self, HiddenKind, HiddenPath, Network, Policy};
-use std::{collections::VecDeque, path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::VecDeque, ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
@@ -557,7 +557,7 @@ impl SessionSandbox {
                 .environment(env_source, &self.tool_dirs, true)
                 .map_err(|error| error.to_string())?
         } else {
-            sandbox::environment(env_source, false)
+            self.disabled_environment()?
         };
         #[cfg(target_os = "linux")]
         let filters = if sandboxed {
@@ -627,6 +627,27 @@ impl SessionSandbox {
             self.quarantine_new_git()?;
         }
         result
+    }
+
+    /// The `Disabled` environment: the same allowlist, the host's `HOME`, `CARGO_HOME` and
+    /// `RUSTUP_HOME`, and the toolchain directories ahead of the system `PATH`.
+    fn disabled_environment(&self) -> Result<Vec<(OsString, OsString)>, String> {
+        let host = ["CARGO_HOME", "RUSTUP_HOME"]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)));
+        let mut environment = sandbox::environment(host, false);
+        for (key, value) in &mut environment {
+            if key == "PATH" {
+                let dirs = self
+                    .tool_dirs
+                    .iter()
+                    .cloned()
+                    .chain(std::env::split_paths(value));
+                *value = std::env::join_paths(dirs).map_err(|error| error.to_string())?;
+            }
+        }
+        environment.push(("HOME".into(), self.policy.home.clone().into_os_string()));
+        Ok(environment)
     }
 
     #[cfg(target_os = "linux")]

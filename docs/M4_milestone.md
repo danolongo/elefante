@@ -262,6 +262,8 @@ Clone-flag masks are added only if S1 shows `--disable-userns` is unavailable.
   Command Line Tools compiler directory ahead of `/usr/bin` in `PATH`.
 - Sandboxed only: `HOME` (Linux `/tmp/home`, macOS `TEMP/home`), `TMPDIR` (the temp dir),
   `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`.
+- `Disabled` only: the host `HOME`, the host `CARGO_HOME` and `RUSTUP_HOME` when set, and the
+  toolchain directories ahead of the system directories in `PATH`.
 - Nothing else ever, including `OPENROUTER_API_KEY`.
 
 **Binaries.** The daemon resolves `bash`, `git` and `bwrap` from fixed system directories

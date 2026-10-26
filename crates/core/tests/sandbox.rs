@@ -229,6 +229,64 @@ async fn disabled_session_keeps_bounded_runner_without_requiring_valid_git_metad
     assert_eq!(output.content, "disabled");
 }
 
+#[tokio::test]
+async fn disabled_session_forwards_host_home_and_puts_toolchains_first() {
+    use elefante_core::sandbox::{Sandbox, SessionSandbox};
+    use std::os::unix::fs::PermissionsExt;
+    let source =
+        "elefante-fixture-tool; printf '|%s|%s|%s' \"$HOME\" \"$CARGO_HOME\" \"$RUSTUP_HOME\"";
+    if let Some(base) = std::env::var_os("ELEFANTE_DISABLED_FIXTURE_BASE") {
+        let base = std::path::PathBuf::from(base);
+        let workspace = base.join("workspace");
+        let session = SessionSandbox::new(&workspace).expect("disabled session");
+        assert!(matches!(session.state(), Sandbox::Disabled));
+        let output = session
+            .run_shell(source, Network::Off)
+            .await
+            .expect("disabled shell runs");
+        assert!(output.success, "{output:?}");
+        let home = base.join("home");
+        assert_eq!(
+            output.content,
+            format!(
+                "tool|{}|{}|{}",
+                home.display(),
+                home.join(".cargo").display(),
+                home.join("rustup").display()
+            )
+        );
+        return;
+    }
+    let fixture = tempfile::tempdir().expect("fixture");
+    let base = fixture.path().canonicalize().expect("canonical fixture");
+    let tools = base.join("home/.cargo/bin");
+    std::fs::create_dir_all(&tools).expect("tool directory");
+    std::fs::create_dir_all(base.join("home/rustup")).expect("rustup directory");
+    std::fs::create_dir(base.join("workspace")).expect("workspace");
+    let tool = tools.join("elefante-fixture-tool");
+    std::fs::write(&tool, "#!/bin/sh\nprintf tool\n").expect("tool fixture");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("tool mode");
+    let child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "disabled_session_forwards_host_home_and_puts_toolchains_first",
+        ])
+        .env("ELEFANTE_DISABLED_FIXTURE_BASE", &base)
+        .env("ELEFANTE_SANDBOX", "0")
+        .env("HOME", base.join("home"))
+        .env("CARGO_HOME", base.join("home/.cargo"))
+        .env("RUSTUP_HOME", base.join("home/rustup"))
+        .output()
+        .await
+        .expect("disabled fixture child");
+    assert!(
+        child.status.success(),
+        "disabled fixture child failed: {}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 #[test]
 fn worktree_gitdir_and_commondir_are_read_only_but_external_nested_targets_are_refused() {
     use elefante_core::sandbox::SessionSandbox;

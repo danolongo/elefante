@@ -12,6 +12,21 @@ fn executor() -> (tempfile::TempDir, ToolExecutor) {
     (temp, executor)
 }
 
+/// A sandboxed executor and one with the sandbox switched off, for bash tests that must hold in
+/// both modes.
+fn bash_executors() -> [(&'static str, tempfile::TempDir, ToolExecutor); 2] {
+    let (sandboxed_root, sandboxed) = executor();
+    let (disabled_root, disabled) = executor();
+    [
+        ("sandboxed", sandboxed_root, sandboxed),
+        (
+            "disabled",
+            disabled_root,
+            disabled.with_sandbox_disabled().unwrap(),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn credential_file_is_never_read_or_returned_by_search() {
     let (temp, executor) = executor();
@@ -43,21 +58,22 @@ async fn credential_file_is_never_read_or_returned_by_search() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelling_executing_bash_kills_descendants_before_delayed_write() {
-    let (temp, executor) = executor();
-    let running = tokio::spawn(async move {
-        executor.execute("bash", json!({"command": "(printf ready > ready; sleep 0.5; printf leaked > delayed) & wait"})).await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !temp.path().join("ready").exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    running.abort();
-    assert!(running.await.unwrap_err().is_cancelled());
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(!temp.path().join("delayed").exists());
+    for (mode, temp, executor) in bash_executors() {
+        let running = tokio::spawn(async move {
+            executor.execute("bash", json!({"command": "(printf ready > ready; sleep 0.5; printf leaked > delayed) & wait"})).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !temp.path().join("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{mode}: command never started"));
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled(), "{mode}");
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(!temp.path().join("delayed").exists(), "{mode}");
+    }
 }
 
 #[test]
@@ -334,29 +350,53 @@ async fn read_and_grep_keep_head_tail_and_state_original_size() {
 
 #[tokio::test]
 async fn bash_executor_runs_commands_without_classifying() {
-    let (temp, executor) = executor();
-    let result = executor
-        .execute("bash", json!({"command": "touch marker"}))
-        .await;
-    assert!(!result.is_error);
-    assert!(temp.path().join("marker").exists());
+    for (mode, temp, executor) in bash_executors() {
+        let result = executor
+            .execute("bash", json!({"command": "touch marker"}))
+            .await;
+        assert!(!result.is_error, "{mode}: {}", result.content);
+        assert!(temp.path().join("marker").exists(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn bash_result_fits_its_cap_and_states_each_stream_size() {
+    for (mode, _temp, executor) in bash_executors() {
+        let result = executor
+            .execute(
+                "bash",
+                json!({"command": "yes o | head -c 100000; yes e | head -c 200000 >&2; exit 3"}),
+            )
+            .await;
+        assert!(result.is_error, "{mode}");
+        assert!(result.content.len() <= 32 * 1024, "{mode}");
+        assert!(
+            result.content.contains("(original 100000 bytes)")
+                && result.content.contains("(original 200000 bytes)"),
+            "{mode}: {}",
+            &result.content[..result.content.len().min(300)]
+        );
+        assert_eq!(result.content.matches("capped output").count(), 2, "{mode}");
+    }
 }
 
 #[tokio::test]
 async fn scrubber_runs_on_success_and_error_results() {
-    let (_temp, executor) = executor();
-    let result = executor
-        .execute(
-            "bash",
-            json!({
-                "command": "printf 'sk-ant-api03_abcdefghijklmnopqrstuvwxyz'"
-            }),
-        )
-        .await;
-    assert!(!result.is_error);
-    assert!(!result.content.contains("sk-ant-"));
-    assert!(result.content.contains("[REDACTED]"));
+    for (mode, _temp, executor) in bash_executors() {
+        let result = executor
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf 'sk-ant-api03_abcdefghijklmnopqrstuvwxyz'"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{mode}: {}", result.content);
+        assert!(!result.content.contains("sk-ant-"), "{mode}");
+        assert!(result.content.contains("[REDACTED]"), "{mode}");
+    }
 
+    let (_temp, executor) = executor();
     let error = executor
         .execute(
             "unknown",

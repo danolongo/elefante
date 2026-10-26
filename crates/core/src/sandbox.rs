@@ -39,7 +39,11 @@ impl Drop for SessionSandbox {
     }
 }
 
-fn binary(name: &str) -> Result<PathBuf, String> {
+/// Resolves a host program from `ELEFANTE_<NAME>` or the fixed system directories.
+///
+/// # Errors
+/// Fails when the program is absent or its path cannot be canonicalized.
+pub fn binary(name: &str) -> Result<PathBuf, String> {
     let override_name = format!("ELEFANTE_{}", name.to_ascii_uppercase());
     if let Some(path) = std::env::var_os(override_name) {
         return fs::canonicalize(path).map_err(|error| error.to_string());
@@ -67,16 +71,140 @@ fn detect() -> Sandbox {
     }
 }
 
-fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Policy, String> {
+const TEMP_PREFIX: &str = "elefante-sandbox-";
+
+/// Creates `elefante-sandbox-<pid>-<n>` with mode 0700. When that name exists (a leftover from
+/// a reused pid, or another user's directory on a shared `/tmp`), it retries with a random suffix.
+fn private_temp_dir() -> Result<PathBuf, String> {
+    private_temp_dir_in(&fs::canonicalize(std::env::temp_dir()).map_err(|error| error.to_string())?)
+}
+
+fn private_temp_dir_in(base: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
     let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = fs::canonicalize(std::env::temp_dir())
-        .map_err(|error| error.to_string())?
-        .join(format!("elefante-sandbox-{}-{id}", std::process::id()));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&temp)
+    let mut name = format!("{TEMP_PREFIX}{}-{id}", std::process::id());
+    for _ in 0..8 {
+        let temp = base.join(&name);
+        match fs::DirBuilder::new().mode(0o700).create(&temp) {
+            Ok(()) => return Ok(temp),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!(
+                    "{TEMP_PREFIX}{}-{id}-{:016x}",
+                    std::process::id(),
+                    random()?
+                );
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("no free private sandbox temp directory name".into())
+}
+
+fn random() -> Result<u64, String> {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 8];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
         .map_err(|error| error.to_string())?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+/// Removes this user's `elefante-sandbox-<pid>-*` directories whose process no longer runs.
+///
+/// A crashed daemon leaves its session temp directories behind. The daemon calls this once at
+/// start and gets the number it removed. Symlinks, other users' entries and entries it cannot
+/// inspect stay in place.
+#[must_use]
+pub fn sweep_stale_temp_dirs() -> usize {
+    sweep_stale_temp_dirs_in(&std::env::temp_dir())
+}
+
+fn sweep_stale_temp_dirs_in(base: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(base) else {
+        return 0;
+    };
+    let uid = rustix::process::getuid().as_raw();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(TEMP_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != uid || process_alive(pid) {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn process_alive(pid: i32) -> bool {
+    if u32::try_from(pid).is_ok_and(|pid| pid == std::process::id()) {
+        return true;
+    }
+    rustix::process::Pid::from_raw(pid).is_none_or(|pid| {
+        // EPERM means the process exists under another user; only ESRCH proves it is gone.
+        rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH)
+    })
+}
+
+/// Detects the host mechanism and runs `true` under a full profile, once per process.
+///
+/// The daemon calls this at start; every later session takes the stored state. A probe that
+/// cannot launch yields `Unavailable` with its reason.
+pub async fn probe() -> Sandbox {
+    if let Some(state) = DETECTED.get() {
+        return state.clone();
+    }
+    let detected = detect();
+    let state = if matches!(detected, Sandbox::Disabled | Sandbox::Unavailable(_)) {
+        detected
+    } else {
+        match probe_detected(detected.clone()).await {
+            Ok(()) => detected,
+            Err(reason) => Sandbox::Unavailable(format!("sandbox probe failed: {reason}")),
+        }
+    };
+    let state = DETECTED.get_or_init(|| state).clone();
+    if !matches!(state, Sandbox::Unavailable(_)) {
+        let _ = PROBED.set(());
+    }
+    state
+}
+
+async fn probe_detected(detected: Sandbox) -> Result<(), String> {
+    let root = private_temp_dir()?;
+    let result = async {
+        let session = SessionSandbox::with_state(&root, detected)?;
+        if let Sandbox::Unavailable(reason) = session.state() {
+            return Err(reason.clone());
+        }
+        let output = session.run_shell_unprobed("true", Network::Off).await?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(output.content)
+        }
+    }
+    .await;
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Policy, String> {
+    let temp = private_temp_dir()?;
     let mut protected = vec![
         harness_dir.join("run/elefante.sock"),
         harness_dir.join("run/token"),
@@ -113,13 +241,16 @@ impl SessionSandbox {
     /// # Errors
     /// Fails closed for invalid roots, unavailable binaries, or incomplete root scans.
     pub fn new(root: &Path) -> Result<Self, String> {
+        Self::with_state(root, DETECTED.get_or_init(detect).clone())
+    }
+
+    fn with_state(root: &Path, mut state: Sandbox) -> Result<Self, String> {
         let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
         let home = fs::canonicalize(home).map_err(|error| error.to_string())?;
         let harness_dir = home.join(".elefante");
         let root_error = sandbox::validate_root(root, &home, &harness_dir).err();
         let bash = binary("bash")?;
         let git = binary("git")?;
-        let mut state = DETECTED.get_or_init(detect).clone();
         if let Some(error) = root_error {
             state = Sandbox::Unavailable(error.to_string());
         }
@@ -750,4 +881,77 @@ pub async fn run_process(mut command: Command, timeout: Duration) -> Result<Proc
         content,
         success: status.success(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait for true");
+        pid
+    }
+
+    #[test]
+    fn sweep_removes_only_own_dead_directories() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dead = dead_pid();
+        let stale = base.path().join(format!("{TEMP_PREFIX}{dead}-0"));
+        let stale_retry = base.path().join(format!("{TEMP_PREFIX}{dead}-1-00ff"));
+        let live = base
+            .path()
+            .join(format!("{TEMP_PREFIX}{}-0", std::process::id()));
+        let other = base.path().join(format!("other-{dead}-0"));
+        let target = base.path().join("target");
+        let link = base.path().join(format!("{TEMP_PREFIX}{dead}-2"));
+        for directory in [&stale, &stale_retry, &live, &other, &target] {
+            fs::create_dir(directory).expect("create directory");
+        }
+        fs::write(stale.join("cache"), "x").expect("write cache");
+        symlink(&target, &link).expect("symlink");
+
+        assert_eq!(sweep_stale_temp_dirs_in(base.path()), 2);
+        assert!(!stale.exists() && !stale_retry.exists());
+        // Positive controls: a live owner, a foreign name, and a symlink all stay.
+        assert!(live.is_dir() && other.is_dir() && target.is_dir());
+        assert!(fs::symlink_metadata(&link).is_ok());
+    }
+
+    #[test]
+    fn temp_dir_creation_retries_with_a_random_suffix() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let first = private_temp_dir_in(base.path()).expect("first directory");
+        assert_eq!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.split('-').count()),
+            Some(4),
+            "an unused name carries no suffix"
+        );
+        let next = SEQUENCE.load(std::sync::atomic::Ordering::Relaxed);
+        for id in next..next + 256 {
+            fs::create_dir(
+                base.path()
+                    .join(format!("{TEMP_PREFIX}{}-{id}", std::process::id())),
+            )
+            .expect("occupy name");
+        }
+        let retried = private_temp_dir_in(base.path()).expect("retried directory");
+        let name = retried
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name");
+        assert_eq!(name.split('-').count(), 5, "{name} carries a random suffix");
+        let mode = fs::metadata(&retried)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 }

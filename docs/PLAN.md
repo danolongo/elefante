@@ -746,10 +746,18 @@ the root readable, the root writable, and `.git` writable except `hooks/`, `conf
 and any protected hooksPath target. Linux uses bubblewrap overlays; macOS uses Seatbelt. The
 exact per-subcommand allowlist remains as a second line of defence.
 
+**`web_search` egress.** M4 lets a session send up to 30 queries of 300 characters each with
+no approval. A prompt-injected model can therefore send about 9 KB of non-secret file content
+out through queries. The URL filter (`://`, `www.`) is a courtesy, not a control: a `[.]`
+spelling or base64 passes it. M4.1 closes the gap:
+- The first `web_search` of each session escalates. The approval prompt shows the query.
+- The threat model in `DEVELOPER_GUIDE.md` states the channel and its size bound.
+
 **Gate.** A test-only widening of the allowlist admits attempts such as
 `--output=$HOME/x`, `--no-index ~/.ssh/f` and `merge -s evil`; the OS still blocks them. A
-normal commit and rebase continue to work. M4 and earlier gates remain green on both operating
-systems before the milestone is recorded.
+normal commit and rebase continue to work. The first `web_search` in a session escalates and
+shows its query; a later one within the cap runs without a prompt. M4 and earlier gates remain
+green on both operating systems before the milestone is recorded.
 
 ### M4.2 — MicroVM backend on macOS
 

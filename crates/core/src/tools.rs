@@ -245,9 +245,10 @@ impl ToolExecutor {
         };
         ToolResult {
             content: match name {
-                "read" => clip_middle(&self.scrubber.scrub(&result.content), 128 * 1024),
+                "read" => clip_scrubbed(&self.scrubber.scrub(&result.content), 128 * 1024),
+                // run_process already fits bash output; for bash this clip catches growth from scrubbing.
                 "bash" | "grep" | "web_search" => {
-                    clip_middle(&self.scrubber.scrub(&result.content), 32 * 1024)
+                    clip_scrubbed(&self.scrubber.scrub(&result.content), 32 * 1024)
                 }
                 _ => self.scrubber.scrub(&result.content),
             },
@@ -645,11 +646,17 @@ fn decode<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ToolResult> {
         .map_err(|error| ToolResult::error(format!("invalid tool input: {error}")))
 }
 
-fn clip_middle(value: &str, limit: usize) -> String {
+fn clip_scrubbed(value: &str, limit: usize) -> String {
+    clip_middle(value, limit, value.len())
+}
+
+/// Keeps the head and tail of `value` within `limit` bytes, marker included. The marker states
+/// `original`, the size before any earlier capping.
+pub(crate) fn clip_middle(value: &str, limit: usize, original: usize) -> String {
     if value.len() <= limit {
         return value.to_owned();
     }
-    let marker = format!("\n… capped output (original {} bytes) …\n", value.len());
+    let marker = format!("\n… capped output (original {original} bytes) …\n");
     let budget = limit.saturating_sub(marker.len());
     let mut head_end = budget / 2;
     while !value.is_char_boundary(head_end) {

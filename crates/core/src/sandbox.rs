@@ -1,6 +1,6 @@
 //! Fail-closed shell launch and bounded process output.
 use elefante_guard::sandbox::{self, HiddenKind, HiddenPath, Network, Policy};
-use std::{collections::VecDeque, fmt::Write as _, path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, process::Stdio, time::Duration};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
@@ -826,6 +826,11 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// Each stream keeps this much from its start and its end, so either stream can fill the budget.
+const KEEP: usize = OUTPUT_LIMIT / 2;
+/// Room left in the 32 KiB result for the exit status line and the bash tool's `.git` hint.
+const RESERVE: usize = 512;
+
 #[derive(Default)]
 struct CappedOutput {
     head: Vec<u8>,
@@ -835,27 +840,51 @@ struct CappedOutput {
 impl CappedOutput {
     fn push(&mut self, bytes: &[u8]) {
         self.total = self.total.saturating_add(bytes.len());
-        let head_count = (OUTPUT_LIMIT / 4 - self.head.len()).min(bytes.len());
+        let head_count = (KEEP - self.head.len()).min(bytes.len());
         self.head.extend_from_slice(&bytes[..head_count]);
         for byte in &bytes[head_count..] {
-            if self.tail.len() == OUTPUT_LIMIT / 4 {
+            if self.tail.len() == KEEP {
                 self.tail.pop_front();
             }
             self.tail.push_back(*byte);
         }
     }
 
+    /// The kept text. When bytes were dropped, the text is at least `OUTPUT_LIMIT` long, so
+    /// clipping it to a share of the budget always cuts inside the dropped middle.
     fn text(self) -> String {
-        let kept = self.head.len() + self.tail.len();
-        let mut result = String::from_utf8_lossy(&self.head).into_owned();
-        if self.total > kept {
-            let _ = write!(result, "\n[{} bytes omitted]\n", self.total - kept);
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        if self.total == self.head.len() + tail.len() {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&bytes).into_owned();
         }
-        result.push_str(&String::from_utf8_lossy(
-            &self.tail.into_iter().collect::<Vec<_>>(),
-        ));
-        result
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        text
     }
+}
+
+/// Splits one output budget across stdout and stderr. A stream that needs less than half the
+/// budget keeps all of it, and the other stream gets the rest.
+fn combined_text(out: CappedOutput, err: CappedOutput) -> String {
+    let budget = OUTPUT_LIMIT - RESERVE;
+    let (out_total, err_total) = (out.total, err.total);
+    let (out, err) = (out.text(), err.text());
+    let out_share = if out.len() + err.len() <= budget || out.len() <= budget / 2 {
+        out.len()
+    } else if err.len() <= budget / 2 {
+        budget - err.len()
+    } else {
+        budget / 2
+    };
+    let mut content = crate::tools::clip_middle(&out, out_share, out_total);
+    content.push_str(&crate::tools::clip_middle(
+        &err,
+        budget - out_share,
+        err_total,
+    ));
+    content
 }
 
 async fn drain(
@@ -921,8 +950,10 @@ pub async fn run_process(mut command: Command, timeout: Duration) -> Result<Proc
             timeout.as_secs_f32()
         )
     })??;
-    let mut content = std::mem::take(&mut *out.lock().await).text();
-    content.push_str(&std::mem::take(&mut *err.lock().await).text());
+    let mut content = combined_text(
+        std::mem::take(&mut *out.lock().await),
+        std::mem::take(&mut *err.lock().await),
+    );
     if !status.success() {
         content.insert_str(0, &format!("exit status {status}\n"));
     }

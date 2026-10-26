@@ -33,9 +33,39 @@ async fn output_is_bounded_while_pipes_are_drained() {
     .await
     .expect("large process completes");
     assert!(output.success);
-    assert!(output.content.len() < 34_000);
+    assert!(output.content.len() <= 32 * 1024);
     assert!(output.content.ends_with("END"));
-    assert!(output.content.contains("omitted"));
+    assert!(output.content.contains("(original 1000003 bytes)"));
+}
+
+#[tokio::test]
+async fn overflowing_streams_share_one_budget_and_state_their_sizes() {
+    let output = run_process(
+        shell("head -c 100000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2; exit 3"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("both streams overflow");
+    assert!(!output.success);
+    assert!(
+        output.content.len() <= 32 * 1024,
+        "{}",
+        output.content.len()
+    );
+    assert!(output.content.contains("(original 100000 bytes)"));
+    assert!(output.content.contains("(original 200000 bytes)"));
+    let small = run_process(
+        shell("printf small; head -c 200000 /dev/zero | tr '\\0' e >&2"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("stderr overflows");
+    assert!(small.content.starts_with("small"));
+    assert!(small.content.len() <= 32 * 1024);
+    assert!(
+        small.content.matches('e').count() > 30_000,
+        "stderr did not receive the unused stdout budget"
+    );
 }
 
 #[tokio::test]
@@ -43,7 +73,10 @@ async fn process_timeout_is_enforced() {
     let error = run_process(shell("sleep 30"), Duration::from_millis(30))
         .await
         .expect_err("process must time out");
-    assert!(error.contains("timed out"));
+    assert!(
+        error.starts_with("command timed out after 0.03 s"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -58,10 +91,7 @@ async fn timeout_kills_a_grandchild_before_its_delayed_write() {
     let error = run_process(shell(&blocked_source), Duration::from_millis(30))
         .await
         .expect_err("timed-out command must be killed");
-    assert!(
-        error.starts_with("command timed out after 0.03 s"),
-        "{error}"
-    );
+    assert!(error.contains("timed out"));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!blocked.exists(), "grandchild survived the timeout");
     let control_source = format!(
@@ -143,8 +173,8 @@ async fn ten_megabytes_of_sandbox_output_is_capped_with_size_and_tail() {
         .await
         .expect("sandbox executes; install bubblewrap and enable user namespaces on Linux, or enable sandbox-exec on macOS");
     assert!(output.success, "sandboxed output command failed");
-    assert!(output.content.len() < 34_000);
-    assert!(output.content.contains("bytes omitted"));
+    assert!(output.content.len() <= 32 * 1024);
+    assert!(output.content.contains("(original 10000003 bytes)"));
     assert!(output.content.ends_with("END"));
 }
 
@@ -155,6 +185,11 @@ async fn invalid_root_is_unavailable_and_cannot_poison_a_valid_session() {
     let invalid = SessionSandbox::new(std::path::Path::new("/"))
         .expect("session can describe an unavailable sandbox");
     assert!(matches!(invalid.state(), Sandbox::Unavailable(_)));
+    let error = invalid
+        .run_shell("true", Network::Off)
+        .await
+        .expect_err("invalid root refuses");
+    assert!(error.starts_with("sandbox unavailable: "), "{error}");
     assert!(
         !error.contains("ELEFANTE_SANDBOX=0"),
         "opting out cannot fix an invalid root: {error}"

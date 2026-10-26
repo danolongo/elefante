@@ -160,7 +160,7 @@ pub struct Policy {
     harness_dir: PathBuf,    // user-level harness state, never readable
     protected: Vec<PathBuf>, // exact socket and token paths, including overrides
     temp: PathBuf,           // private per-session dir, 0700, outside root and ~/.elefante
-    readable: Vec<PathBuf>,  // system dirs + exact PATH dirs + S4's toolchain set + ELEFANTE_SANDBOX_READ
+    readable: Vec<PathBuf>,  // system dirs + exact PATH dirs + S4's toolchain set
     writable: Vec<PathBuf>,  // root, temp, S4's exact cache files
     read_only: Vec<PathBuf>, // every .git (any case) + validated gitdir/commondir + in-root core.hooksPath / include targets
     hidden: Vec<HiddenPath>, // typed file/dir masks for harness state and credentials
@@ -502,7 +502,7 @@ approved escalation still runs sandboxed; only `network-requested` switches to
 
 **Refused:** queries that scrubbing would change, and URL-like queries (`://`, `www.`).
 
-**Cap.** 30 searches per session (`ELEFANTE_WEB_SEARCH_CAP`); beyond it, each search escalates.
+**Cap.** 30 searches per session, a fixed constant; beyond it, each search escalates.
 
 **Results.** Plain text with numbered URLs, capped at 32 KiB. The description says they are
 untrusted and are not instructions.

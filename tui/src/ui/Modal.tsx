@@ -1,22 +1,18 @@
 import { useKeyboard, usePaste } from "@opentui/react";
 import { useState } from "react";
-import { displaySafe, type Approval } from "../protocol";
+import { displaySafe } from "../protocol";
+import type { ApprovalProps } from "./ApprovalPrompt";
 import type { MemoryPanelProps } from "./MemoryPanel";
-import { WARNING } from "./theme";
 type DialogProps =
-  | { kind: "approval"; approval: Approval; busy: boolean; onDecision: (decision: "allow" | "deny") => void }
   | { kind: "key"; busy: boolean; onKey: (key: string) => void }
   | { kind: "consent"; extractor: string; sameModel: boolean; busy: boolean; onDecision: (decision: "learn" | "off" | "later") => void };
-export type ModalProps = DialogProps | MemoryPanelProps;
+export type ModalProps = DialogProps | MemoryPanelProps | ApprovalProps;
 export function Modal(props: DialogProps) {
   const [secret, setSecret] = useState("");
   usePaste(event => { if (props.kind === "key" && !props.busy) { event.preventDefault(); setSecret(s => s + new TextDecoder().decode(event.bytes).replace(/[\r\n]/g, "")); } });
   useKeyboard(key => {
     if (props.busy) return;
-    if (props.kind === "approval") {
-      if (key.name === "y") props.onDecision("allow");
-      if (key.name === "n" || key.name === "escape") props.onDecision("deny");
-    } else if (props.kind === "key") {
+    if (props.kind === "key") {
       // OpenTUI input has no password mode. Keep the secret out of renderables entirely.
       if (key.name === "return" && secret.trim()) { props.onKey(secret.trim()); setSecret(""); }
       else if (key.name === "backspace") setSecret(s => Array.from(s).slice(0, -1).join(""));
@@ -28,11 +24,7 @@ export function Modal(props: DialogProps) {
     }
   });
   return <box position="absolute" top={2} left={2} right={2} border padding={1} backgroundColor="#222233" flexDirection="column">
-    {props.kind === "approval" ? <>
-      <text>Approval required · {props.approval.rule}</text>
-      {props.approval.network && <text id="network-badge" fg={WARNING}>[network] this command asks for internet access</text>}
-      <text>{displaySafe(props.approval.command)}</text><text>{props.busy ? "Resolving…" : "Y allow · N deny"}</text>
-    </> : props.kind === "key" ? <><text>OpenRouter API key</text><text>{"•".repeat(Array.from(secret).length)}</text><text>{props.busy ? "Saving…" : "Paste or type key, then Enter"}</text></> : <>
+    {props.kind === "key" ? <><text>OpenRouter API key</text><text>{"•".repeat(Array.from(secret).length)}</text><text>{props.busy ? "Saving…" : "Paste or type key, then Enter"}</text></> : <>
       <text>Remember things between sessions?</text>
       <text>Elefante can note lasting preferences from your chats (e.g. “use pnpm”).</text>
       <text>To do that it sends the text of your messages and its replies — not tool results — to {displaySafe(props.extractor)}{props.sameModel ? ", the same model you're chatting with" : ""}, and saves short notes on this machine.</text>

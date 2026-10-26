@@ -11,6 +11,7 @@ import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
 import { Input } from "../src/ui/Input";
 import { Modal } from "../src/ui/Modal";
+import { ApprovalPrompt } from "../src/ui/ApprovalPrompt";
 import { MemoryPanel, type MemoryPanelProps } from "../src/ui/MemoryPanel";
 import type { Command } from "../src/commands";
 import type { MemoryRow } from "../src/protocol";
@@ -179,11 +180,64 @@ test("the status line, prompt border and placeholder are tints of one blue: ligh
     expect(fg("Ctrl+R show reasoning")).toEqual([0x5f, 0x80, 0x9b]);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
-test("approval modal emits a decision and key modal masks typed and pasted secrets", async () => {
+test("the approval prompt sends allow on y and deny on n or Esc, and ignores keys while busy", async () => {
+  const decide = async (keys: (setup: Awaited<ReturnType<typeof testRender>>) => Promise<void>, busy = false) => {
+    const decisions: string[] = [];
+    const setup = await testRender(<ApprovalPrompt kind="approval" approval={{ approval_id: "a", command: "ls", rule: "ask" }} busy={busy} onDecision={d => decisions.push(d)} />, { width: 80, height: 10 });
+    try { await keys(setup); return decisions; }
+    finally { await act(async () => setup.renderer.destroy()); }
+  };
+  expect(await decide(async s => act(async () => s.mockInput.pressKey("y")))).toEqual(["allow"]);
+  expect(await decide(async s => act(async () => s.mockInput.pressKey("n")))).toEqual(["deny"]);
+  expect(await decide(pressEscape)).toEqual(["deny"]);
+  expect(await decide(async s => { await act(async () => s.mockInput.pressKey("y")); await act(async () => s.mockInput.pressEnter()); }, true)).toEqual([]);
+});
+test("the approval prompt highlights No first and Enter sends the highlighted choice", async () => {
   const decisions: string[] = [];
-  const approval = await testRender(<Modal kind="approval" approval={{ approval_id: "a", command: "ls", rule: "ask" }} busy={false} onDecision={d => decisions.push(d)} />, { width: 80, height: 15 });
-  try { await act(async () => approval.mockInput.pressKey("y")); expect(decisions).toEqual(["allow"]); }
-  finally { await act(async () => approval.renderer.destroy()); }
+  const setup = await testRender(<ApprovalPrompt kind="approval" approval={{ approval_id: "a", command: "ls", rule: "ask" }} busy={false} onDecision={d => decisions.push(d)} />, { width: 80, height: 10 });
+  const highlighted = async () => { await setup.renderOnce(); return setup.captureCharFrame().split("\n").find(row => row.includes("▸"))?.trim(); };
+  try {
+    expect(await highlighted()).toContain("▸ No");
+    await act(async () => setup.mockInput.pressEnter());
+    expect(decisions).toEqual(["deny"]);
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(await highlighted()).toContain("▸ Yes");
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(await highlighted()).toContain("▸ Yes");
+    await act(async () => setup.mockInput.pressEnter());
+    expect(decisions).toEqual(["deny", "allow"]);
+    await act(async () => setup.mockInput.pressArrow("down"));
+    await act(async () => setup.mockInput.pressArrow("down"));
+    expect(await highlighted()).toContain("▸ No");
+    await act(async () => setup.mockInput.pressEnter());
+    expect(decisions).toEqual(["deny", "allow", "deny"]);
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("a pending approval replaces the prompt bar, and the prompt bar returns with its draft afterwards", async () => {
+  const approval = { kind: "approval" as const, approval: { approval_id: "a", command: "ls", rule: "ask" }, busy: false, onDecision: () => {} };
+  let setModal: (modal: typeof approval | null) => void = () => {};
+  const Harness = () => {
+    const [modal, set] = useState<typeof approval | null>(null); setModal = set;
+    return <App state={initialSession("s")} now={0} connected message={null} modal={modal} animateMascot={false} onSubmit={() => {}} onCommand={() => {}} onInterrupt={() => {}} onExit={() => {}} />;
+  };
+  const setup = await testRender(<Harness />, { width: 100, height: 24 });
+  const frame = async () => { await setup.renderOnce(); return setup.captureCharFrame(); };
+  try {
+    await act(async () => { await setup.mockInput.typeText("draft"); });
+    expect(await frame()).toContain("draft");
+    await act(async () => setModal(approval));
+    const asking = await frame();
+    expect(asking).toContain("Allow this command? · ask");
+    expect(asking).not.toContain("draft");
+    expect(asking).not.toContain("Ctrl+R show reasoning");
+    expect(setup.renderer.root.findDescendantById("approval-prompt")).toBeDefined();
+    await act(async () => setModal(null));
+    const after = await frame();
+    expect(after).not.toContain("Allow this command?");
+    expect(after).toContain("draft");
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("key modal masks typed and pasted secrets", async () => {
   const keys: string[] = [];
   const key = await testRender(<Modal kind="key" busy={false} onKey={k => keys.push(k)} />, { width: 80, height: 15 });
   try {
@@ -236,7 +290,7 @@ test("input submits, Esc interrupts without exiting, and Ctrl+C exits without in
     await act(async () => setup.mockInput.pressCtrlC()); expect(interrupts).toBe(1); expect(exits).toBe(1);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
-test("Esc inside an approval modal denies the command and does not also interrupt the turn", async () => {
+test("Esc inside an approval prompt denies the command and does not also interrupt the turn", async () => {
   let interrupts = 0; const decisions: string[] = [];
   const modal = { kind: "approval" as const, approval: { approval_id: "a", command: "ls", rule: "ask" }, busy: false, onDecision: (d: "allow" | "deny") => decisions.push(d) };
   const setup = await testRender(<App state={initialSession("s")} now={0} connected message={null} modal={modal} onSubmit={() => {}} onCommand={() => {}} onInterrupt={() => interrupts++} onExit={() => {}} />, { width: 100, height: 20 });
@@ -495,10 +549,10 @@ test("the status line names an off or unavailable sandbox in the warning colour 
     expect(fg).toBeUndefined();
   }
 });
-test("the approval modal escapes the command and shows a network badge only for a network request", async () => {
+test("the approval prompt escapes the command and shows a network badge only for a network request", async () => {
   const render = async (network: boolean | undefined) => {
     const approval = { approval_id: "a", command: "curl\x1b[2J example.com\n‮rm -rf ~", rule: "network-requested", ...(network === undefined ? {} : { network }) };
-    const setup = await testRender(<Modal kind="approval" approval={approval} busy={false} onDecision={() => {}} />, { width: 80, height: 15 });
+    const setup = await testRender(<ApprovalPrompt kind="approval" approval={approval} busy={false} onDecision={() => {}} />, { width: 80, height: 15 });
     try {
       await setup.renderOnce();
       const spans = setup.captureSpans().lines.flatMap(line => line.spans);

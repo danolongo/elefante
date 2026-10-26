@@ -13,9 +13,10 @@ use std::{
 use crate::wire::{
     MEMORY_OFF, MemoryChange, MemoryConsentState, MemoryIndexState, MemoryLearningState,
     MemoryNote, MemoryNoteCounts, MemorySeed, MemoryStatus, Notification, NotificationEvent,
-    UNAUTHORIZED, UNKNOWN_NOTE, Usage, truncate_preview,
+    SandboxState, SandboxStatus, UNAUTHORIZED, UNKNOWN_NOTE, Usage, truncate_preview,
 };
 use anyhow::Context as _;
+use elefante_core::sandbox::Sandbox;
 use elefante_core::tools::ToolExecutor;
 use elefante_core::{
     ApprovalOutcome, ApprovalSink, Note as CoreNote, OutputEvent, RunConfig, Session, ToolGate,
@@ -50,7 +51,9 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(debug_assertions)]
 use super::stub::StubProvider;
-use super::{MAX_LINE_BYTES, RING_CAPACITY, credentials, queue::ClientQueue};
+use super::{
+    MAX_LINE_BYTES, RING_CAPACITY, credentials, queue::ClientQueue, search::ProviderSearch,
+};
 
 /// Startup configuration captured once, rather than reading mutable process state per turn.
 #[derive(Clone)]
@@ -421,6 +424,8 @@ struct Shared {
     memories: Mutex<HashMap<PathBuf, Arc<RepoMemory>>>,
     consent: Mutex<ConsentGate>,
     standalone_extractor: String,
+    /// The user's own Git identity, read once at start; `None` denies harness Git writes.
+    git_identity: Option<elefante_guard::git::Identity>,
     next_id: AtomicU64,
     instance_id: String,
     clients: AtomicUsize,
@@ -474,6 +479,63 @@ fn make_provider(
     Ok(Some(Arc::new(provider)))
 }
 
+/// Reads `user.name` and `user.email` from the user's global Git config files with the hardened
+/// invocation. `~/.gitconfig` wins over `$XDG_CONFIG_HOME/git/config`, as in Git itself.
+async fn git_identity() -> Option<elefante_guard::git::Identity> {
+    let home = home().ok()?;
+    let xdg = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    git_identity_in(&home, xdg).await
+}
+
+async fn git_identity_in(
+    home: &Path,
+    xdg_config: Option<PathBuf>,
+) -> Option<elefante_guard::git::Identity> {
+    let git = elefante_core::sandbox::binary("git").ok()?;
+    let xdg = xdg_config
+        .unwrap_or_else(|| home.join(".config"))
+        .join("git/config");
+    let files = [home.join(".gitconfig"), xdg];
+    let mut values = Vec::new();
+    for key in ["user.name", "user.email"] {
+        let mut value = None;
+        for file in files.iter().filter(|file| file.is_file()) {
+            let invocation = elefante_guard::git::hardened(&git, home);
+            let mut command = tokio::process::Command::new(&invocation.program);
+            command
+                .args(&invocation.args)
+                .args(["config", "--includes", "--file"])
+                .arg(file)
+                .args(["--get", key])
+                .current_dir(&invocation.cwd)
+                .env_clear()
+                .envs(&invocation.environment);
+            let output = elefante_core::sandbox::run_process(command, Duration::from_secs(10))
+                .await
+                .ok()?;
+            let text = output.content.trim();
+            if output.success && !text.is_empty() {
+                value = Some(text.to_owned());
+                break;
+            }
+        }
+        values.push(value?);
+    }
+    let email = values.pop()?;
+    let name = values.pop()?;
+    Some(elefante_guard::git::Identity { name, email })
+}
+
+fn sandbox_status(sandbox: &Sandbox) -> SandboxStatus {
+    let (state, detail) = match sandbox {
+        Sandbox::Seatbelt => (SandboxState::On, "seatbelt".to_owned()),
+        Sandbox::Bubblewrap { .. } => (SandboxState::On, "bubblewrap".to_owned()),
+        Sandbox::Disabled => (SandboxState::Off, "ELEFANTE_SANDBOX=0".to_owned()),
+        Sandbox::Unavailable(reason) => (SandboxState::Unavailable, reason.clone()),
+    };
+    SandboxStatus { state, detail }
+}
+
 /// Serve until no clients and no running turns remain for the idle timeout.
 ///
 /// # Errors
@@ -492,6 +554,12 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let provider = make_provider(&config, stored_key)?;
     let instance_id = instance_id()?;
     let token: Arc<str> = new_token()?.into();
+    // Settled once, before clients connect: every session takes this sandbox state and identity.
+    let _ = elefante_core::sandbox::sweep_stale_temp_dirs();
+    if let Sandbox::Unavailable(reason) = elefante_core::sandbox::probe().await {
+        eprintln!("elefante: sandbox unavailable: {reason}");
+    }
+    let git_identity = git_identity().await;
     // Recheck under directory ownership: another starter may have become ready
     // while we prepared the provider and credentials.
     let Some((listener, _socket_guard)) = bind(&config.socket, &token).await? else {
@@ -506,6 +574,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         memories: Mutex::new(HashMap::new()),
         consent: Mutex::new(consent),
         standalone_extractor,
+        git_identity,
         next_id: AtomicU64::new(1),
         instance_id,
         clients: AtomicUsize::new(0),
@@ -544,6 +613,8 @@ struct SessionEntry {
     learning: Mutex<SessionLearning>,
     memory_state: Mutex<SessionMemoryState>,
     tools: ToolExecutor,
+    /// `web_search` spend not yet added to a turn's usage.
+    search_usage: Arc<Mutex<Usage>>,
     view: Mutex<View>,
     approvals: Arc<Approvals>,
 }
@@ -1042,6 +1113,33 @@ fn refresh_memory_status(state: &Shared, entry: &SessionEntry) {
     }
 }
 
+/// The session's tools: the user's Git identity for harness writes and the `web_search` backend,
+/// whose spend collects in `search_usage` until the turn ends.
+fn session_tools(
+    state: &Arc<Shared>,
+    cwd: &Path,
+    author: &elefante_provider::ModelId,
+    search_usage: &Arc<Mutex<Usage>>,
+) -> Result<ToolExecutor, (i32, String)> {
+    let mut tools = ToolExecutor::new(cwd).map_err(invalid)?;
+    if let Some(identity) = &state.git_identity {
+        // A failed attach leaves the session without harness Git, and the gate denies its writes.
+        match tools.clone().with_git_identity(identity.clone()) {
+            Ok(identified) => tools = identified,
+            Err(error) => eprintln!(
+                "elefante: harness git unavailable for {}: {error}",
+                cwd.display()
+            ),
+        }
+    }
+    let provider = Arc::downgrade(state);
+    Ok(tools.with_web_search(Arc::new(ProviderSearch::new(
+        move || provider.upgrade()?.provider.lock().ok()?.clone(),
+        super::search::search_model(author, &|name| env::var(name).ok()),
+        Arc::clone(search_usage),
+    ))))
+}
+
 fn create_session(
     state: &Arc<Shared>,
     queue: &Arc<ClientQueue>,
@@ -1078,7 +1176,9 @@ fn create_session(
             .filter(|n| *n > 0)
             .ok_or_else(|| invalid("max_rounds must be positive"))?;
     }
-    let tools = ToolExecutor::new(&cwd).map_err(invalid)?;
+    let search_usage = Arc::new(Mutex::new(Usage::default()));
+    let tools = session_tools(state, &cwd, &config.model, &search_usage)?;
+    let sandbox = sandbox_status(tools.sandbox_state());
     let author = config.model.clone();
     let (session, tools, memory) = attach_memory(state, &cwd, Session::new(config), tools);
     let learn_config = (memory.is_some() && state.config.learn != LearnMode::Off).then(|| {
@@ -1111,6 +1211,7 @@ fn create_session(
         learning: Mutex::new(SessionLearning::default()),
         memory_state: Mutex::new(memory_state),
         tools,
+        search_usage,
         approvals: Arc::new(Approvals::default()),
         view: Mutex::new(View {
             id: session_id.clone(),
@@ -1133,7 +1234,7 @@ fn create_session(
         .insert(session_id.clone(), entry);
     queue.push(response(
         id.clone(),
-        json!({"session_id":session_id,"seq":0,"memory":status}),
+        json!({"session_id":session_id,"seq":0,"memory":status,"sandbox":sandbox}),
     ));
     Ok(())
 }
@@ -1560,9 +1661,15 @@ fn attach_session(
 ) -> RpcResult {
     let status = memory_status(state, entry);
     let target = status.extractor.clone();
+    let sandbox = serde_json::to_value(sandbox_status(entry.tools.sandbox_state()))
+        .expect("sandbox status serialization");
     attach_session_with_result(queue, id, entry, params, move |view, since| {
         let mut result = attach_result(view, since);
         result["memory"] = serde_json::to_value(status).expect("memory status serialization");
+        if result["kind"] == "snapshot" {
+            result["snapshot"]["sandbox"] = sandbox.clone();
+        }
+        result["sandbox"] = sandbox;
         result
     })?;
     *consent_target = target;
@@ -1799,7 +1906,12 @@ fn prompt_session(
                 &gate,
                 text,
                 cancel,
-                |event| {
+                |mut event| {
+                    if let OutputEvent::TurnFinished { usage, .. } = &mut event {
+                        let mut searched =
+                            entry.search_usage.lock().expect("search usage poisoned");
+                        usage.accumulate(std::mem::take(&mut *searched));
+                    }
                     if let OutputEvent::ApprovalRequested { approval_id, .. } = &event {
                         entry.approvals.register(approval_id);
                     }
@@ -2044,6 +2156,7 @@ mod tests {
                 revision: std::cell::Cell::new(0),
             }),
             standalone_extractor: "anthropic/claude-sonnet-5".to_owned(),
+            git_identity: None,
             next_id: AtomicU64::new(1),
             instance_id: instance_id().unwrap(),
             clients: AtomicUsize::new(0),
@@ -2064,6 +2177,158 @@ mod tests {
             "tools":[], "stop_reason":"end_turn", "usage":null,
         }));
         (state, queue, entry)
+    }
+
+    #[tokio::test]
+    async fn create_and_attach_report_sandbox_state_and_keep_the_network_badge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, queue, entry) = existing_subscriber(dir.path()).await;
+        let expected = serde_json::to_value(sandbox_status(entry.tools.sandbox_state())).unwrap();
+        create_session(
+            &state,
+            &queue,
+            &json!(5),
+            &json!({"cwd":dir.path()}),
+            &mut None,
+        )
+        .unwrap();
+        let created = loop {
+            let message = queue.pop().await.unwrap();
+            if message["id"] == 5 {
+                break message;
+            }
+        };
+        assert_eq!(created["result"]["sandbox"], expected);
+        assert!(matches!(
+            expected["state"].as_str(),
+            Some("on" | "off" | "unavailable")
+        ));
+        {
+            let mut view = entry.view.lock().unwrap();
+            view.turns.clear();
+            view.active = Some(
+                json!({"turn_id":"t1","prompt":"p","text_so_far":"","reasoning_so_far":"","tools":[],"pending_approval":null,"memory_note_ids":[]}),
+            );
+            view.emit(OutputEvent::ApprovalRequested {
+                approval_id: "a1".into(),
+                command: "curl example.com".into(),
+                rule: "network-requested",
+                network: true,
+            });
+        }
+        let attached = Arc::new(ClientQueue::new());
+        attach_session(&state, &attached, &json!(6), &entry, &json!({}), &mut None).unwrap();
+        let result = attached.pop().await.unwrap()["result"].clone();
+        assert_eq!(result["sandbox"], expected);
+        let wire: crate::wire::AttachResult = serde_json::from_value(result).unwrap();
+        let crate::wire::AttachResult::Snapshot { snapshot, .. } = wire else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(
+            serde_json::to_value(snapshot.sandbox).unwrap(),
+            expected,
+            "the snapshot carries the same state"
+        );
+        let pending = snapshot.active_turn.unwrap().pending_approval.unwrap();
+        assert!(pending.network, "a reattached client still sees the badge");
+        assert_eq!(pending.command, "curl example.com");
+    }
+
+    #[tokio::test]
+    async fn git_identity_comes_from_the_global_files_and_needs_both_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = home.path().join("xdg");
+        assert_eq!(git_identity_in(home.path(), Some(xdg.clone())).await, None);
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        fs::write(xdg.join("git/config"), "[user]\n\tname = Xdg Name\n").unwrap();
+        assert_eq!(
+            git_identity_in(home.path(), Some(xdg.clone())).await,
+            None,
+            "a name without an email is no identity"
+        );
+        fs::write(
+            home.path().join(".gitconfig"),
+            "[user]\n\temail = person@example.invalid\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_identity_in(home.path(), Some(xdg.clone())).await,
+            Some(elefante_guard::git::Identity {
+                name: "Xdg Name".into(),
+                email: "person@example.invalid".into(),
+            })
+        );
+        fs::write(
+            home.path().join(".gitconfig"),
+            "[user]\n\tname = Home Name\n\temail = person@example.invalid\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_identity_in(home.path(), Some(xdg)).await.unwrap().name,
+            "Home Name",
+            "~/.gitconfig wins over the XDG file"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_spend_joins_the_turn_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, queue, entry) = existing_subscriber(dir.path()).await;
+        let usage = |input: u64, cost: f64| {
+            json!({"Usage":{"input_tokens":input,"output_tokens":1,"reasoning_tokens":0,
+                "cached_input_tokens":0,"cache_write_tokens":0,"cost":cost}})
+        };
+        // The stub answers requests in order: the turn, the search it starts, then the turn again.
+        let script = dir.path().join("script.json");
+        fs::write(
+            &script,
+            serde_json::to_vec(&json!({"rounds":[
+                [{"ToolUseStart":{"id":"c1","name":"web_search"}},
+                 {"ToolUseComplete":{"id":"c1","input":{"query":"rust release"}}},
+                 usage(10, 0.5), {"Stop":"tool_use"}],
+                [{"TextDelta":"1. https://example.com/rust"}, usage(7, 0.25), {"Stop":"end_turn"}],
+                [{"TextDelta":"done"}, usage(20, 0.125), {"Stop":"end_turn"}]
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        *state.provider.lock().unwrap() = Some(Arc::new(StubProvider::load(&script).unwrap()));
+        prompt_session(&state, &queue, &json!(7), &entry, &json!({"text":"search"})).unwrap();
+        let mut search_ok = false;
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = queue.pop().await.unwrap();
+                if message["method"] == "tool.finished" {
+                    search_ok = message["params"]["is_error"] == false;
+                }
+                if message["method"] == "turn.finished" {
+                    break message;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(search_ok, "the search returned a result");
+        let usage = &finished["params"]["usage"];
+        assert_eq!(usage["input_tokens"], 37, "turn 10 + search 7 + turn 20");
+        assert_eq!(usage["cost"], 0.875);
+        assert_eq!(*entry.search_usage.lock().unwrap(), Usage::default());
+    }
+
+    #[test]
+    fn sandbox_status_names_each_state() {
+        assert_eq!(sandbox_status(&Sandbox::Seatbelt).state, SandboxState::On);
+        assert_eq!(
+            sandbox_status(&Sandbox::Bubblewrap {
+                bwrap: "/usr/bin/bwrap".into()
+            })
+            .detail,
+            "bubblewrap"
+        );
+        assert_eq!(sandbox_status(&Sandbox::Disabled).state, SandboxState::Off);
+        let unavailable = sandbox_status(&Sandbox::Unavailable("no bwrap".into()));
+        assert_eq!(unavailable.state, SandboxState::Unavailable);
+        assert_eq!(unavailable.detail, "no bwrap");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

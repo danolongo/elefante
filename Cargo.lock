@@ -264,6 +264,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "elefante-core",
+ "elefante-guard",
  "elefante-mem",
  "elefante-provider",
  "futures-util",

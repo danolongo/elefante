@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_false(value: &bool) -> bool {
+pub(super) fn is_false(value: &bool) -> bool {
     !*value
 }
 

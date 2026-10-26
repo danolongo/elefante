@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 elefante-core = { path = "../core" }
+elefante-guard = { path = "../guard" }
 elefante-mem = { path = "../mem" }
 elefante-provider = { path = "../provider" }
 futures-util.workspace = true

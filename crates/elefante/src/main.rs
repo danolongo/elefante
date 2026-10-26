@@ -527,6 +527,9 @@ fn main() -> anyhow::Result<()> {
     if learning_is_paused(&created) && io::stderr().is_terminal() {
         eprintln!("{PAUSED_NOTICE}");
     }
+    if let Some(warning) = elefante::client::sandbox_warning(&created) {
+        eprintln!("{warning}");
+    }
     let session = created["session_id"]
         .as_str()
         .context("session.create returned no session_id")?;

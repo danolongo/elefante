@@ -156,10 +156,12 @@ through the environment, each falling back to the author's model when unset:
 |---|---|---|
 | author | `OPENROUTER_MODEL`, `ELEFANTE_EFFORT` | M0 |
 | extractor (learned memory) | `ELEFANTE_EXTRACT_MODEL`, `ELEFANTE_EXTRACT_EFFORT` | M3 |
+| web search | `ELEFANTE_SEARCH_MODEL` | M4 |
 | critic | `ELEFANTE_CRITIC_MODEL`, `ELEFANTE_CRITIC_EFFORT` | M5 |
 | bash triage | `ELEFANTE_TRIAGE_MODEL`, `ELEFANTE_TRIAGE_EFFORT` | M5 |
 
-No `config.toml` role table: four variables do not need a file format. The critic should be a
+The search default follows the same fallback until the end-of-M4.1 S9 probe; that probe may pick a
+cheaper default. No `config.toml` role table: a handful of variables do not need a file format. The critic should be a
 *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage
 can be anything cheap and fast. Per-model pricing needs no local table — `usage.cost` comes back on
 every response.

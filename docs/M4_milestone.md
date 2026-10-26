@@ -575,9 +575,12 @@ plus a visible "network" badge driven by the structured field. Today it renders 
 **`web_search` backend.** The provider gets an optional `Request.web_search` rendered as
 `plugins:[{id:"web",engine:"exa",max_results}]`, with Exa pinned so that native engines cannot
 fetch URLs named in a query. The daemon's `WebSearch` implementation runs one request on
-`ELEFANTE_SEARCH_MODEL` (default chosen in S9), and its usage is added to the session's.
+`ELEFANTE_SEARCH_MODEL` (unset, the session's author model; the S9 probe may revisit this), and its
+usage is added to the turn's usage.
 
-**Identity.** Read once at daemon start with the hardened git.
+**Identity.** Read once at daemon start with the hardened git, from `~/.gitconfig` and then
+`$XDG_CONFIG_HOME/git/config`. Without both `user.name` and `user.email`, the gate denies a harness
+Git write (rule `git-identity-missing`), so the user never approves a write that cannot commit.
 
 **Gate:**
 - auth required; a bad token is refused; the race at startup works; an older daemon gets a named

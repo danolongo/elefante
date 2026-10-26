@@ -248,6 +248,25 @@ pub struct CreateResult {
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxStatus>,
+}
+
+/// Whether the session's shell commands run under an OS sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxState {
+    On,
+    /// `ELEFANTE_SANDBOX=0`: every shell command needs approval.
+    Off,
+    /// Every shell command fails; `detail` says why and how to fix it.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxStatus {
+    pub state: SandboxState,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

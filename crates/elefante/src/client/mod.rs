@@ -1,8 +1,32 @@
 //! Rendering for the daemon client. Each output stream owns its renderer.
 pub mod memory;
 
-use crate::wire::{Notification, NotificationEvent};
+use crate::wire::{Notification, NotificationEvent, SandboxState, SandboxStatus};
 use std::io::{self, Write};
+
+/// The one warning line for a `session.create` result whose shell is not sandboxed.
+///
+/// Returns `None` while the sandbox is on, and for an older daemon that reports no state.
+#[must_use]
+pub fn sandbox_warning(create_result: &serde_json::Value) -> Option<String> {
+    let status: SandboxStatus =
+        serde_json::from_value(create_result.get("sandbox")?.clone()).ok()?;
+    let detail = status
+        .detail
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match status.state {
+        SandboxState::On => None,
+        SandboxState::Off => Some(format!(
+            "sandbox: off ({detail}); every shell command needs your approval"
+        )),
+        SandboxState::Unavailable => Some(format!(
+            "sandbox: unavailable; shell commands will fail: {detail}"
+        )),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Channel {
@@ -173,5 +197,32 @@ impl<W: Write> StreamRenderer<W> {
 
     pub fn into_inner(self) -> W {
         self.out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sandbox_warning;
+    use serde_json::json;
+
+    #[test]
+    fn only_an_unsandboxed_session_gets_one_warning_line() {
+        assert_eq!(
+            sandbox_warning(&json!({"sandbox":{"state":"on","detail":"seatbelt"}})),
+            None
+        );
+        assert_eq!(sandbox_warning(&json!({"session_id":"s1"})), None);
+        assert_eq!(
+            sandbox_warning(&json!({"sandbox":{"state":"off","detail":"ELEFANTE_SANDBOX=0"}}))
+                .as_deref(),
+            Some("sandbox: off (ELEFANTE_SANDBOX=0); every shell command needs your approval")
+        );
+        let unavailable = sandbox_warning(&json!({"sandbox":{
+            "state":"unavailable","detail":"sandbox probe failed:\nexit status 1\x1b[31m"
+        }}))
+        .unwrap();
+        assert!(unavailable.starts_with("sandbox: unavailable;"));
+        assert!(!unavailable.contains(['\n', '\x1b']), "{unavailable:?}");
+        assert!(unavailable.contains("probe failed: exit status 1"));
     }
 }

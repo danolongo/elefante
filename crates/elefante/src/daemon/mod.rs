@@ -2,6 +2,7 @@
 
 mod credentials;
 mod queue;
+mod search;
 mod server;
 #[cfg(debug_assertions)]
 mod stub;

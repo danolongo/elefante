@@ -639,6 +639,8 @@ async fn former_harness_state_bypasses_reach_the_os_boundary() {
             "printf '.%s/x\\n' elefante | xargs cat",
             "printf '%s\\n' ordinary/x | xargs cat",
         ),
+        ("cat .elef*/x", "cat ordin*/x"),
+        ("grep -r marker .elef*", "grep -r marker ordin*"),
     ] {
         assert_eq!(
             classifier.classify_in(blocked, &root).verdict,

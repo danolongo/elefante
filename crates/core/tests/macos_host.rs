@@ -4,6 +4,7 @@
 use elefante_core::sandbox::SessionSandbox;
 use elefante_guard::sandbox::Network;
 use std::{
+    ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -30,9 +31,27 @@ fn session(root: &Path) -> SessionSandbox {
     SessionSandbox::new(root).expect("sandbox session; enable sandbox-exec on macOS")
 }
 
-async fn host(program: &str, args: &[&str]) -> Output {
+/// Returns the cleared environment the sandboxed attempt receives, so each host control differs
+/// from its sandboxed attempt only by the Seatbelt profile. Session tool directories stay off
+/// `PATH`; every control names its binary by absolute path.
+fn environment(session: &SessionSandbox) -> Vec<(OsString, OsString)> {
+    session
+        .scan()
+        .expect("session policy")
+        .environment(std::iter::empty(), &[], true)
+        .expect("sandbox environment")
+}
+
+/// How long a host service may take to act on a cold CI runner.
+const SERVICE_WAIT: Duration = Duration::from_secs(30);
+
+async fn host(environment: &[(OsString, OsString)], program: &str, args: &[&str]) -> Output {
     let mut command = AsyncCommand::new(program);
-    command.args(args).kill_on_drop(true);
+    command
+        .args(args)
+        .env_clear()
+        .envs(environment.iter().cloned())
+        .kill_on_drop(true);
     tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
         .expect("host control timed out on the macOS CI runner")
@@ -44,7 +63,7 @@ fn quote(value: &str) -> String {
 }
 
 async fn marker_appears(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(SERVICE_WAIT, async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -96,11 +115,14 @@ impl Drop for LaunchJobCleanup {
 async fn sandbox_cannot_read_a_synthetic_keychain_item() {
     require_disposable_runner();
     let (_temp, root) = fixture();
+    let sandbox = session(&root);
+    let env = environment(&sandbox);
     let keychain = root.join("fixture.keychain-db");
     let path = keychain.to_str().expect("UTF-8 scratch path");
     let _cleanup = KeychainCleanup(keychain.clone());
     assert!(
         host(
+            &env,
             "/usr/bin/security",
             &["create-keychain", "-p", "fixture-password", path]
         )
@@ -111,6 +133,7 @@ async fn sandbox_cannot_read_a_synthetic_keychain_item() {
     );
     assert!(
         host(
+            &env,
             "/usr/bin/security",
             &[
                 "add-generic-password",
@@ -138,7 +161,7 @@ async fn sandbox_cannot_read_a_synthetic_keychain_item() {
         "-w",
         path,
     ];
-    let control = host("/usr/bin/security", &args).await;
+    let control = host(&env, "/usr/bin/security", &args).await;
     assert!(
         control.status.success(),
         "host keychain lookup control unavailable"
@@ -148,7 +171,7 @@ async fn sandbox_cannot_read_a_synthetic_keychain_item() {
         "/usr/bin/security find-generic-password -a elefante-fixture -s elefante-fixture -w {}",
         quote(path)
     );
-    let blocked = session(&root)
+    let blocked = sandbox
         .run_shell(&command, Network::Off)
         .await
         .expect("sandbox runs");
@@ -161,7 +184,7 @@ async fn sandbox_cannot_read_a_synthetic_keychain_item() {
         "synthetic item appeared in sandbox output"
     );
     assert!(
-        host("/usr/bin/security", &["delete-keychain", path])
+        host(&env, "/usr/bin/security", &["delete-keychain", path])
             .await
             .status
             .success(),
@@ -174,9 +197,13 @@ async fn sandbox_cannot_read_a_synthetic_keychain_item() {
 async fn sandbox_cannot_read_the_synthetic_clipboard() {
     require_disposable_runner();
     let (_temp, root) = fixture();
+    let sandbox = session(&root);
+    let env = environment(&sandbox);
     let marker = b"elefante-ci-clipboard-fixture";
     let _cleanup = ClipboardCleanup;
     let mut copy = AsyncCommand::new("/usr/bin/pbcopy")
+        .env_clear()
+        .envs(env.iter().cloned())
         .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -195,7 +222,7 @@ async fn sandbox_cannot_read_the_synthetic_clipboard() {
             .success(),
         "CI runner has no working pasteboard"
     );
-    let control = host("/usr/bin/pbpaste", &[]).await;
+    let control = host(&env, "/usr/bin/pbpaste", &[]).await;
     assert!(
         control.status.success(),
         "CI runner pasteboard cannot be read"
@@ -204,7 +231,7 @@ async fn sandbox_cannot_read_the_synthetic_clipboard() {
         control.stdout, marker,
         "CI runner pasteboard did not retain synthetic content"
     );
-    let blocked = session(&root)
+    let blocked = sandbox
         .run_shell("/usr/bin/pbpaste", Network::Off)
         .await
         .expect("sandbox runs");
@@ -214,7 +241,7 @@ async fn sandbox_cannot_read_the_synthetic_clipboard() {
         "synthetic clipboard content appeared in sandbox output"
     );
     assert!(
-        host("/usr/bin/pbcopy", &[]).await.status.success(),
+        host(&env, "/usr/bin/pbcopy", &[]).await.status.success(),
         "synthetic clipboard cleanup failed"
     );
 }
@@ -224,6 +251,8 @@ async fn sandbox_cannot_read_the_synthetic_clipboard() {
 async fn sandbox_cannot_launch_a_scratch_app() {
     require_disposable_runner();
     let (_temp, root) = fixture();
+    let sandbox = session(&root);
+    let env = environment(&sandbox);
     let app = root.join("Fixture.app");
     let contents = app.join("Contents");
     let executable = contents.join("MacOS/Fixture");
@@ -250,7 +279,7 @@ async fn sandbox_cannot_launch_a_scratch_app() {
         .expect("executable scratch app");
     let app_path = app.to_str().expect("UTF-8 app path");
     assert!(
-        host("/usr/bin/open", &["-a", app_path])
+        host(&env, "/usr/bin/open", &["-a", app_path])
             .await
             .status
             .success(),
@@ -259,12 +288,12 @@ async fn sandbox_cannot_launch_a_scratch_app() {
     marker_appears(&marker).await;
     fs::remove_file(&marker).expect("clear only the scratch app marker");
     let command = format!("/usr/bin/open -a {}", quote(app_path));
-    let blocked = session(&root)
+    let blocked = sandbox
         .run_shell(&command, Network::Off)
         .await
         .expect("sandbox runs");
     assert!(!blocked.success, "sandbox launched the scratch app");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    tokio::time::sleep(SERVICE_WAIT).await;
     assert!(
         !marker.exists(),
         "scratch app marker appeared after sandboxed launch"
@@ -276,6 +305,8 @@ async fn sandbox_cannot_launch_a_scratch_app() {
 async fn sandbox_cannot_submit_a_launchd_job() {
     require_disposable_runner();
     let (_temp, root) = fixture();
+    let sandbox = session(&root);
+    let env = environment(&sandbox);
     let label = format!("dev.elefante.sandbox-fixture.{}", std::process::id());
     let _cleanup = LaunchJobCleanup(label.clone());
     let marker = root.join("launchd-marker");
@@ -284,6 +315,7 @@ async fn sandbox_cannot_submit_a_launchd_job() {
         quote(marker.to_str().expect("UTF-8 marker path"))
     );
     let control = host(
+        &env,
         "/bin/launchctl",
         &["submit", "-l", &label, "--", "/bin/sh", "-c", &payload],
     )
@@ -293,13 +325,13 @@ async fn sandbox_cannot_submit_a_launchd_job() {
         "launchctl submit unavailable on the macOS CI runner"
     );
     marker_appears(&marker).await;
-    let removed = host("/bin/launchctl", &["remove", &label]).await;
+    let removed = host(&env, "/bin/launchctl", &["remove", &label]).await;
     assert!(
         removed.status.success(),
         "cannot remove the synthetic launchd job before the denial test"
     );
     tokio::time::timeout(Duration::from_secs(3), async {
-        while host("/bin/launchctl", &["list", &label])
+        while host(&env, "/bin/launchctl", &["list", &label])
             .await
             .status
             .success()
@@ -314,21 +346,21 @@ async fn sandbox_cannot_submit_a_launchd_job() {
         "/bin/launchctl submit -l {label} -- /bin/sh -c {}",
         quote(&payload)
     );
-    let blocked = session(&root)
+    let blocked = sandbox
         .run_shell(&command, Network::Off)
         .await
         .expect("sandbox runs");
     assert!(!blocked.success, "sandbox submitted a launchd job");
     assert!(
-        !host("/bin/launchctl", &["list", &label])
+        !host(&env, "/bin/launchctl", &["list", &label])
             .await
             .status
             .success(),
         "sandbox registered a launchd job despite command failure"
     );
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    tokio::time::sleep(SERVICE_WAIT).await;
     assert!(
-        !host("/bin/launchctl", &["list", &label])
+        !host(&env, "/bin/launchctl", &["list", &label])
             .await
             .status
             .success(),
@@ -345,14 +377,16 @@ async fn sandbox_cannot_submit_a_launchd_job() {
 async fn sandbox_cannot_send_a_finder_apple_event() {
     require_disposable_runner();
     let (_temp, root) = fixture();
+    let sandbox = session(&root);
+    let env = environment(&sandbox);
     let script = "tell application \"Finder\" to get version";
-    let control = host("/usr/bin/osascript", &["-e", script]).await;
+    let control = host(&env, "/usr/bin/osascript", &["-e", script]).await;
     assert!(
         control.status.success(),
         "Finder Apple Events unavailable on the macOS CI runner"
     );
     assert!(!control.stdout.is_empty(), "Finder returned no version");
-    let blocked = session(&root)
+    let blocked = sandbox
         .run_shell(
             "/usr/bin/osascript -e 'tell application \"Finder\" to get version'",
             Network::Off,

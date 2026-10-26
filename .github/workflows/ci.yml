@@ -79,7 +79,7 @@ jobs:
       - name: sandbox host-service controls
         env:
           ELEFANTE_MAC_HOST_GATE: "1"
-        run: cargo test -p elefante-core --test macos_host -- --ignored --nocapture
+        run: cargo test -p elefante-core --test macos_host -- --ignored --nocapture --test-threads=1
 
   # Advisory only. Pinning above buys reproducibility at the cost of never hearing about a new
   # lint until someone bumps the pin; this job pays that back by reporting what current stable

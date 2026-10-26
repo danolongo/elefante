@@ -433,9 +433,8 @@ struct Shared {
 }
 
 fn random_bits() -> io::Result<[u8; 16]> {
-    use std::io::Read as _;
     let mut bytes = [0_u8; 16];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     Ok(bytes)
 }
 

@@ -113,12 +113,7 @@ fn private_temp_dir_in(base: &Path) -> Result<PathBuf, String> {
 }
 
 fn random() -> Result<u64, String> {
-    use std::io::Read as _;
-    let mut bytes = [0_u8; 8];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|error| error.to_string())?;
-    Ok(u64::from_ne_bytes(bytes))
+    getrandom::u64().map_err(|error| error.to_string())
 }
 
 /// Removes this user's `elefante-sandbox-<pid>-*` directories whose process no longer runs.

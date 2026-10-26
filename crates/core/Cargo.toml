@@ -10,6 +10,7 @@ elefante-guard = { path = "../guard" }
 elefante-mem = { path = "../mem" }
 elefante-provider = { path = "../provider" }
 futures-util.workspace = true
+getrandom.workspace = true
 globset.workspace = true
 ignore.workspace = true
 regex.workspace = true

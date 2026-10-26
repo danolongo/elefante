@@ -1007,40 +1007,43 @@ fn synthetic_child_failure_stage(output: &std::process::Output) -> String {
         "synthetic key was inherited by the shell",
         "unsandboxed parent process should be inspectable",
         "sandbox exposed its host parent process",
+        "sandbox /proc environ check inspected nothing",
+        "host /proc environ control did not find the synthetic key",
         "synthetic key exposed in sandbox /proc",
-        "fd probe cannot detect an extra descriptor",
-        "probe counted a transient host descriptor",
+        "host process inherited an extra descriptor",
+        "fd probe did not identify the intentionally retained FD 3",
         "sandbox inherited an extra descriptor",
     ]
     .into_iter()
     .find(|marker| child_report.contains(marker))
     .unwrap_or("unclassified child failure");
-    if stage == "sandbox inherited an extra descriptor" {
-        let number = child_report
-            .split("open_fd=")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .filter(|value| value.len() <= 3 && value.chars().all(|c| c.is_ascii_digit()))
-            .unwrap_or("unknown");
-        format!("{stage} (fd {number})")
-    } else {
-        stage.to_owned()
+    match child_report
+        .split("open_fd=")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|value| !value.is_empty() && value.len() <= 3)
+    {
+        Some(number) => format!("{stage} (fd {number})"),
+        None => stage.to_owned(),
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Builds a probe that prints the first descriptor above stderr. Linux lists `/proc/self/fd`.
+/// Seatbelt denies reads of `/dev/fd`, so macOS tests each descriptor with `fcntl`.
 async fn build_fd_probe(root: &std::path::Path) -> std::path::PathBuf {
     assert!(
         std::path::Path::new("/usr/bin/cc").is_file(),
-        "install a C compiler for the Linux inherited-fd gate"
+        "install a C compiler for the inherited-fd gate"
     );
     let source = root.join("fd_probe.c");
     let binary = root.join("fd_probe");
     std::fs::write(
         &source,
         r#"
-#include <dirent.h>
 #include <stdio.h>
+#ifdef __linux__
+#include <dirent.h>
 #include <stdlib.h>
 int main(void) {
     DIR *entries = opendir("/proc/self/fd");
@@ -1059,6 +1062,21 @@ int main(void) {
     closedir(entries);
     return 0;
 }
+#else
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+    int limit = getdtablesize();
+    if (limit > 65536) limit = 65536;
+    for (int fd = 3; fd < limit; fd++) {
+        if (fcntl(fd, F_GETFD) != -1) {
+            printf("open_fd=%d\n", fd);
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
 "#,
     )
     .expect("write fd fixture source");
@@ -1075,6 +1093,44 @@ int main(void) {
         String::from_utf8_lossy(&compiled.stderr)
     );
     binary
+}
+
+/// Runs the fd probe on the host with a clean control and a retained-FD control, then in the
+/// sandbox. Each failure message carries the probe's `open_fd=` line.
+async fn assert_only_standard_descriptors(
+    session: &elefante_core::sandbox::SessionSandbox,
+    root: &std::path::Path,
+) {
+    build_fd_probe(root).await;
+    let mut clean_command = shell("./fd_probe");
+    clean_command.current_dir(root);
+    let clean_control = run_process(clean_command, Duration::from_secs(3))
+        .await
+        .expect("clean host fd control");
+    assert!(
+        clean_control.success,
+        "host process inherited an extra descriptor: {}",
+        clean_control.content
+    );
+    let mut retained_command = shell("exec 3< /dev/null; exec ./fd_probe");
+    retained_command.current_dir(root);
+    let control = run_process(retained_command, Duration::from_secs(3))
+        .await
+        .expect("unsandboxed fd control");
+    assert!(
+        !control.success && control.content.contains("open_fd=3"),
+        "fd probe did not identify the intentionally retained FD 3: {}",
+        control.content
+    );
+    let fds = session
+        .run_shell("./fd_probe", Network::Off)
+        .await
+        .expect("sandboxed fd inspection");
+    assert!(
+        fds.success,
+        "sandbox inherited an extra descriptor: {}",
+        fds.content
+    );
 }
 
 #[tokio::test]
@@ -1132,43 +1188,113 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
     assert!(!parent.success, "sandbox exposed its host parent process");
     #[cfg(target_os = "linux")]
     {
+        let scan = "for entry in /proc/[0-9]*/environ; do if grep -a -q OPENROUTER_API_KEY \"$entry\" 2>/dev/null; then exit 1; fi; done";
+        let host = run_process(shell(scan), Duration::from_secs(5))
+            .await
+            .expect("host /proc environ control");
+        assert!(
+            !host.success,
+            "host /proc environ control did not find the synthetic key"
+        );
+        let readable = session
+            .run_shell("grep -a -q TERM=dumb /proc/$$/environ", Network::Off)
+            .await
+            .expect("sandboxed environ readability check");
+        assert!(
+            readable.success,
+            "sandbox /proc environ check inspected nothing: {readable:?}"
+        );
         let proc = session
-            .run_shell(
-                "for entry in /proc/[0-9]*/environ; do if grep -a -q OPENROUTER_API_KEY \"$entry\" 2>/dev/null; then exit 1; fi; done",
-                Network::Off,
-            )
+            .run_shell(scan, Network::Off)
             .await
             .expect("sandboxed process inspection");
         assert!(proc.success, "synthetic key exposed in sandbox /proc");
-        build_fd_probe(root.path()).await;
-        let mut clean_command = shell("./fd_probe");
-        clean_command.current_dir(root.path());
-        let clean_control = run_process(clean_command, Duration::from_secs(3))
+    }
+    assert_only_standard_descriptors(&session, root.path()).await;
+}
+
+#[tokio::test]
+async fn planted_temp_symlinks_cannot_redirect_daemon_writes() {
+    use elefante_core::sandbox::SessionSandbox;
+    let outside = tempfile::tempdir().expect("outside fixture directory");
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "outside fixture").expect("outside fixture");
+    let root = tempfile::tempdir().expect("fixture root");
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let temp = session.scan().expect("session policy").temp;
+    // The names match the program files earlier daemons wrote into the sandbox's TMPDIR.
+    let plant = format!(
+        "for i in $(seq 0 3000); do ln -s '{0}' \"$TMPDIR/seccomp-0-$i\"; ln -s '{0}' \"$TMPDIR/seccomp-1-$i\"; done",
+        victim.display()
+    );
+    let planted = session
+        .run_shell(&plant, Network::Off)
+        .await
+        .expect("sandboxed plant runs");
+    assert!(
+        planted.success,
+        "sandbox could not plant symlinks: {planted:?}"
+    );
+    assert_eq!(
+        std::fs::read_link(temp.join("seccomp-0-0")).expect("planted link persists"),
+        victim,
+        "planted link does not point at the outside fixture"
+    );
+    let next = session
+        .run_shell("true", Network::Off)
+        .await
+        .expect("second sandboxed command runs");
+    assert!(next.success, "second sandboxed command failed: {next:?}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("outside fixture remains"),
+        "outside fixture",
+        "daemon wrote through a planted symlink"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sandboxed_command_leaks_no_descriptor() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("fixture root");
+    build_fd_probe(root.path()).await;
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let sleeper = session.run_shell("printf ready > ready; sleep 3", Network::Off);
+    let probes = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !root.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("sleeping sandboxed command never started");
+        let mut host_command = shell("./fd_probe");
+        host_command.current_dir(root.path());
+        let host = run_process(host_command, Duration::from_secs(3))
             .await
-            .expect("clean host fd control");
-        assert!(
-            clean_control.success,
-            "probe counted a transient host descriptor: {clean_control:?}"
-        );
-        let mut retained_command = shell("exec 3< /dev/null; exec ./fd_probe");
-        retained_command.current_dir(root.path());
-        let control = run_process(retained_command, Duration::from_secs(3))
-            .await
-            .expect("unsandboxed fd control");
-        assert!(
-            !control.success && control.content.contains("open_fd=3"),
-            "fd probe did not identify the intentionally retained FD 3: {control:?}"
-        );
-        let fds = session
+            .expect("host fd probe runs");
+        let sandboxed = session
             .run_shell("./fd_probe", Network::Off)
             .await
-            .expect("sandboxed fd inspection");
-        assert!(
-            fds.success,
-            "sandbox inherited an extra descriptor: {}",
-            fds.content
-        );
-    }
+            .expect("sandboxed fd probe runs");
+        (host, sandboxed)
+    };
+    let (slept, (host, sandboxed)) = tokio::join!(sleeper, probes);
+    assert!(
+        slept.expect("sleeping sandboxed command runs").success,
+        "sleeping sandboxed command failed"
+    );
+    assert!(
+        host.success,
+        "host process inherited a descriptor from a concurrent sandboxed command: {}",
+        host.content
+    );
+    assert!(
+        sandboxed.success,
+        "sandbox inherited a descriptor from a concurrent sandboxed command: {}",
+        sandboxed.content
+    );
 }
 
 #[tokio::test]
@@ -1421,5 +1547,66 @@ int main(void) {
     assert!(
         !blocked.success && blocked.content.contains("errno=38"),
         "sandbox did not return ENOSYS: {blocked:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn seccomp_returns_eperm_for_process_vm_readv_without_network() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("scratch syscall probe root");
+    let source = root.path().join("vm_read_probe.c");
+    let binary = root.path().join("vm_read_probe");
+    std::fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <sys/uio.h>
+#include <unistd.h>
+int main(void) {
+    char source[] = "fixture", target[sizeof source];
+    struct iovec local = { target, sizeof target }, remote = { source, sizeof source };
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) < 0) {
+        printf("errno=%d\n", errno);
+        return 2;
+    }
+    puts("process_vm_readv succeeded");
+    return 0;
+}
+"#,
+    )
+    .expect("write syscall probe source");
+    let compiled = Command::new("/usr/bin/cc")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .await
+        .expect("install a C compiler for the Linux syscall gate");
+    assert!(
+        compiled.status.success(),
+        "syscall fixture compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let host = Command::new(&binary)
+        .output()
+        .await
+        .expect("host syscall control runs");
+    assert!(
+        host.status.success(),
+        "host process_vm_readv unavailable: {}; the EPERM gate cannot claim a positive control",
+        String::from_utf8_lossy(&host.stdout)
+    );
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("sandbox session");
+    let blocked = session
+        .run_shell("./vm_read_probe", Network::Off)
+        .await
+        .expect("sandbox runs");
+    assert!(
+        !blocked.success && blocked.content.contains("errno=1\n"),
+        "sandbox did not return EPERM for process_vm_readv: {blocked:?}"
     );
 }

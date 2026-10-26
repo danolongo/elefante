@@ -547,7 +547,7 @@ impl SessionSandbox {
         };
         #[cfg(target_os = "linux")]
         let filters = if sandboxed {
-            seccomp_filters(&policy, network)?
+            seccomp_filters(network)?
         } else {
             Vec::new()
         };
@@ -578,17 +578,19 @@ impl SessionSandbox {
                         bash: self.bash.clone(),
                         command: source.into(),
                         environment: environment.clone(),
-                        seccomp_fds: filters
-                            .iter()
-                            .map(|file| {
-                                u32::try_from(file.as_raw_fd())
-                                    .expect("file descriptor is nonnegative")
-                            })
-                            .collect(),
+                        seccomp_fds: vec![3, 4],
                     };
                     let args =
                         sandbox::bwrap_args(&policy, &spec).map_err(|error| error.to_string())?;
-                    let mut command = Command::new(bwrap);
+                    let mut command = Command::new("/bin/sh");
+                    command.args(["-c", SECCOMP_TRAMPOLINE]).arg(bwrap);
+                    for file in &filters {
+                        command.arg(format!(
+                            "/proc/{}/fd/{}",
+                            std::process::id(),
+                            file.as_raw_fd()
+                        ));
+                    }
                     command.args(args);
                     command
                 }
@@ -666,9 +668,14 @@ impl SessionSandbox {
     }
 }
 
+/// Writes each seccomp program into an anonymous memory file.
+///
+/// The memory files have no path, so a sandboxed command cannot redirect the write. The daemon
+/// keeps close-on-exec set, so no concurrent child inherits them.
 #[cfg(target_os = "linux")]
-fn seccomp_filters(policy: &Policy, network: Network) -> Result<Vec<fs::File>, String> {
-    use rustix::io::{FdFlags, fcntl_setfd};
+fn seccomp_filters(network: Network) -> Result<Vec<fs::File>, String> {
+    use rustix::fs::{MemfdFlags, memfd_create};
+    use std::io::Write as _;
     let architecture = if cfg!(target_arch = "x86_64") {
         sandbox::Architecture::X86_64
     } else {
@@ -677,17 +684,21 @@ fn seccomp_filters(policy: &Policy, network: Network) -> Result<Vec<fs::File>, S
     let programs =
         sandbox::seccomp_programs(architecture, network).map_err(|error| error.to_string())?;
     let mut files = Vec::new();
-    for (index, program) in programs.iter().enumerate() {
-        let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = policy.temp.join(format!("seccomp-{index}-{id}"));
-        fs::write(&path, program).map_err(|error| error.to_string())?;
-        let file = fs::File::open(&path).map_err(|error| error.to_string())?;
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
-        fcntl_setfd(&file, FdFlags::empty()).map_err(|error| error.to_string())?;
+    for program in &programs {
+        let mut file = fs::File::from(
+            memfd_create("elefante-seccomp", MemfdFlags::CLOEXEC)
+                .map_err(|error| error.to_string())?,
+        );
+        file.write_all(program).map_err(|error| error.to_string())?;
         files.push(file);
     }
     Ok(files)
 }
+
+/// Reopens the two seccomp programs as fds 3 and 4 in the launched process only, then execs
+/// bubblewrap. A failed reopen stops the `exec`, so the command never runs unfiltered.
+#[cfg(target_os = "linux")]
+const SECCOMP_TRAMPOLINE: &str = r#"a=$1 b=$2; shift 2; exec "$0" "$@" 3<"$a" 4<"$b""#;
 
 fn git_reference(path: &Path, gitfile: bool) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;

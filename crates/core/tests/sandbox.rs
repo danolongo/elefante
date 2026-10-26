@@ -1808,6 +1808,48 @@ int main(void) {
 }
 
 #[tokio::test]
+async fn enclosing_repository_hooks_path_inside_the_root_is_read_only() {
+    use elefante_core::sandbox::SessionSandbox;
+    let fixture = tempfile::tempdir().expect("fixture repository");
+    let repository = fixture.path().canonicalize().expect("canonical repository");
+    for args in [
+        &["init", "-q"][..],
+        &["config", "core.hooksPath", "sub/.husky"],
+    ] {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(&repository)
+            .output()
+            .expect("Git fixture command");
+        assert!(output.status.success(), "Git fixture failed: {output:?}");
+    }
+    let root = repository.join("sub");
+    std::fs::create_dir_all(root.join(".husky")).expect("hooks fixture");
+    let control = run_process(
+        shell(&format!(
+            "cd '{}' && printf host > .husky/host",
+            root.display()
+        )),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("host control executes");
+    assert!(control.success, "host write to .husky: {control:?}");
+    let session = SessionSandbox::new(&root).expect("session setup");
+    let blocked = session
+        .run_shell("printf hook > .husky/pre-commit", Network::Off)
+        .await
+        .expect("sandbox executes");
+    assert!(!blocked.success, "sandboxed hook write: {blocked:?}");
+    assert!(!root.join(".husky/pre-commit").exists());
+    let ordinary = session
+        .run_shell("printf ordinary > ordinary", Network::Off)
+        .await
+        .expect("sandbox executes");
+    assert!(ordinary.success, "ordinary in-root write: {ordinary:?}");
+}
+
+#[tokio::test]
 async fn in_root_hooks_path_is_read_only_and_a_missing_one_refuses() {
     use elefante_core::sandbox::SessionSandbox;
     let fixture = tempfile::tempdir().expect("fixture root");

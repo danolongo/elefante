@@ -437,8 +437,30 @@ impl SessionSandbox {
                 entry.display()
             ));
         }
-        for (entry, gitdir) in &repositories {
-            let worktree = entry.parent().ok_or("Git metadata has no parent")?;
+        let mut worktrees = repositories
+            .iter()
+            .map(|(entry, gitdir)| {
+                let worktree = entry.parent().ok_or("Git metadata has no parent")?;
+                Ok((worktree.to_owned(), gitdir.clone()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // A root inside a repository: that repository's config can still name targets in the root.
+        if !policy.root.join(".git").exists()
+            && let Some(enclosing) = policy
+                .root
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| ancestor.join(".git").exists())
+        {
+            let entry = enclosing.join(".git");
+            let gitdir = if entry.is_dir() {
+                entry
+            } else {
+                git_reference(&entry, true)?
+            };
+            worktrees.push((enclosing.to_owned(), gitdir));
+        }
+        for (worktree, gitdir) in &worktrees {
             let config =
                 crate::harness_git::repo_config(&self.git, worktree, gitdir, Some(&policy.home))?;
             for target in config.targets {

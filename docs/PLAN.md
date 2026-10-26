@@ -639,7 +639,8 @@ that phase can pass its gate.
   A new nested `.git` is quarantined after the command, including under ignored directories.
   If a move fails, the next root scan refuses until the entry is gone. On every OS, a `.git` that
   was absent at session start makes bash and harness git refuse, and in-root include or hooksPath
-  targets are read-only in the shell.
+  targets are read-only in the shell. The scan also reads the config of a repository that encloses
+  the root.
 - **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
   bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
   process that leaves the group can survive, but remains sandboxed; the output reader stops two

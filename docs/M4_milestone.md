@@ -42,78 +42,20 @@ Git writes and web research go through harness-owned, allowlisted paths.
   Credentialed checks are deferred until the end of M4.1 at the maintainer's request; until
   then they are `not run`, not green. M4.1's gate, including those deferred checks, must be
   green before M5 or completion is reported.
-- **Plan in the repo.** After approval this plan becomes `docs/M4_milestone.md`. When M4.1
-  ships, it is folded into `MILESTONES.md` and deleted, keeping the four-doc rule.
-- **Commits.** One commit per implementation phase, following the conventions in the next section.
-  Phase 0 uses separately approved CI-iteration commits and a results commit. GitHub returned
-  404 for `workflow_dispatch` on a workflow absent from the default branch, so a trigger-fix
-  commit added a `sandboxing` push event. The first Linux run exposed probe-harness errors,
-  requiring another iteration before its results can be trusted. Phase 1 has one separately
-  approved Linux gate-fix commit after pinned Clippy found Linux-only lint errors; Phase 2 stays
-  blocked until that gate reruns green. Ask before every commit. The maintainer later authorized
-  pushes without a separate request.
+- **Plan in the repo.** This file is M4's working plan. The pull request that closes M4.1
+  deletes it, after lasting decisions move into `PLAN.md` and `DEVELOPER_GUIDE.md`.
+- **Commits.** Commits land on `sandboxing` as each fix lands, following `DEVELOPER_GUIDE.md`
+  § 13.
 - **No `unsafe`.** The workspace forbids it. New dependencies:
   - `seccompiler`, Linux only, in `guard`: pure BPF compilation.
-- `rustix` 1.1.5 or later compatible release, in `core` and `mem`: safe `openat2` and
-  `O_NOFOLLOW_ANY`. The macOS probe found that 1.1.4 lacks the latter flag.
+  - `rustix` 1.1.5 or later compatible release, in `core` and `mem`: safe `openat2` and
+    `O_NOFOLLOW_ANY`. The macOS probe found that 1.1.4 lacks the latter flag.
 
-  Both are checked against MSRV 1.90 in the spike.
+  The spike checked both against MSRV 1.90.
 - **Tests never skip silently.** A sandbox test that finds no sandbox fails with setup
   instructions, and CI provides the sandbox on both operating systems.
 - **Every negative test has a positive control.** The same operation must succeed unsandboxed or
   with approval, so a test cannot pass because the operation was broken for another reason.
-
-
-## Commit and PR conventions
-
-**Authorship.**
-- No `Co-Authored-By` trailer, no "Generated with" line, and no other attribution, in commits or
-  in PR descriptions.
-- Never name milestones (M0–M7, M4.1) in a commit message or PR description.
-
-**Subject line:** `type(scope): summary`
-- `type` is one of `feat`, `fix`, `refactor`, `test`, `docs`, `ci`.
-- `scope` is the crate or area touched (`core`, `guard`, `mem`, `provider`, `elefante`, `tui`).
-  Leave it out when a change spans several, e.g. `docs: …`.
-- The summary is lower case, imperative, without a final full stop, and says what the change
-  does for the reader, not which files moved.
-
-**Body.** After one blank line, a short paragraph wrapped at about 72 columns:
-- **For a fix:** what went wrong and why, then what the code does now.
-- **For a feature or refactor:** the behaviour that changed, in one or two sentences.
-
-The body is plain prose: no bullet lists, no file inventories, no test counts. Leave it out when
-the subject says everything.
-
-**PR description:** the same voice. A few sentences on what changes and why, then what was
-verified and what was not.
-
-**Examples, from this repository's history:**
-
-```
-test(srv): keep the turn's end when a withdrawal races it
-
-The interleaving test waited for turn.finished after sending its requests, but
-on a slower machine the event had already been read while waiting for an
-earlier response, so the wait timed out. It now notes the turn's end as it goes
-by and only waits when it has not seen it.
-```
-
-```
-refactor: merge rpc, srv and cli into one elefante binary
-
-The client starts its own executable as `elefante daemon`, memory
-commands always go through the daemon, and the scripted test
-provider is compiled only into debug builds.
-```
-
----
-
-## First action after approval
-
-1. Copy this plan verbatim to `docs/M4_milestone.md`.
-2. **Stop.** Ask the user for permission to continue before starting any phase, including
-   Phase 0. No other edits, spike runs or commits until they say so.
 
 ## Phase 0 — Amend PLAN.md, then spike (no product code)
 
@@ -194,12 +136,12 @@ PLAN.md is amended where a decision moved. The optional S1 AppArmor-profile alte
 tested. S9 remains `not run` under the explicit credentialed deferral above. Phase 1 may then
 begin; the deferred S9 check remains a required final gate.
 **First commit (Actions route):** `ci: probe Linux sandbox requirements`. This carries the
-temporary workflow, spike programs and design amendment and is pushed after separate approval.
+temporary workflow, spike programs and design amendment.
 **Trigger fix:** `fix(ci): run the sandbox spike on branch pushes`. GitHub's manual dispatch
 requires the workflow to exist on the default branch, so the temporary workflow must run on
 pushes to `sandboxing` instead.
-**Further CI iterations:** fix the temporary probe if its own setup fails, with a separate
-approval for each commit and push. Do not treat a probe-harness failure as a sandbox result.
+**Further CI iterations:** fix the temporary probe if its own setup fails. Do not treat a
+probe-harness failure as a sandbox result.
 **Results commit:** `docs: switch the Linux sandbox to bubblewrap and record the spike`.
 
 ---
@@ -561,8 +503,12 @@ Linux CI installs `bubblewrap` and `sqlite3` and checks user namespaces with an 
 than waiting until Phase 4: without them the runtime tests would fail at setup instead of
 testing isolation. Phase 4 keeps the planned two-OS matrix change.
 
-Tests live in `crates/{core,elefante}/tests/sandbox.rs` and run the real sandbox on both CI
-operating systems. Every negative test has a positive control.
+Tests live in `crates/{core,elefante}/tests/sandbox.rs`, with the side-effectful macOS host
+controls in `crates/core/tests/macos_host.rs`. The latter are explicitly ignored in ordinary
+local test runs and executed by a dedicated disposable `macos-latest` CI job with `--ignored`;
+that job must fail with a setup reason if GUI or clipboard services are unavailable. No such
+control runs on the maintainer's Mac without separate approval. Every negative test has a
+positive control.
 
 | Gate item | Test (negative; positive control) |
 |---|---|
@@ -575,7 +521,7 @@ operating systems. Every negative test has a positive control.
 | Harness state and secrets | `.elefante/` reads empty or is refused; in-root `.env` and `*.pem` are refused |
 | Root validation | A session rooted at `$HOME` or `/` gets `Unavailable`, and bash runs nothing |
 | Daemon and local services | A child process with a fake home connects to synthetic fallback, `$XDG_RUNTIME_DIR` and `ELEFANTE_SOCKET` override fixtures outside the root (under `/private/tmp` on macOS); sandboxed Off and Approved cannot connect, while the session-temp socket works. `/run` has no guaranteed writable fixture on CI, so the pure policy test rejects its broad mount and the runtime outside-socket and abstract-socket tests cover the reachable service classes. No real daemon or user state is touched. |
-| macOS host | `security find-generic-password`, `pbpaste`, `open -a`, `launchctl submit` and `osascript` fail |
+| macOS host | CI-only synthetic host controls first make `security find-generic-password`, `pbpaste`, `open -a`, `launchctl submit` and `osascript` succeed on the disposable runner, then require the current Seatbelt profile to refuse them. Missing host services fail the CI job rather than skip. |
 | Key and processes | The test process has `OPENROUTER_API_KEY` set; inside, `env` and every readable `/proc/*/environ` lack it, `ps eww $PPID` fails, and only fds 0–2 are open |
 | Symlinks and links | `read` and `write` refuse a symlink to an outside fixture, a link swapped in during the call (loop test), and a hard link. The indexer skips them too |
 | Lifetime | The timeout kills a grandchild; Linux: a `setsid` orphan is gone after its command; macOS: a held pipe does not stall the turn; 10 MB of output arrives capped with its size stated |
@@ -583,10 +529,10 @@ operating systems. Every negative test has a positive control.
 | Fail closed | `Unavailable` means bash refuses and a marker file is never created; `Disabled` means every bash call escalates |
 | `web_search` | A query with a secret fixture or a URL is refused; the 31st call escalates; results are capped (stub backend) |
 
-The FD gate uses a Python child to inspect its parent Bash process's `/proc/<pid>/fd` entries:
-the probe's own directory descriptor is therefore not counted. Its unsandboxed control first
-verifies a clean shell has no extra descriptor, then keeps FD 3 open and must detect it with the
-same probe. CI reports only an FD number on failure, never the child environment. The `setsid`
+The FD gate compiles a test-only C helper that inspects its own `/proc/self/fd` entries and
+excludes only the descriptor it opened for that enumeration. Its unsandboxed control first
+verifies a clean process has no extra descriptor, then keeps FD 3 open and must detect it with
+the same helper. CI reports only an FD number on failure, never the child environment. The `setsid`
 control waits for its detached child to write a `ready` marker before the parent exits, so the
 process-group cleanup cannot race the control's detachment.
 The io_uring gate compiles a test-only C syscall fixture with the existing compiler, requires
@@ -672,7 +618,7 @@ fetch URLs named in a query. The daemon's `WebSearch` implementation runs one re
   - `curl example.com` fails, then works once approved;
   - an agent commit leaves `.git/hooks` untouched.
 
-**Record.** Add the M4 entry to `MILESTONES.md`.
+**Record.** The pull request description states what M4's gate proved.
 
 **Commit:** `ci: test on macOS and Linux with the sandbox` (docs travel in the same commit, or in a
 separate `docs:` commit if they are large).
@@ -691,8 +637,7 @@ separate `docs:` commit if they are large).
   `merge -s evil`), and each one still fails at the OS.
 - A commit and a rebase still work.
 
-**Record.** The `MILESTONES.md` entry. Fold `docs/M4_milestone.md` into it and delete the
-file.
+**Record.** The closing pull request deletes this file and states what the gate proved.
 
 ---
 
@@ -709,7 +654,8 @@ file.
 - **`web_search` queries leave without per-call approval** up to the cap. They are scrubbed and
   URL-refused, but they remain an outbound channel.
 - **The secret scan is name-based** and prunes `target/` and `node_modules/`.
-- **Kernel exploits.** The microVM backend is a Proposal.
+- **Kernel exploits.** The opt-in microVM backend in M4.2 (macOS) and M4.3 (Linux) addresses
+  them.
 
 ---
 

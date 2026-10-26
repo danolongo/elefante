@@ -9,8 +9,16 @@ bun install          # verifies against bun.lock, the one committed lockfile
 bun run src/main.tsx
 ```
 
-`bun.lock` is authoritative; see [`../docs/LOCKFILE.md`](../docs/LOCKFILE.md) for why there is
-exactly one. `elefante` with no prompt is the normal way in: the Rust CLI starts the daemon if none is
+**One lockfile.** `bun.lock` is the only committed lockfile. Do not add `package-lock.json`, and
+do not gitignore `bun.lock`. Bun reads `bun.lock` and never reads `package-lock.json`. With both
+files present, `bun install --frozen-lockfile` and `npm ci` each succeed and install different
+trees, with no warning (measured on Bun 1.4.2).
+
+**Packaging.** `bun build --compile` produces one self-contained binary with the native library
+embedded. CI compiles it on every push so the option stays open. Shipping that binary waits for a
+release.
+
+`elefante` with no prompt is the normal way in: the Rust CLI starts the daemon if none is
 listening, then runs this entrypoint under `bun` with the resolved model, effort, and limits.
 Run directly, this client never spawns a daemon and exits with a named error if none is
 listening.

@@ -4,21 +4,15 @@ Elefante is a small, modifiable coding-agent harness. Its current implementation
 Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
 seven guarded tools, and policy enforced in code rather than in a long system prompt.
 
-The daemon, the OpenTUI client, a per-repository index and learned memory have shipped. The index
-gives each turn relevant files and symbols and gives the model a `memory_search` tool. The project
-goes deep on four pillars — security, sandboxing, memory (including isolated subagents) and
-adversarial review — and what comes next is an OS sandbox, critics, and subagents that each work in
-their own git worktree, each behind a milestone gate. See [`docs/PLAN.md`](docs/PLAN.md).
+The project goes deep on four pillars: security, sandboxing, memory (including isolated
+subagents) and adversarial review.
 
 ## Project status
 
-M0, M1 and M2 are complete, with their gates green — 350 hermetic Rust tests and 24 TypeScript
-tests, plus three credentialed checks run against a live provider: a real prompt-cache hit through
-OpenRouter, a live edit in a scratch repository, and a real model using the repository index it is
-sent. See [`docs/MILESTONES.md`](docs/MILESTONES.md). CI runs the hermetic gates on every push and the
-credentialed tests on dispatch. M3 — learned memory — is complete with its gate green (486 Rust tests, 67 TypeScript tests) and its
-credentialed check, `live_learned_memory_is_extracted_stored_and_used`, passing against a live provider
-on its second run.
+The agent loop, the daemon, the TUI, the repository index and learned memory have shipped. The OS
+sandbox is in progress on the `sandboxing` branch. [`docs/PLAN.md`](docs/PLAN.md) lists the
+remaining milestones and their gates. Pull requests and `git log` record what each milestone
+shipped. CI runs the hermetic gates on every push and the credentialed tests on dispatch.
 
 ## Quick start
 
@@ -111,8 +105,7 @@ environments may need to permit local socket binding.
 
 Start with the [developer guide](docs/DEVELOPER_GUIDE.md) for crate responsibilities,
 runtime data flow, the wire contract, data models, safety invariants, extension workflows, and
-testing. The [design of record](docs/PLAN.md) describes future milestones; the
-[milestone record](docs/MILESTONES.md) reports what has actually passed its gate.
+testing. The [design of record](docs/PLAN.md) describes the milestones still ahead.
 
 If you are about to edit one crate rather than understand the system, read that crate's own
 `README.md` — each carries its module map, entry points, invariants, and how to test it

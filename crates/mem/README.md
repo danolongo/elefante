@@ -242,8 +242,8 @@ ELEFANTE_DOGFOOD=/path/to/a/copy cargo test -p elefante-mem --test dogfood -- --
 The `dogfood` test indexes a real repository and prints edges, symbols and counts so a human can
 judge whether they are plausible; it is not part of the gate. `tests/common/` holds a hermetic git
 fixture (empty global config, throwaway `HOME`, fixed identities and dates) and a `Tree`/`Live`
-harness — the same discipline that `MILESTONES.md` records learning three times: a test that
-passes only because the developer's machine supplied something is a test that fails in CI.
+harness. A test that passes only because the developer's machine supplied something fails in
+CI.
 
 ## Boundaries
 

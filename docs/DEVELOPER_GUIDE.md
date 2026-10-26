@@ -1,12 +1,14 @@
 # Elefante developer guide
 
 This guide explains the code that exists today, the contracts between crates, and the
-invariants a contributor must preserve. Read [`PLAN.md`](./PLAN.md) for the longer-term
-architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
+invariants a contributor must preserve. Read [`PLAN.md`](./PLAN.md) for the milestones still
+ahead.
 
 ## 1. Current scope
 
-The repository is at M3, plus M3.1 and the memory-facing parts of the pre-rescope M5, M6 and M7 (see `MILESTONES.md`); what comes next is in `PLAN.md` § Milestones: a provider-backed coding loop behind a daemon, driven by either a
+Every milestone through M3.1 has shipped, along with the five-crate consolidation. M4, the OS
+sandbox, is in progress; `PLAN.md` § Milestones lists what comes after it. The repository holds a
+provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
 relevant context and gives the model a search tool, and durable notes learned from conversations.
 The implemented vertical slice can:
@@ -36,7 +38,7 @@ OpenRouter cache hit, the live repository edit, and `live_memory_context_reaches
 proves a real provider accepts the injected message shape and that a real model uses the index it is
 sent. M3's, `live_learned_memory_is_extracted_stored_and_used`, which proves a real provider accepts
 the extraction request, that a real model's reply passes the store's verification, and that the note
-reaches a later prompt, passes against a live provider (it failed once first; see `MILESTONES.md`). CI runs
+reaches a later prompt, passes against a live provider. CI runs
 the hermetic gates on every push and the credentialed tests behind `workflow_dispatch`; see
 `.github/workflows/`.
 
@@ -68,7 +70,7 @@ elefante/
 ├── README.md                      contributor and user entry point
 ├── docs/
 │   ├── PLAN.md                    design of record and milestone gates
-│   ├── MILESTONES.md              completion record
+│   ├── M4_milestone.md            the current milestone's phases and gate tests
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/                     every crate carries its own README.md
     ├── elefante/                  the binary: wire types, daemon, headless client
@@ -1166,9 +1168,12 @@ effects are not statically clear.
 `PLAN.md` is the design of record. Amend it in the same change when implementation teaches
 the project that a recorded decision is wrong. Do not silently make the code and plan disagree.
 
-`MILESTONES.md` is evidence, not a roadmap. Append a completed entry only when the baseline
-and entire gate pass together, including prior milestone gates. Record what shipped, what the
-gate proved, anything deliberately deferred, and any plan amendment.
+A milestone is complete only when its baseline and its entire gate pass together, including
+every earlier gate. A milestone that needs ordered phases gets a working plan in `docs/`, such as
+`M4_milestone.md`. The milestone's closing pull request deletes that plan. Its description states
+what shipped, what the gate proved, and what the milestone deferred. Decisions that outlive the
+milestone move into `PLAN.md` or this guide before the plan goes. Git history keeps the rest; no
+file in `docs/` tracks progress.
 
 When behavior changes, update:
 
@@ -1178,7 +1183,39 @@ When behavior changes, update:
   checkable and also what makes it rot;
 - this developer guide if a public model, interaction, invariant, or workflow changed;
 - the README if setup, user-visible behavior, or project status changed; and
-- the design/milestone documents when their respective contracts require it.
+- `PLAN.md` when a recorded decision changed.
+
+### Commits and pull requests
+
+Work happens on a milestone branch. The author commits there as each fix lands and pushes the
+branch to `origin` for visibility. A pull request opens once the milestone is complete and its
+gate is green.
+
+The subject line reads `type(scope): summary`.
+
+- `type` is one of `feat`, `fix`, `refactor`, `test`, `docs`, `ci`.
+- `scope` names the crate or area: `core`, `guard`, `mem`, `provider`, `elefante`, `tui`. Leave
+  it out when the change spans several.
+- The summary is lower case and imperative, with no final full stop. It says what the change does
+  for the reader, not which files moved.
+
+A short prose paragraph follows one blank line, wrapped at about 72 columns. A fix states what
+went wrong and what the code does now. A feature or refactor states the behavior that changed.
+Leave the body out when the subject says everything. The body has no bullet lists, file
+inventories or test counts.
+
+Commit messages and pull request descriptions never name milestones and carry no attribution
+trailer. A pull request description uses the same voice: what changes and why, then what the
+author verified and what the author did not.
+
+```
+test(srv): keep the turn's end when a withdrawal races it
+
+The interleaving test waited for turn.finished after sending its requests, but
+on a slower machine the event had already been read while waiting for an
+earlier response, so the wait timed out. It now notes the turn's end as it goes
+by and only waits when it has not seen it.
+```
 
 ## 14. Known limitations and next boundaries
 

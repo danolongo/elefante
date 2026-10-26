@@ -1,9 +1,8 @@
 //! Hermetic git fixture builder shared by the `mem` integration tests.
 //!
 //! Every git invocation runs with an empty global/system config, a throwaway `HOME`, and fixed
-//! identities and dates. A test that passed only because the developer's own git config supplied
-//! something is the failure shape `MILESTONES.md` records three times; this builder exists so
-//! that cannot happen here.
+//! identities and dates. A test that passes only because the developer's own git config supplied
+//! something fails in CI. This builder keeps that from happening here.
 
 #![allow(dead_code)]
 

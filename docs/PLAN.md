@@ -1,6 +1,6 @@
 # elefante — lightweight coding harness (Rust core + OpenTUI client)
 
-> **Living document.** This is the design of record. When a decision changes during implementation, amend this file in the same change that implements it — a plan that drifts from the code is worse than no plan. Milestone outcomes are recorded in [`MILESTONES.md`](./MILESTONES.md).
+> **Living document.** This is the design of record. When a decision changes during implementation, amend this file in the same change that implements it — a plan that drifts from the code is worse than no plan.
 
 ## Context
 
@@ -9,7 +9,7 @@ The repo began empty (one README: "a quick modifiable harness for coding"). The 
 | Pillar | Has today | Gets deeper in |
 |---|---|---|
 | **Security** | Path policy, bash classifier, output scrubber, keyed memory rows, consent | M4 (environment, key), M5 (critics), M6 (audit log) |
-| **Sandboxing** | Nothing — the guard reduces blast radius but is not an OS sandbox | M4, then reused by M6 |
+| **Sandboxing** | Nothing — the guard reduces blast radius but is not an OS sandbox | M4, M4.2 (microVM on macOS), M4.3 (microVM on Linux), then reused by M6 |
 | **Memory**, including isolated subagents | Repository index, learned notes, memory in the UI | M6 (shared with subagents), M7 |
 | **Adversarial review** | Nothing | M5, reused by M6 to review a subagent's diff before it merges |
 
@@ -32,7 +32,7 @@ Work that serves none of the pillars is out of scope. What the 2026-10-19 rescop
 
 **We do not begin milestone N+1 until milestone N's gate is green.** If a gate can't be met, the correct responses are to fix it, or to explicitly renegotiate the baseline and write that decision into this file — not to proceed with it failing.
 
-Each milestone ends with a short written record appended to `docs/MILESTONES.md`: what shipped, what the gate proved, and anything deliberately deferred. This is what keeps "incremental" from decaying into "unfinished."
+Each milestone closes with a pull request. Its description states what shipped, what the gate proved, and what the milestone deferred. Git history is the record; no file in `docs/` tracks progress.
 
 ---
 
@@ -43,7 +43,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 | UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | The same split opencode runs in production, so it is a proven shape rather than one invented here. A headless core is also what lets subagents run as further sessions of the same daemon (M6). |
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. |
 | Storage | Project graph in `<repo>/.elefante/`, self-ignoring; user-level keys and consent in `~/.elefante/` | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
-| Isolation | OS sandbox (Seatbelt on macOS, bubblewrap + seccomp on Linux) plus a git worktree per editing subagent | Bubblewrap can mask secrets and protect `.git` inside a writable root; Landlock cannot subtract access once granted. Linux requires bubblewrap and unprivileged user namespaces. Harness write git gains its own sandbox in M4.1. A microVM backend remains a proposal. |
+| Isolation | OS sandbox (Seatbelt on macOS, bubblewrap + seccomp on Linux) plus a git worktree per editing subagent | Bubblewrap can mask secrets and protect `.git` inside a writable root; Landlock cannot subtract access once granted. Linux requires bubblewrap and unprivileged user namespaces. Harness write git gains its own sandbox in M4.1. An opt-in libkrun microVM backend follows: macOS (Hypervisor.framework) in M4.2, then Linux (KVM) in M4.3. It gives bash its own kernel. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |
 | Provider | OpenRouter only | One transport, one auth, one code path. Reaching Claude via `anthropic/claude-opus-5` means this narrows the *code*, not the *models*. `Capabilities` survives and matters more, now resolved per model. |
 
@@ -55,9 +55,8 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 elefante/
   Cargo.toml                 # workspace
   docs/PLAN.md               # this document
-  docs/MILESTONES.md         # per-milestone completion record
+  docs/M4_milestone.md       # the current milestone's phases and gate tests
   docs/DEVELOPER_GUIDE.md    # shipped behaviour, incl. the wire contract (§5)
-  docs/LOCKFILE.md           # why tui/ commits exactly one lockfile
   crates/
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
     guard/                   # PathPolicy, BashClassifier, Scrubber; sandbox policy (M4)
@@ -79,7 +78,7 @@ provider ──► (nothing)
 
 `guard` must never depend on `core`, `mem` or `provider`. The practical consequence: `guard` is pure policy — it decides, it never performs. This is what makes the whole gate layer unit-testable without a filesystem or a network. Critics need a model, so they live in `core` (M5), not in `guard`: `mem` depends on `guard`, and a `guard → provider` edge would pull the HTTP stack into the memory crate.
 
-Five crates, after the consolidation (§ Milestones › Consolidation): eight was more seams than the pillars need. `tools` became `core::tools`; `rpc`, `srv` and `cli` became one `elefante` crate and one binary. Client and daemon now share a crate, so one rule the old graph enforced is now a rule of review: **the client never runs a turn** — it always goes through the socket.
+Five crates, after the consolidation (§ Milestones › Shipped): eight was more seams than the pillars need. `tools` became `core::tools`; `rpc`, `srv` and `cli` became one `elefante` crate and one binary. Client and daemon now share a crate, so one rule the old graph enforced is now a rule of review: **the client never runs a turn** — it always goes through the socket.
 
 Key crates: `tokio 1.53`, `reqwest 0.13`, `rusqlite 0.40` (bundled + FTS5), `tree-sitter 0.27` (+ `tree-sitter-bash`), `blake3 1.8`, `moka 0.12`, `ignore`, `serde`/`serde_json`.
 
@@ -530,155 +529,25 @@ and M6 adds `agent`, the ninth. Every tool is permanent prompt cost, so the bar 
 
 Each has a **Baseline** (what must exist) and a **Gate** (what must pass before the next milestone starts).
 
-### M0 — Loop
+### Shipped
 
-**Baseline.** Workspace skeleton. `Provider` trait + `Capabilities` + a single OpenRouter impl (OpenAI-compatible SSE, per-model capability resolution, `reasoning` control and verbatim replay, `tool_calls` normalization, prompt caching where the upstream supports it). Transport-generic SSE decoder in its own module. Agent loop with the seven tools, plain stdout, no TUI. **`PathPolicy` and the deterministic half of the bash classifier ship here** — an ungated bash tool should never exist, even in a prototype.
+These milestones have shipped. Their gates now live in the test suite, and every later gate keeps
+them green. Pull requests and `git log` hold the detail.
 
-*The Anthropic impl was written first and then removed.* Doing this inside M0 rather than later matters because **M1 puts the neutral types on the RPC wire**; changing them after M1 would mean revising a published protocol instead of a private enum.
+| Milestone | What shipped |
+|---|---|
+| M0 — Loop | `Provider` trait, OpenRouter transport, the agent loop, seven tools, `PathPolicy`, bash classifier, scrubber |
+| M1 — Daemon + TUI | JSON-RPC daemon on a unix socket, headless client, OpenTUI client, attach and resume, approvals, first-run key setup |
+| M2 — Repo cache + mechanical graph | blake3 walk cache, tree-sitter symbols, import and co-change edges, FTS5 + graph-hop retrieval, `memory_search` |
+| M3 — Learned memory | Learned notes with verification, speaker provenance, dedupe, supersession and keyed rows; `elefante memory` |
+| M3.1 — Hardening and consent | `display_safe`, store stamp checks, `LearnMode { Off, Ask, On }` with consent bound to the extractor model |
+| Pre-rescope memory UI | `memory.status`, `memory.context`, the `/memory` panel, `/forget <id>`, headless `memory:` lines |
+| Consolidation | Eight crates became five and one `elefante` binary; the stub provider exists only in debug builds |
 
-The decision it forced, now settled: reasoning blocks are stored **verbatim as opaque JSON** (`ReasoningDetail { kind, raw }`), not parsed into typed variants. OpenRouter's replay rule requires the block sequence to return unmodified and unreordered, so an unknown future `reasoning.*` type must round-trip — a typed enum would silently violate the rule rather than erroring.
-
-**Gate.**
-- Bash classifier fixture table: commands → expected `Allow`/`Deny`/`Escalate`, including compound commands (`ls && rm -rf /` must classify as the `rm`), pipes, subshells, and command substitution. Includes obfuscation cases asserted as **known-not-caught**, so the test documents the limit rather than implying coverage.
-- `PathPolicy` canonicalization: `./x/../.env`, a symlink pointing at `.env`, `.env.local`, and a grep whose *pattern* would match secret content — all denied.
-- Secret fixture: an `.env` containing an `sk-ant-`-shaped string. Read, glob, and grep all deny; `cat .env` is gated; the scrubber redacts it from a bash result that reaches it another way.
-- Cache: `usage.prompt_tokens_details.cached_tokens > 0` on the second identical request of a session — zero means a silent invalidator. Hermetic fixture proves parsing; the live check stays credentialed and separate.
-- Requests carry name-sorted tools with stable key order — an unsorted tool list silently invalidates the cache every turn, which is exactly the bug this catches.
-- A model that does not declare reasoning support receives no `reasoning` field at all.
-- Streaming edge cases: frames split mid-boundary, mixed line endings, `: OPENROUTER PROCESSING` keep-alives ignored, `data: [DONE]` terminates, unknown future event types ignored.
-- `delta.tool_calls[]` accumulate by **array index** — `id`/`name` on the first fragment only, `arguments` concatenated then parsed. Malformed accumulated JSON is a hard error, never a silent `{}`.
-- `reasoning_details` round-trips byte-identical through a tool continuation.
-- Two parallel `tool_calls` produce two consecutive `{role:"tool"}` messages in call order.
-- An unrecognised model slug yields all-false capabilities and a request carrying no `reasoning` field.
-- No request carries a field the resolved model does not declare — no `reasoning`, no `cache_control`.
-- Every request carrying `tools` also carries `provider: {require_parameters: true}`, and a request with no tools does not. Without it an endpoint may silently drop `tools`, and the loop then finds no tool calls and stops after one round — the agent does nothing while appearing to work.
-- `openrouter/auto` (and `openrouter/auto-beta`, by prefix) resolves to reasoning and structured output but **not** caching: the catalogue declares `reasoning`/`reasoning_effort`/`structured_outputs` for that slug, and its pricing carries no `input_cache_read`, so caching is unknown rather than absent and no breakpoint is sent on a guess.
-- A missing `OPENROUTER_API_KEY` produces a named, graceful error rather than a transport failure.
-- End-to-end: run against this repo, request a trivial edit, confirm the tool loop completes and the edit lands.
-
-### M1 — Daemon + TUI
-
-**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. The CLI stops running the loop in process and becomes a client — one-shot prompts use a headless client, which doubles as the daemon's test harness. **First-run key setup** rides on the same channel.
-
-Shipped. The wire contract now lives in [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5, and the gate that proved it is recorded in [`MILESTONES.md`](./MILESTONES.md); the items below are the summary. The contract was drafted as two documents — core types first, then the wire derived from them — because an adversarial review found the reverse order had produced four blocking defects. Both were retired once the code carried the same information.
-
-M1 also lands three things M0 left as design rather than code: `guard::check` moves from `tools` into `core`'s dispatch so approval has somewhere to suspend, dispatch becomes a `JoinSet` so an interrupt can keep completed tool results, and `run_agent_loop` becomes a `Session` that owns history across turns.
-
-The headless client splits streams: **`stdout` is the answer, `stderr` is reasoning, tool activity, and errors.** Issue #4 recorded the current CLI rendering reasoning and answer through one match arm, producing an undelimited wall of prose. Splitting by stream removes that class of bug by construction — a redirected `stdout` has no reasoning in it to distinguish — rather than relying on formatting to keep them apart.
-
-**Gate.**
-- Kill and reconnect a client mid-turn: `session.attach` replays state and the turn completes with output intact.
-- Two clients attached to one session both render the same stream.
-- Interrupt cancels in-flight tools, and already-completed tool results still appear in history (no `tool_use_id` desync — assert the next request does not 400).
-- Socket is mode `0600`; daemon exits after idle timeout with zero clients.
-- First launch with no key resolvable prompts for one, stores it under `~/.elefante/` at mode `0600`, and never writes it into a working tree. An already-set `OPENROUTER_API_KEY` wins over the stored value.
-- A model that reasons at length while emitting no renderable text does not present as a frozen UI — the failure the old `thinking.display` note warned about.
-- **M0 gate still green.**
-
-### M2 — Repo cache + mechanical graph
-
-**Baseline.** Schema design pass first. Walk + blake3 cache, tree-sitter symbols, import edges, git co-change edges, repo brief, FTS5 + graph-hop retrieval injected per turn, and a working `memory_search`.
-
-**Gate.**
-- Warm start: second launch on an unchanged repo performs **zero** tree-sitter invocations (asserted by counter, not by timing).
-- Touching one file re-parses exactly one file and bumps `repo_generation` once.
-- `co_edited_with` weights match a hand-computed expectation on a fixture repo with known commit history.
-- A prompt issued before indexing completes returns a `partial: true` memory block and does not block.
-- Retrieval respects the 1500-token budget under an adversarially large graph.
-- Editing a file leaves its node id, and the ids of its unchanged symbols, intact.
-- Deleting `cache.db` or `memory.db` converges on an identical graph — the latter with zero parses — and a crash between the graph commit and the cache write converges too, edges included.
-- No secret fixture string survives in any row or in the raw bytes of any file under `.elefante/`; `git status` is clean after a session and at a mid-index kill; files are `0600`, the directory `0700`.
-- Hostile repository text cannot close or forge the injected envelope; no request carries a `system` message other than the configured prompt; the block is absent from history and from the next turn's request.
-- FTS-hostile prompts never error; a session in a subdirectory sees only its subtree; history before a rename counts for the renamed file; a non-repository indexes fully with no co-change.
-- N concurrent refresh requests collapse to at most two runs and none blocks.
-- `ELEFANTE_MEMORY=0` creates no `.elefante/` and adds no context.
-- Golden retrievals: a fixture repository's queries find the expected file in the top three.
-- **M0–M1 gates still green**, and the MSRV check passes with the new dependencies.
-- *Credentialed:* a real model, given `--max-rounds 1`, names a function it can only know from the index it was sent.
-
-### M3 — Learned memory
-
-**Baseline.** Learned notes (`preference`, `convention`, `decision`, `fact`) in the project graph;
-incremental extraction behind a gate with a watermark; verification, provenance by speaker, hybrid
-dedupe and supersession; keyed integrity for stores and rows; read-time decay and compaction; a
-separate `<repo-memory>` section in retrieval; and `elefante memory list | forget | approve | clear`.
-Deferred from the original baseline: the user-level graph (since cut) and transcript compaction (M7)
-— M3 ships the seam (`Learner::flush`, and a watermark that only shrinks after a commit), so whatever a
-future compactor drops has already been read.
-
-**Gate.**
-- `git status` is clean after a full session in a test repo.
-- The same fact stated twice, in reordered or paraphrased words, is one note with raised confidence;
-  a paraphrase merges only on a verified model verdict.
-- A contradicting fact, in the user's own words, supersedes the old note; retrieval returns the survivor.
-- No row and no byte under `.elefante/` contains the `sk-ant-` fixture after a session that touched it.
-- Extract incrementally, truncate the history, and a fact from the dropped region is still retrievable.
-- A store a repository shipped, a version-1 store, and a row with a bad or missing MAC render nothing.
-- The extractor's captured request contains no tool result, tool call or reasoning; an assistant-only
-  claim is `pending` and never shown; a quote not in the conversation is refused.
-- A note cannot close its envelope; the learned section is ≤ 400 and the block ≤ 1,500 estimated tokens;
-  with nothing learned the block is byte-identical to code-only retrieval.
-- `ELEFANTE_LEARN=0` and `ELEFANTE_MEMORY=0` each make zero extractor requests.
-- **M0–M2 gates still green.**
-- **Credentialed, once:** `live_learned_memory_is_extracted_stored_and_used`.
-
-### M3.1 — Learned-memory hardening and consent
-
-**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)). Follow-up to M3. It fixes two defects
-found in the merged code and changes one default.
-
-**Baseline.** `learn::display_safe` (Unicode categories Cc, Cf, Zl, Zp) applied at ingest and to every
-column the CLI prints; `elefante memory list` verifies the store's stamp; the learner clears its failure
-state on success. `ELEFANTE_LEARN` becomes `LearnMode { Off, Ask, On }` with **unset meaning Ask**: the
-TUI asks once at launch (Y/N, no default, `Esc` asks later), the answer is stored beside the credentials
-with a keyed stamp and is bound to the extractor model, and until it is given the daemon reads and keeps
-nothing. `elefante memory learn on|off` answers headlessly; `memory.consent` and an additive
-`memory: { consent, extractor }` field on the create/attach results carry it.
-
-**Gate.**
-- No note, stored or displayed, holds a control or formatting character in any column; an unstamped
-  store prints nothing.
-- No extractor request is made before consent, on any client; the answer persists, is bound to the
-  extractor, is tamper-evident, and `ELEFANTE_LEARN` overrides it.
-- An old client ignores the new result field; a new client against a result without it shows no modal.
-- Nothing but the launch-time modal opens an overlay or takes focus; with consent granted the screen is
-  byte-identical to today's.
-- **M0–M3 gates still green.**
-
-### Shipped before the rescope
-
-The memory-facing parts of the old M5, M6 and M7 shipped on 2026-10-11 and stay part of the baseline
-every later gate must keep green (records in [`MILESTONES.md`](./MILESTONES.md), under "pre-rescope"):
-`MemoryStatus` and the `memory.status` event, lenient clients on both parsers, `View::emit_session`,
-one session cost including memory spend; `InjectedContext`, `memory.context` and `memory_note_ids`
-on turns; `memory.learned`, `memory.list | forget | approve | clear | status` keyed by `cwd`, the
-`/memory` panel and `/forget <id>` in the TUI, and the headless stderr lines. Everything else those
-milestones planned was cut (§ Cut in the rescope) or moved into M4–M7 below.
-
-### Consolidation (before M4)
-
-**Implemented** (record in [`MILESTONES.md`](./MILESTONES.md)).
-
-**Baseline.** Eight crates become five. `tools` moves into `core` as `core::tools`. `rpc`, `srv` and
-`cli` become one `elefante` crate and one binary: `wire/`, `daemon/` and `client/` modules, with
-`elefante daemon` in place of `elefante-srv`, and a client that starts the daemon by running its own
-executable rather than looking for a sibling binary. `elefante memory` goes through the daemon only,
-starting one if needed; the direct-store path and the "older daemon" fallbacks are deleted. A daemon
-that answers "method not found" is named as an older build, with how to stop it, and nothing is
-worked around. (A `version` field on create/attach was planned for this and dropped: every crate is
-version 0.1.0, so it would have detected nothing.) The scripted stub provider is compiled only into
-debug builds. No behaviour visible to the model or the TUI changes.
-
-**Gate.**
-- `cargo metadata --no-deps` lists exactly `elefante`, `elefante-core`, `elefante-guard`,
-  `elefante-mem`, `elefante-provider`.
-- No test is lost: the direct-mode `elefante memory` tests run through the binary and a daemon it
-  starts, so the gate items they carried (hostile rows sanitised, an unstamped store shows nothing,
-  consent per extractor) still hold.
-- With no daemon running, a one-shot prompt and every `elefante memory` subcommand start one and work.
-- A daemon that lacks a method is named as an older build, and nothing is written around it.
-- A release build contains no `ELEFANTE_STUB_PROVIDER`.
-- **M0–M3 gates still green**, credentialed ones included, since the client and daemon paths moved.
+`cargo test --workspace` and `bun test` run the hermetic gates. The credentialed gates are
+`live_second_identical_request_reads_prompt_cache`, `live_edit_lands_in_a_scratch_repository`,
+`live_memory_context_reaches_the_model` and `live_learned_memory_is_extracted_stored_and_used`;
+`.github/workflows/credentialed.yml` runs them.
 
 ### M4 — Sandbox
 
@@ -691,8 +560,8 @@ classes). M4 moves enforcement to the operating system and lets the classifier g
 **Threat model.** A prompt-injected model choosing tool calls. M4 keeps shell commands inside a
 rooted OS sandbox, without the daemon's key or access to the daemon socket. The harness controls
 git writes and web research. Code the user later chooses to run outside elefante — builds, IDE
-tasks and hook managers — is outside this guarantee. Kernel exploits are also outside it; a
-microVM backend is a proposal.
+tasks and hook managers — is outside this guarantee. Kernel exploits are also outside it; the
+opt-in microVM backend of M4.2 (macOS) and M4.3 (Linux) addresses them.
 
 **The key never enters the sandbox.** The model runs at OpenRouter and every request comes from the
 daemon, which is not sandboxed. Sandboxed processes run model-chosen commands and never need the key,
@@ -831,11 +700,8 @@ that phase can pass its gate.
   specified and tested.
 - **A per-domain egress proxy**, so an approved command reaches only named hosts. On Linux this needs a
   controlled network path rather than the host network namespace.
-- **A microVM backend on macOS** (Apple `container`, which targets macOS 26, or Docker Sandboxes)
-  behind a `Backend` trait that M4 shapes but does not implement. It isolates the kernel too, and is
-  the fallback if Apple removes `sandbox-exec`. gVisor was considered and not chosen: Linux only, so on
-  a Mac it needs Docker Desktop's VM, builds a Linux toolchain rather than the one shipped, and Docker's
-  privileged daemon is itself a known way out.
+
+The microVM backend, formerly a proposal here, is required work: M4.2 and M4.3.
 
 **Gate.** The detailed positive and negative controls are in `M4_milestone.md`. They prove the
 old classifier harness-state bypasses fail at the OS, outside paths and secrets stay hidden,
@@ -847,6 +713,10 @@ The socket gate uses a fake home and synthetic runtime/override sockets; the `/r
 pure no-broad-mount assertion plus runtime outside/abstract-socket controls, because CI does not
 guarantee a writable `/run` location for a listener. This retains the service boundary without
 opening or disturbing the real daemon socket.
+The current macOS profile's Keychain, clipboard, app-launch, launchd and Apple Event controls
+run only in a dedicated disposable macOS CI job with synthetic fixtures, not on the maintainer's
+machine. The job invokes explicitly ignored tests; if the runner lacks a required GUI service,
+the gate fails with a setup reason and is reported rather than silently skipped.
 Sandbox tests fail with setup instructions if the sandbox is missing, and each negative test has
 a positive control. Both macOS and Linux CI legs, MSRV, TUI checks and **all M0–M3 gates** must
 be green before M4.1 starts. Credentialed tests are run separately by the maintainer at the end
@@ -863,6 +733,80 @@ exact per-subcommand allowlist remains as a second line of defence.
 `--output=$HOME/x`, `--no-index ~/.ssh/f` and `merge -s evil`; the OS still blocks them. A
 normal commit and rebase continue to work. M4 and earlier gates remain green on both operating
 systems before the milestone is recorded.
+
+### M4.2 — MicroVM backend on macOS
+
+Seatbelt and bubblewrap share the host kernel, so a kernel exploit escapes them. M4.2 runs bash
+in a Linux microVM with its own kernel, using libkrun: a Rust VMM library on Hypervisor.framework
+(Apple silicon) and on KVM, so M4.3 reuses the same backend on Linux. It is also the fallback if
+Apple removes `sandbox-exec`.
+
+Considered and not chosen:
+- **Apple `container`.** It is macOS 26 only and macOS only, so Linux would need a second
+  backend. Its CLI also gives less control over shares and network devices.
+- **gVisor.** Linux only, so on a Mac it needs Docker Desktop's VM, and Docker's privileged
+  daemon is itself a known way out.
+- **Firecracker.** It needs KVM and has no macOS port.
+
+**Opt-in for now.** Seatbelt stays the macOS default; `ELEFANTE_SANDBOX=microvm` selects the VM,
+and the status line shows it. **The microVM should become the macOS default in the near future**,
+once M4.2's measurements show its start-up cost and the Linux toolchain are acceptable for
+everyday use.
+
+**What moves into the VM.** Only a bash call and everything it starts. The daemon, the key, the
+TUI, the file tools, harness git, the indexer and `web_search` stay on the host. Inside the guest,
+commands build and run Linux tools, so `cargo build` there produces Linux binaries.
+
+**Baseline.** Design pass first, with a spike. Its results go into the milestone file before any
+phase begins.
+- **A `Backend` seam** in `core` with Seatbelt, bubblewrap and the microVM behind it, selected by
+  the daemon's configuration only, never by the workspace.
+- **libkrun never runs in the daemon.** It runs in the process that links it, so a VM escape
+  inside the daemon would land beside the key. A separate VM-runner child links it, receives no
+  key, and itself runs under Seatbelt with only the shares it serves.
+- **A pinned stable libkrun branch.** `main` is an unstable 2.0. The runner is signed with the
+  hypervisor entitlement that Hypervisor.framework requires.
+- **We own the guest:** kernel, root filesystem with the Linux toolchain, and a minimal init.
+- **The same `Policy`.** Network off attaches no network device at all; libkrun's socket
+  forwarding (TSI) uses the runner's host network, so it is never enabled for an off call.
+  Approved network gives the guest outbound access for that one call. The key never enters the
+  guest; the environment is the same allowlist. Timeouts stop the command and the VM.
+- **Bubblewrap and seccomp inside the guest**, as the second layer, so the M4 rules still hold
+  when the VM boundary is not the one under test.
+- **Fail closed.** If the microVM is selected but unavailable (unsupported macOS, Intel Mac,
+  libkrun or the guest image missing), bash does not run and the error names why. It never
+  silently falls back to Seatbelt.
+
+**Open for the design pass (spike questions):**
+- libkrun's minimum macOS version on the pinned branch.
+- Cold and warm start time per call and per session; whether one VM per session is needed to
+  keep calls fast.
+- Can the virtio-fs shares keep `.git` read-only and secrets and `.elefante` absent at the host
+  side, not only inside the guest?
+- How the guest kernel and image are built, versioned and kept small.
+- Shared-folder speed for `cargo test` and `bun test` on this repository.
+- Linux build output must not clobber the host's: `target/` and native `node_modules` need a
+  guest-private location.
+- Does a GitHub-hosted macOS runner, itself a VM, support Hypervisor.framework guests? If not,
+  where the gate runs.
+
+**Gate.**
+- Inside the VM, `uname -s` is Linux and host processes are invisible.
+- The M4 negative controls pass with the microVM backend: outside paths and secrets hidden, `.git`
+  read-only, network off and approved differ, the daemon socket refuses without the token, the
+  timeout kills the command.
+- Selecting the microVM where it is unavailable fails closed with a setup reason.
+- With the microVM not selected, Seatbelt behaves exactly as in M4.
+- **M0–M4.1 gates still green.**
+
+### M4.3 — MicroVM backend on Linux
+
+**Baseline.** The M4.2 libkrun backend on Linux over KVM, opt-in on the same setting, behind the
+same `Backend` seam, with the same runner process, fail-closed rule and gate. The runner process
+is confined by bubblewrap and seccomp instead of Seatbelt. The design pass confirms `/dev/kvm` on
+the CI runner.
+
+**Gate.** M4.2's gate on Linux, and **M0–M4.2 gates still green.**
 
 ### M5 — Critics
 
@@ -954,7 +898,7 @@ plainer wording.
 - A note anchored to a renamed file still links to it.
 - The learner's held text stays under its cap across a long scripted session.
 - After compaction, a fact from the dropped history is still retrievable.
-- The measurement's results are recorded in `MILESTONES.md`.
+- M7's pull request states the measurement's results.
 - **M0–M6 gates still green.**
 
 ---

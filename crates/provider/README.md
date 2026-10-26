@@ -8,10 +8,10 @@ message model and one event stream no matter what is on the other end.
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/lib.rs` | 305 | The `Provider` trait and every normalized type: `Request`, `Message`, `ContentBlock`, `Event`, `Usage`, `StopReason`, `Capabilities`. |
+| `src/lib.rs` | 327 | The `Provider` trait and every normalized type: `Request`, `Message`, `ContentBlock`, `Event`, `Usage`, `StopReason`, `Capabilities`. |
 | `src/sse.rs` | 103 | Transport-generic Server-Sent Events decoder. Knows nothing about any provider. |
-| `src/openrouter.rs` | 598 | The crate's only transport: `POST {base}/chat/completions`, driving the decoder and mapping wire chunks back to normalized events. |
-| `src/openrouter/tests.rs` | 878 | Tests for that transport — larger than the transport itself, and the only `src/<module>/` subdirectory in the workspace. |
+| `src/openrouter.rs` | 618 | The crate's only transport: `POST {base}/chat/completions`, driving the decoder and mapping wire chunks back to normalized events. |
+| `src/openrouter/tests.rs` | 983 | Tests for that transport — larger than the transport itself, and the only `src/<module>/` subdirectory in the workspace. |
 
 The split matters: `sse.rs` handles what byte-oriented HTTP streams get wrong — frames split
 across chunk boundaries, mixed CRLF and LF, multi-line `data:` payloads, comment keep-alives —
@@ -37,6 +37,13 @@ as a strict `response_format` — with `provider.require_parameters`, so an endp
 it is not used — only to a model that declares `structured_output`; for any other it is omitted and
 the caller's prompt must ask for JSON. A schema is a request, not a guarantee: callers validate the
 reply either way. A request without one serialises exactly as it did before the field existed.
+
+`Request::web_search` asks for web grounding: `Some(WebSearch { max_results })`. The OpenRouter
+transport sends it as `plugins: [{ id: "web", engine: "exa", max_results }]`. The transport pins
+Exa, so a model's native search engine never fetches a URL named in a query. Callers validate
+`max_results` first. A request with `web_search: None` serialises with no `plugins` field. The
+daemon's `web_search` backend is the only caller: it sends one such request per search, with no
+tools.
 
 `Provider` is deliberately two methods — `capabilities` and `stream`. It is object-safe and
 `Send + Sync`, so `core` holds it behind a trait object and the daemon can swap in a stub.
@@ -71,17 +78,20 @@ slugs: an unknown model must not silently receive fields it cannot handle. `DEVE
 ## Testing
 
 ```sh
-cargo test -p elefante-provider                          # 23 hermetic
-cargo test -p elefante-provider -- --ignored --nocapture  # 1 credentialed, billable
+cargo test -p elefante-provider                                # 27 hermetic
+cargo test -p elefante-provider --lib -- --ignored --nocapture  # the credentialed cache check
 ```
 
-24 tests total. `src/openrouter/tests.rs` holds 21 and drives a loopback mock HTTP server, which
+29 tests total. `src/openrouter/tests.rs` holds 25 and drives a loopback mock HTTP server, which
 is why `tokio`'s `net` feature is a dev-dependency. `tests/sse.rs` holds 3 covering the decoder
 in isolation.
 
-One test is `#[ignore]`d — `live_second_identical_request_reads_prompt_cache` needs real
-credentials, network, and billable requests. It bounds itself to 64 output tokens and runs in CI
-through `.github/workflows/credentialed.yml`, not on push.
+Two tests are `#[ignore]`d, and both need real credentials, network, and billable requests:
+
+- `live_second_identical_request_reads_prompt_cache` bounds itself to 64 output tokens.
+  `.github/workflows/credentialed.yml` runs it on manual dispatch, through `--lib`.
+- `live_s9_exa_web_plugin` (`tests/s9_web_plugin.rs`) probes the web plugin's wire format with one
+  Exa and model request. Only the maintainer runs it, by hand; no workflow does.
 
 ## Boundaries
 

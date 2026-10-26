@@ -13,19 +13,20 @@ boundaries below are the old crate boundaries and keep their rules.
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/main.rs` | 533 | The binary: argument and environment parsing, `elefante daemon`, starting a daemon and waiting for it, the socket client, the session lifecycle, `elefante memory`, the TUI launch. |
+| `src/main.rs` | 565 | The binary: argument and environment parsing, `elefante daemon`, starting a daemon and waiting for it, the socket client and its `auth` handshake, the session lifecycle, `elefante memory`, the TUI launch. |
 | `src/lib.rs` | 9 | `pub mod client; pub mod daemon; pub mod wire;` |
 | `src/wire/mod.rs` | 14 | Glob re-exports and the two capacity constants. |
 | `src/wire/framing.rs` | 124 | NDJSON encode/decode, `FrameDecoder`, preview truncation. |
-| `src/wire/notification.rs` | 352 | `Notification`, `NotificationEvent` (hand-written `Deserialize`, `Unknown`), and `Sequence` with its coalescing rule. |
-| `src/wire/request.rs` | 352 | `Request`, `Method`, `Response`, the error codes, and the memory types: `MemoryStatus`, `MemorySeed`, `MemoryNote`, `MemoryRow`, `MemoryChange`, the consent and learning enums. |
-| `src/wire/snapshot.rs` | 76 | `AttachResult` (both kinds carry optional `memory`), `SessionSnapshot`, `CompletedTurn` and `ActiveTurn` (with `memory_note_ids`), `ToolStatus`. |
-| `src/daemon/mod.rs` | 13 | Module declarations, re-exports, three capacity constants. |
-| `src/daemon/server.rs` | 2105 | **The largest file in the workspace.** Listener, session registry, ring buffer, method dispatch, turn driving, memory and consent. |
+| `src/wire/notification.rs` | 363 | `Notification`, `NotificationEvent` (hand-written `Deserialize`, `Unknown`), and `Sequence` with its coalescing rule. |
+| `src/wire/request.rs` | 372 | `Request`, `Method`, `Response`, the error codes (including `UNAUTHORIZED`), `SandboxStatus` and `SandboxState`, and the memory types: `MemoryStatus`, `MemorySeed`, `MemoryNote`, `MemoryRow`, `MemoryChange`, the consent and learning enums. |
+| `src/wire/snapshot.rs` | 85 | `AttachResult` (both kinds carry optional `memory` and `sandbox`), `SessionSnapshot` (with optional `sandbox`), `CompletedTurn` and `ActiveTurn` (with `memory_note_ids`), `PendingApproval` (with `network`), `ToolStatus`. |
+| `src/daemon/mod.rs` | 14 | Module declarations, re-exports, three capacity constants. |
+| `src/daemon/server.rs` | 2442 | **The largest file in the workspace.** Listener and token, `auth`, session registry, ring buffer, method dispatch, turn driving, memory and consent, sandbox status and the git identity. |
+| `src/daemon/search.rs` | 208 | `ProviderSearch`, the `web_search` backend, and `search_model`. |
 | `src/daemon/queue.rs` | 300 | `ClientQueue` — per-client delivery with coalescing and eviction. |
-| `src/daemon/stub.rs` | 263 | `StubProvider`, the scripted fake the tests use. **Compiled into debug builds only.** |
-| `src/daemon/credentials.rs` | 95 | `0700` directories and `0600` files for the socket and stored key. |
-| `src/client/mod.rs` | 177 | `StreamRenderer`, one per output stream. |
+| `src/daemon/stub.rs` | 264 | `StubProvider`, the scripted fake the tests use. **Compiled into debug builds only.** |
+| `src/daemon/credentials.rs` | 105 | `0700` directories and `0600` files, written by rename, for the socket, the token and the stored key. |
+| `src/client/mod.rs` | 228 | `StreamRenderer`, one per output stream, and `sandbox_warning`. |
 | `src/client/memory.rs` | 218 | `elefante memory`: argument parsing (`parse`), the consent request, and rendering daemon results. |
 
 `server.rs` is the obvious first split: the listener, the registry and the dispatch table are three
@@ -151,6 +152,23 @@ there are no clients *and* no active turns.
 umask and there is no safe API to bind with an explicit mode; `credentials.rs` also rejects a
 symlinked directory rather than following it.
 
+**Every connection authenticates first.** At start the daemon draws a 128-bit token. The starter
+that holds the socket directory's lock writes it to `token` beside the socket (`0600`, by rename),
+then binds. The first request on a connection must be `auth { token }`. `same_token` compares
+every byte, and a mismatch gets `UNAUTHORIZED` (`-32008`) before the daemon closes the connection.
+
+**The daemon settles the sandbox state before any client connects.** At start the daemon removes stale
+sandbox temp directories, calls `elefante_core::sandbox::probe` once and prints an `Unavailable`
+reason to stderr. It also reads the user's git identity once. Each `session.create` builds the
+session's `ToolExecutor`, attaches the identity (without one the gate denies harness git writes)
+and attaches `ProviderSearch`. The create and attach results and the snapshot report the state as
+`sandbox: { state, detail }`.
+
+**`web_search` runs on the provider.** `ProviderSearch` sends one request per search with
+`Request::web_search` set and no tools, on `ELEFANTE_SEARCH_MODEL` or else the session's model. It
+reads the provider at each search, so a key set after the session started still works. Its usage,
+including a failed search's, joins the turn's usage at `turn.finished`.
+
 ### Client (`client/`, `main.rs`)
 
 **The client never runs a turn.** It talks to the daemon over the socket, which is what makes
@@ -165,6 +183,13 @@ stream by `is_terminal()`.
 captures the daemon's stderr on a reader thread, so a daemon that dies during startup reports *why*
 rather than timing out.
 
+**Every connection sends `auth` first.** The client reads the token beside the socket. It retries
+for up to 2 seconds while a starting daemon writes the file, and sends an empty token when none
+appears.
+A daemon that answers `-32601` predates the token; the client names it as an older daemon, with how
+to stop it. After `session.create` the client prints one warning line to stderr when `sandbox` is
+`off` or `unavailable`.
+
 **With no key and a non-TTY stdin the client exits non-zero and does not prompt.** A prompt written
 to a pipe is a hang. With a TTY it reads the key and sends `key.set`.
 
@@ -176,9 +201,10 @@ text.
 **Headless mode denies every escalated command** by answering `approval.requested` with `deny` at
 once: a one-shot cannot ask you. Use the TUI when a task needs approvals.
 
-**The environment that counts is the daemon's.** `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`,
-`ELEFANTE_IDLE_SECS`, `ELEFANTE_MEMORY` and `ELEFANTE_LEARN` are read once, when the daemon starts —
-from the environment of whichever client started it — and a running daemon is reused as-is.
+**The environment that counts is the daemon's.** The daemon reads `OPENROUTER_API_KEY`,
+`OPENROUTER_BASE_URL`, `ELEFANTE_IDLE_SECS`, `ELEFANTE_MEMORY`, `ELEFANTE_LEARN` and
+`ELEFANTE_SANDBOX` once, when it starts, from the environment of whichever client started it. A
+client reuses a running daemon as-is. It reads `ELEFANTE_SEARCH_MODEL` at each `session.create`.
 `--model`, `--effort`, `--max-rounds` and `--max-tokens` travel in `session.create`.
 
 ## Testing
@@ -192,13 +218,14 @@ cargo test -p elefante -- --ignored --nocapture   # 3 credentialed, billable
 |---|---:|---|
 | `tests/wire.rs` | 10 | Every request, response, notification and snapshot shape, the memory methods and events, and that an unknown method parses but cannot be serialised. |
 | `tests/framing.rs` | 3 | Frames split across chunks, oversized lines, escaped newlines inside strings. |
-| `tests/daemon.rs` | 15 | The real daemon over a real socket: resume, fanout, interrupt, approval, lifecycle. |
+| `tests/daemon.rs` | 17 | The real daemon over a real socket: resume, fanout, interrupt, approval, lifecycle, the token handshake and a client that arrives during startup. |
 | `tests/daemon_memory.rs` | 8 | The repository index through the daemon: what a model is sent, `memory_search`, a subdirectory's scope, edits between turns, memory off writes nothing. |
 | `tests/learn.rs` | 27 | Learning end to end through a scripted extractor; consent (nothing read before an answer, persistence, extractor binding, tampering, operator modes, revocation); the memory status and events; `memory.*` by `cwd`. |
 | `tests/cli_memory.rs` | 13 | `elefante memory` through the real binary and a daemon it starts: listing, approve, forget, clear, tampered and hostile rows, an unstamped store, argument errors before any daemon, consent per extractor model. |
-| `tests/client.rs` | 8 | The socket client against a scripted peer, a daemon that fails to start, `elefante daemon` in the foreground, and a daemon from an older build. |
+| `tests/client.rs` | 11 | The socket client against a scripted peer, a daemon that fails to start, `elefante daemon` in the foreground, a daemon from an older build or without the token, a token the daemon is still writing, and a refused token. |
 | `tests/renderer.rs` | 13 | Channel transitions, newline discipline and the `memory:` lines. |
 | `tests/cli.rs` | 7 | Startup failures named, not transport noise; 3 are credentialed and `#[ignore]`d. |
+| `tests/sandbox.rs` | 1 | End to end through the real binary with a fake `HOME`: a scripted tool call cannot read an SSH key fixture through the file tools or the sandboxed shell. |
 
 The credentialed tests run in a `tempfile` directory so a model that misreads its instruction cannot
 touch tracked files, and bound themselves with `--max-tokens 2048 --effort low`:

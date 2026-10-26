@@ -264,10 +264,9 @@ Clone-flag masks are added only if S1 shows `--disable-userns` is unavailable.
   `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`.
 - Nothing else ever, including `OPENROUTER_API_KEY`.
 
-**Binaries.** `bash`, `git` and `bwrap` are resolved once, at daemon start, from fixed system
-directories (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`) or from
-`ELEFANTE_{BASH,GIT,BWRAP}` in the daemon's environment. A resolved path inside any session root
-is refused at `session.create`.
+**Binaries.** The daemon resolves `bash`, `git` and `bwrap` from fixed system directories
+(`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). No environment variable overrides
+them. `session.create` refuses a resolved path inside the session root.
 
 ### 1b. `guard::git` (new module): write-git router
 

@@ -39,15 +39,11 @@ impl Drop for SessionSandbox {
     }
 }
 
-/// Resolves a host program from `ELEFANTE_<NAME>` or the fixed system directories.
+/// Resolves a host program from the fixed system directories.
 ///
 /// # Errors
 /// Fails when the program is absent or its path cannot be canonicalized.
 pub fn binary(name: &str) -> Result<PathBuf, String> {
-    let override_name = format!("ELEFANTE_{}", name.to_ascii_uppercase());
-    if let Some(path) = std::env::var_os(override_name) {
-        return fs::canonicalize(path).map_err(|error| error.to_string());
-    }
     ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
         .iter()
         .map(|dir| Path::new(dir).join(name))

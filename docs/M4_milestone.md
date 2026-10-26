@@ -183,7 +183,14 @@ A refused root makes the session's sandbox
 **The readable set never contains:**
 - `$HOME` itself, `~/.ssh` or `~/.elefante`;
 - a tool root (exact PATH dirs only);
+- `/run` (apart from `/run/systemd/resolve`), `/var/run`, `/private/var/run`, `$XDG_RUNTIME_DIR`
+  or `/dev` (apart from `/dev/null`, `/dev/random` and `/dev/urandom`), or a path under them;
+- the host `/tmp` or `/private/tmp`, or a path under them, unless that path lies in the root or
+  is also a `read_only` entry (a validated git directory);
 - the socket or token path. The renderer asserts this.
+
+`read_only` entries outside the root pass the same checks. Every path must use normalized
+spelling, with no `//`, `/./` or trailing `/`, because Seatbelt never matches such a spelling.
 Linux includes only the exact resolver files `/etc/resolv.conf`, `/etc/nsswitch.conf` and
 `/etc/hosts`, so approved DNS can use libc without exposing the rest of `/etc`; Off still has
 an isolated network namespace.
@@ -195,13 +202,19 @@ an isolated network namespace.
 - **Writes:** allowed under `ROOT` and `TEMP`, plus an exact literal `/dev/null` exception
   needed by sandboxed Git reads using the cleared `GIT_CONFIG_GLOBAL=/dev/null`. No other
   out-of-root write path is granted. Denied: `(require-all (subpath ROOT)
-  (regex #"/\.[Gg][Ii][Tt](/|$)"))`, `.elefante`, and each `read_only` entry.
+  (regex #"/\.[Gg][Ii][Tt](/|$)"))`, `.elefante`, and each `read_only` entry. A `writable` entry
+  must lie under `ROOT` or `TEMP`, contain no `.git` or `.elefante` component, and lie under no
+  `read_only` or `hidden` entry.
+- **Rule order:** Seatbelt applies the last matching rule, so the profile emits every allow
+  before every deny. A later allow therefore cannot cancel a `.git`, secret-name or hidden deny.
 - **Reads:** allowed for the readable set; denied for `hidden` and secret-name regexes under `ROOT`.
   `/private/etc` and narrowly required `/private/var` descendants (for example `/private/var/db`)
   are listed explicitly; the host's whole `/private/var` and shared temp directories are not.
-  Directory ancestors needed to traverse to these paths are allowed as exact `literal` matches,
-  never as `subpath` mounts. The S5 probe needed literal reads of `/`, `/Users` and `$HOME` for
-  process startup; the `$HOME` grant does not include its contents.
+  The ancestors of the root, temp, readable and writable entries get exact `literal` read
+  grants, never `subpath` grants. A literal grant lets a command list the names in that
+  directory, but grants no read of the entries' contents. The S5 probe needed literal reads of
+  `/`, `/Users` and `$HOME` for process startup. `$HOME` gets one when the root or a toolchain
+  directory lies beneath it.
 - **Network:**
   - Off: **no** loopback; Unix sockets only under `TEMP` and `ROOT`.
   - Approved: outbound TCP/UDP and the exact system mDNSResponder socket; Unix sockets remain
@@ -236,7 +249,7 @@ the renderer performs no filesystem lookup.
 | Program | Calls | Why |
 |---|---|---|
 | ENOSYS | `clone3`, `io_uring_setup/enter/register` | Runtimes fall back to `clone` and plain I/O |
-| EPERM | `unshare`, `setns`, the mount family, `ptrace`, `process_vm_readv/writev`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key`, module loading, `kexec_*`, `ioctl(TIOCSTI)` | Block escape, terminal injection and other-process access |
+| EPERM | `unshare`, `setns`, the mount family, `ptrace`, `process_vm_readv/writev`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key`, module loading, `kexec_*`, `ioctl(TIOCSTI)` (the rule compares the low 32 bits of the request, as the kernel does) | Block escape, terminal injection and other-process access |
 | EPERM | `socket()` for any family except `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` | `AF_VSOCK` is blocked |
 | EPERM, only under `Approved` | `socket(AF_UNIX)` | The host network namespace exposes abstract Unix sockets (X11, D-Bus); the DNS stub is UDP |
 

@@ -610,20 +610,24 @@ that phase can pass its gate.
   socket while other Unix sockets remain restricted to the root and session temp. Host process inspection, keychain,
   pasteboard, Apple Events and launchd submission are denied. System reads use exact directories;
   the host's whole `/private/var` is excluded, with required descendants tested during the
-  runtime gate. The profile grants exact literal reads of directory ancestors needed for path
-  traversal, including `$HOME` when the workspace is beneath it, without granting any home
-  subtree.
+  runtime gate. The profile grants exact literal reads of the ancestors of the root, temp,
+  readable and writable paths, including `$HOME` when the workspace is beneath it. A command can
+  list the names in those ancestors, but the profile grants no home subtree. Seatbelt applies
+  the last matching rule, so every allow precedes every deny.
 - **Linux.** Bubblewrap creates user, PID, IPC, UTS and (when network is off) network namespaces,
   clears the environment, binds exact read paths, binds the root writable, overlays each existing
   `.git` read-only, and masks secrets and harness state. `--disable-userns` prevents nested user
   namespaces when available. A `/tmp` tmpfs and private home replace host locations; `/run`, host
-  `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The daemon feeds two stacked `seccompiler` programs
+  `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The renderer rejects a readable path under them,
+  under `/var/run` or under `/dev`, apart from the device nodes, the resolver directory and
+  validated git directories. The daemon feeds two stacked `seccompiler` programs
   through repeated bubblewrap `--add-seccomp-fd` arguments: ENOSYS for `clone3` and
   `io_uring_*` so runtimes fall back, and EPERM for
   namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
   programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture
   check does not cover them. The EPERM program also refuses `ioctl(TIOCSTI)` to prevent
-  terminal input injection. The filter restricts
+  terminal input injection. That rule compares the low 32 bits of the request, as the kernel
+  does. The filter restricts
   socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
   spike settled repeated `--add-seccomp-fd` arguments, Ubuntu's AppArmor user-namespace sysctl
   step, and `--disable-userns` without a clone-flag mask. Its toolchain probe required exact

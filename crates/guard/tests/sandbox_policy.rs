@@ -130,22 +130,148 @@ fn approved_seatbelt_network_does_not_grant_arbitrary_unix_sockets() {
     assert!(profile.contains("(remote unix-socket (subpath (param \"TEMP\")))"));
 }
 
-#[test]
-fn seatbelt_grants_only_literal_directory_ancestors_for_path_traversal() {
-    let (profile, params) = seatbelt_profile(&policy()).unwrap();
-    let literal_paths: Vec<_> = params
-        .iter()
-        .filter(|(key, _)| key.starts_with("TRAVERSE_"))
-        .map(|(_, path)| path.clone())
-        .collect();
-    for required in ["/", "/work", "/scratch", "/users/alice"] {
-        assert!(
-            literal_paths.iter().any(|path| path == required),
-            "{required}"
-        );
-    }
+fn traversal_paths(policy: &Policy) -> Vec<OsString> {
+    let (profile, params) = seatbelt_profile(policy).unwrap();
     assert!(profile.contains("(allow file-read* (literal (param \"TRAVERSE_0\")))"));
     assert!(!profile.contains("(subpath (param \"TRAVERSE_"));
+    params
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("TRAVERSE_"))
+        .map(|(_, path)| path)
+        .collect()
+}
+
+#[test]
+fn seatbelt_grants_literal_ancestors_only_of_mounted_paths() {
+    let defaults = traversal_paths(&policy());
+    for required in ["/", "/work", "/scratch"] {
+        assert!(defaults.iter().any(|path| path == required), "{required}");
+    }
+    // The harness directory is never mounted, so its ancestors stay unlisted.
+    for absent in ["/users", "/users/alice"] {
+        assert!(!defaults.iter().any(|path| path == absent), "{absent}");
+    }
+    let mut p = policy();
+    p.readable.push("/users/alice/.cargo/bin".into());
+    p.hidden.push(HiddenPath {
+        path: "/elsewhere/secret/file".into(),
+        kind: HiddenKind::File,
+    });
+    p.protected.push("/sockets/run/daemon.sock".into());
+    let paths = traversal_paths(&p);
+    for required in ["/users", "/users/alice", "/users/alice/.cargo"] {
+        assert!(paths.iter().any(|path| path == required), "{required}");
+    }
+    for absent in [
+        "/elsewhere",
+        "/elsewhere/secret",
+        "/sockets",
+        "/sockets/run",
+    ] {
+        assert!(!paths.iter().any(|path| path == absent), "{absent}");
+    }
+}
+
+#[test]
+fn seatbelt_denies_follow_every_allow() {
+    let mut p = policy();
+    p.writable = vec![p.root.clone()];
+    p.readable.push("/work".into());
+    let (profile, params) = seatbelt_profile(&p).unwrap();
+    assert!(
+        params
+            .iter()
+            .any(|(key, value)| key == "WRITE_0" && value == p.root.as_os_str())
+    );
+    let allow = profile
+        .find("(allow file-write* (subpath (param \"WRITE_0\")))")
+        .expect("writable root allow");
+    let deny = profile
+        .find(r#"(deny file-write* (require-all (subpath (param "ROOT")) (regex #"/\.[Gg][Ii][Tt](/|$)")))"#)
+        .expect(".git write deny");
+    assert!(allow < deny);
+    let first_deny = profile.find("(deny file-").expect("a file deny");
+    assert!(!profile[first_deny..].contains("(allow file-"));
+}
+
+#[test]
+fn writable_entries_cannot_reopen_git_harness_or_masked_paths() {
+    for path in [
+        "/work/project[1]/.git",
+        "/work/project[1]/.GIT/hooks",
+        "/work/project[1]/sub/.elefante",
+        "/work/project[1]/vendor/cache",
+        "/work/project[1]/masked/cache",
+        "/outside",
+    ] {
+        let mut p = policy();
+        p.read_only.push("/work/project[1]/vendor".into());
+        p.hidden.push(HiddenPath {
+            path: "/work/project[1]/masked".into(),
+            kind: HiddenKind::Directory,
+        });
+        p.writable.push(path.into());
+        assert!(p.validate().is_err(), "{path}");
+    }
+    let mut p = policy();
+    p.writable = [
+        "/work/project[1]",
+        "/work/project[1]/target",
+        "/scratch/session/cache",
+    ]
+    .map(PathBuf::from)
+    .into();
+    assert!(p.validate().is_ok());
+}
+
+#[test]
+fn read_only_mounts_outside_the_root_cannot_expose_protected_locations() {
+    for path in [
+        "/users/alice",
+        "/users/alice/.ssh",
+        "/users/alice/.elefante",
+        "/run/user/1000",
+    ] {
+        let mut p = policy();
+        p.read_only.push(path.into());
+        assert!(p.validate().is_err(), "{path}");
+    }
+    let mut p = policy();
+    p.read_only.push("/repos/main/.git".into());
+    assert!(p.validate().is_ok());
+}
+
+#[test]
+fn non_normalized_paths_are_refused() {
+    for path in [
+        "/work/project[1]//.elefante",
+        "/work/project[1]/./.elefante",
+        "/work/project[1]/.elefante/",
+    ] {
+        let mut p = policy();
+        p.hidden.push(HiddenPath {
+            path: path.into(),
+            kind: HiddenKind::Directory,
+        });
+        assert!(seatbelt_profile(&p).is_err(), "{path}");
+    }
+    let mut p = policy();
+    p.hidden.push(HiddenPath {
+        path: "/work/project[1]/.elefante".into(),
+        kind: HiddenKind::Directory,
+    });
+    assert!(seatbelt_profile(&p).is_ok());
+    for root in ["/work/project/", "/work//project"] {
+        assert!(
+            validate_root(
+                root.as_ref(),
+                "/users/alice".as_ref(),
+                "/users/alice/.elefante".as_ref()
+            )
+            .is_err(),
+            "{root}"
+        );
+    }
 }
 
 #[test]
@@ -284,6 +410,15 @@ fn readable_mounts_cannot_reintroduce_secrets_or_daemon_paths() {
         "/run",
         "/tmp",
         "/outside/socket-dir",
+        "/run/user/1000",
+        "/run/dbus",
+        "/run/systemd",
+        "/var/run/docker.sock",
+        "/private/var/run/mDNSResponder",
+        "/tmp/.X11-unix",
+        "/private/tmp/session",
+        "/dev",
+        "/dev/shm",
     ] {
         let mut p = policy();
         p.readable.push(mount.into());
@@ -302,6 +437,49 @@ fn readable_mounts_cannot_reintroduce_secrets_or_daemon_paths() {
     assert!(p.validate().is_ok());
     p.temp = p.root.join("scratch");
     assert!(p.validate().is_err());
+    for allowed in ["/run/systemd/resolve", "/dev/null", "/dev/urandom"] {
+        let mut p = policy();
+        p.readable.push(allowed.into());
+        assert!(p.validate().is_ok(), "{allowed}");
+    }
+}
+
+#[test]
+fn shared_temp_admits_only_validated_git_directories_and_root_paths() {
+    let mut p = policy();
+    p.root = "/tmp/worktree".into();
+    p.read_only = vec!["/tmp/main/.git".into()];
+    p.readable.push("/tmp/main/.git".into());
+    assert!(p.validate().is_ok());
+    p.readable.push("/tmp/worktree/vendor".into());
+    assert!(p.validate().is_ok());
+    p.read_only.clear();
+    assert!(p.validate().is_err());
+}
+
+#[test]
+fn readable_mounts_exclude_the_runtime_directory() {
+    const RUNTIME: &str = "/outside/xdg-runtime";
+    // The workspace forbids `unsafe`, so the test sets the variable on a child test process.
+    if std::env::var_os("XDG_RUNTIME_DIR").as_deref() != Some(RUNTIME.as_ref()) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "readable_mounts_exclude_the_runtime_directory"])
+            .env("XDG_RUNTIME_DIR", RUNTIME)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+        return;
+    }
+    let mut p = policy();
+    p.readable.push(format!("{RUNTIME}/bus").into());
+    assert!(p.validate().is_err());
+    p.readable.pop();
+    p.readable.push(format!("{RUNTIME}-other").into());
+    assert!(p.validate().is_ok());
 }
 
 #[test]
@@ -455,6 +633,11 @@ mod linux {
                     );
                 }
                 assert_eq!(action(&programs[1], audit, ioctl, 0x5412), 0x0005_0001);
+                // The kernel ignores the high 32 bits of the request, so these must match too.
+                assert_eq!(
+                    action(&programs[1], audit, ioctl, 0x1_0000_5412),
+                    0x0005_0001
+                );
                 assert_eq!(action(&programs[1], audit, ioctl, 0x5401), 0x7fff_0000);
             }
         }

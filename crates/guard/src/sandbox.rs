@@ -68,6 +68,13 @@ pub enum SeccompError {
     Compile(String),
 }
 
+#[cfg(target_os = "linux")]
+impl From<seccompiler::BackendError> for SeccompError {
+    fn from(error: seccompiler::BackendError) -> Self {
+        Self::Compile(error.to_string())
+    }
+}
+
 /// Compiles two stacked filters, with an explicit x32 guard on `x86_64`.
 ///
 /// # Errors
@@ -88,52 +95,31 @@ pub fn seccomp_programs(
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
             calls.iter().map(|nr| (*nr, Vec::new())).collect();
         if errno == 1 {
-            let allowed = if network == Network::Approved {
-                vec![2, 10, 16]
+            // Under `Approved` the list omits `AF_UNIX`, so this one rule also blocks `AF_UNIX`.
+            let allowed: &[u64] = if network == Network::Approved {
+                &[2, 10, 16]
             } else {
-                vec![1, 2, 10, 16]
+                &[1, 2, 10, 16]
             };
             let conditions = allowed
-                .into_iter()
+                .iter()
                 .map(|family| {
-                    SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, family)
+                    SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, *family)
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| SeccompError::Compile(e.to_string()))?;
-            let mut socket_rules = vec![
-                SeccompRule::new(conditions).map_err(|e| SeccompError::Compile(e.to_string()))?,
-            ];
-            if network == Network::Approved {
-                socket_rules.push(
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 1)
-                            .map_err(|e| SeccompError::Compile(e.to_string()))?,
-                    ])
-                    .map_err(|e| SeccompError::Compile(e.to_string()))?,
-                );
-            }
-            rules.insert(socket, socket_rules);
+                .collect::<Result<Vec<_>, _>>()?;
+            rules.insert(socket, vec![SeccompRule::new(conditions)?]);
+            // The kernel truncates the `ioctl` request to 32 bits, so the rule compares 32 bits.
             let tiocsti =
-                SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0x5412)
-                    .map_err(|e| SeccompError::Compile(e.to_string()))?;
-            rules.insert(
-                ioctl,
-                vec![
-                    SeccompRule::new(vec![tiocsti])
-                        .map_err(|e| SeccompError::Compile(e.to_string()))?,
-                ],
-            );
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x5412)?;
+            rules.insert(ioctl, vec![SeccompRule::new(vec![tiocsti])?]);
         }
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Allow,
             SeccompAction::Errno(errno),
             target,
-        )
-        .map_err(|e| SeccompError::Compile(e.to_string()))?;
-        let program: BpfProgram = filter
-            .try_into()
-            .map_err(|e: seccompiler::BackendError| SeccompError::Compile(e.to_string()))?;
+        )?;
+        let program: BpfProgram = filter.try_into()?;
         let mut bytes = Vec::new();
         if arch == Architecture::X86_64 {
             // seccompiler checks architecture, but treats x32 syscall numbers as ordinary misses.
@@ -241,6 +227,8 @@ fn validate_path(path: &Path) -> Result<(), RootError> {
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        // Seatbelt never matches `//`, `/./` or a trailing `/`, so a deny would fail open.
+        || path.as_os_str() != path.components().collect::<PathBuf>().as_os_str()
     {
         return Err(RootError::InvalidPath);
     }
@@ -327,41 +315,32 @@ impl Policy {
             return Err(RootError::InvalidTemp);
         }
         for path in &self.readable {
-            if path.parent().is_none()
-                || matches!(
-                    path.to_str(),
-                    Some(
-                        "/home"
-                            | "/Users"
-                            | "/tmp"
-                            | "/private/tmp"
-                            | "/run"
-                            | "/var/run"
-                            | "/private/var"
-                    )
-                )
-                || self.home.starts_with(path)
-                || overlaps(path, &self.harness_dir)
-                || self.protected.iter().any(|secret| overlaps(path, secret))
-                || self
-                    .hidden
-                    .iter()
-                    .any(|secret| overlaps(path, &secret.path))
-                || path
-                    .components()
-                    .any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".elefante")))
-                || path.file_name().is_some_and(|name| {
-                    matches!(
-                        name.to_str(),
-                        Some("credentials" | "credentials.toml" | "token" | "daemon.sock")
-                    )
-                })
-            {
+            if self.exposes_protected(path) {
+                return Err(RootError::ProtectedMount(path.clone()));
+            }
+        }
+        for path in &self.read_only {
+            if !path.starts_with(&self.root) && self.exposes_protected(path) {
                 return Err(RootError::ProtectedMount(path.clone()));
             }
         }
         for path in &self.writable {
-            if !path.starts_with(&self.root) && !path.starts_with(&self.temp) {
+            let inner = path
+                .strip_prefix(&self.root)
+                .or_else(|_| path.strip_prefix(&self.temp));
+            if inner.is_err()
+                || inner.is_ok_and(|inner| {
+                    inner.components().any(|c| {
+                        let name = c.as_os_str().to_string_lossy();
+                        name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".elefante")
+                    })
+                })
+                || self.read_only.iter().any(|entry| path.starts_with(entry))
+                || self
+                    .hidden
+                    .iter()
+                    .any(|entry| path.starts_with(&entry.path))
+            {
                 return Err(RootError::ProtectedMount(path.clone()));
             }
         }
@@ -374,11 +353,66 @@ impl Policy {
         }
         Ok(())
     }
+
+    /// Reports whether a read mount of `path` would expose home, harness state, a secret or a
+    /// host service directory.
+    fn exposes_protected(&self, path: &Path) -> bool {
+        let under = |prefix: &str| path.starts_with(prefix);
+        let device = matches!(
+            path.to_str(),
+            Some("/dev/null" | "/dev/random" | "/dev/urandom")
+        );
+        // Only a path in the root or a validated git directory may live in host temp.
+        let shared_temp = (under("/tmp") || under("/private/tmp"))
+            && (matches!(path.to_str(), Some("/tmp" | "/private/tmp"))
+                || !path.starts_with(&self.root) && !self.read_only.iter().any(|ro| ro == path));
+        path.parent().is_none()
+            || matches!(path.to_str(), Some("/home" | "/Users" | "/private/var"))
+            || shared_temp
+            || under("/run") && !under("/run/systemd/resolve")
+            || under("/var/run")
+            || under("/private/var/run")
+            || under("/dev") && !device
+            || std::env::var_os("XDG_RUNTIME_DIR")
+                .is_some_and(|dir| Path::new(&dir).is_absolute() && path.starts_with(dir))
+            || self.home.starts_with(path)
+            || overlaps(path, &self.harness_dir)
+            || self.protected.iter().any(|secret| overlaps(path, secret))
+            || self
+                .hidden
+                .iter()
+                .any(|secret| overlaps(path, &secret.path))
+            || path
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".elefante")))
+            || path.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("credentials" | "credentials.toml" | "token" | "daemon.sock")
+                )
+            })
+    }
 }
 
 fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
+
+/// Name-based denies under `ROOT`: `.git` writes, secret names and harness state.
+const ROOT_DENIES: &str = concat!(
+    r#"(deny file-write* (require-all (subpath (param "ROOT")) (regex #"/\.[Gg][Ii][Tt](/|$)")))"#,
+    "\n",
+    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/(\.env(\.[^/]*)?|\.netrc|\.npmrc|\.git-credentials|id_rsa[^/]*|[^/]*\.[Pp][Ee][Mm]|[^/]*\.[Kk][Ee][Yy])(/|$)")))"#,
+    "\n",
+    r#"(deny file-read* file-write* (require-all (subpath (param "ROOT")) (regex #"/\.elefante(/|$)")))"#,
+    "\n",
+    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.ssh(/|$)")))"#,
+    "\n",
+    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.aws/credentials(/|$)")))"#,
+    "\n",
+    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.cargo/credentials(\.toml)?(/|$)")))"#,
+    "\n",
+);
 
 /// Renders a deny-default Seatbelt profile and separate `-D` path parameters.
 ///
@@ -391,17 +425,14 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
         ("TEMP".into(), policy.temp.clone().into_os_string()),
     ];
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(allow process-exec process-fork)\n(allow signal (target self))\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow file-write* (literal \"/dev/null\"))\n(allow file-read* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(allow file-write* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(deny file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.[Gg][Ii][Tt](/|$)\")))\n(deny file-read* (require-all (subpath (param \"ROOT\")) (regex #\"/(\\.env(\\.[^/]*)?|\\.netrc|\\.npmrc|\\.git-credentials|id_rsa[^/]*|[^/]*\\.[Pp][Ee][Mm]|[^/]*\\.[Kk][Ee][Yy])(/|$)\")))\n(deny file-read* file-write* (require-all (subpath (param \"ROOT\")) (regex #\"/\\.elefante(/|$)\")))\n",
+        "(version 1)\n(deny default)\n(allow process-exec process-fork)\n(allow signal (target same-sandbox))\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow file-write* (literal \"/dev/null\"))\n(allow file-read* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n(allow file-write* (subpath (param \"ROOT\")) (subpath (param \"TEMP\")))\n",
     );
-    profile = profile.replace("(target self)", "(target same-sandbox)");
+    // A literal grant lets a command list the names in that ancestor directory.
     let mut traversal = BTreeSet::new();
-    for path in [&policy.root, &policy.temp, &policy.harness_dir]
+    for path in [&policy.root, &policy.temp]
         .into_iter()
         .chain(policy.readable.iter())
         .chain(policy.writable.iter())
-        .chain(policy.read_only.iter())
-        .chain(policy.hidden.iter().map(|hidden| &hidden.path))
-        .chain(policy.protected.iter())
     {
         traversal.extend(path.ancestors().skip(1).map(Path::to_path_buf));
     }
@@ -411,14 +442,6 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
             .expect("writing to String cannot fail");
         params.push((key, path.into_os_string()));
     }
-    profile.push_str(concat!(
-        r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.ssh(/|$)")))"#,
-        "\n",
-        r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.aws/credentials(/|$)")))"#,
-        "\n",
-        r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.cargo/credentials(\.toml)?(/|$)")))"#,
-        "\n",
-    ));
     let hidden: Vec<PathBuf> = policy
         .hidden
         .iter()
@@ -426,12 +449,16 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
         .chain([policy.harness_dir.clone()])
         .chain(policy.protected.iter().cloned())
         .collect();
+    // Seatbelt applies the last matching rule, so every deny follows every allow.
     for (prefix, paths, rule) in [
         ("READ", &policy.readable, "allow file-read*"),
         ("WRITE", &policy.writable, "allow file-write*"),
         ("RO", &policy.read_only, "deny file-write*"),
         ("HIDDEN", &hidden, "deny file-read* file-write*"),
     ] {
+        if prefix == "RO" {
+            profile.push_str(ROOT_DENIES);
+        }
         for (index, path) in paths.iter().enumerate() {
             let key = format!("{prefix}_{index}");
             writeln!(profile, "({rule} (subpath (param \"{key}\")))")

@@ -199,11 +199,6 @@ impl ToolGate {
     }
 
     #[must_use]
-    pub fn check(&self, name: &str, input: &Value) -> GateDecision {
-        self.check_in(name, input, std::path::Path::new("."), &Sandbox::Seatbelt)
-    }
-
-    #[must_use]
     pub fn check_with_tools(
         &self,
         name: &str,

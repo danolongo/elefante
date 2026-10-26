@@ -476,35 +476,69 @@ async fn quarantines_all_new_git_metadata_even_when_one_is_malformed() {
     use elefante_core::sandbox::SessionSandbox;
     use elefante_guard::sandbox::Network;
     let source = "mkdir -p first/.git second/.git third target/.git; printf malformed > third/.git; printf ordinary > ordinary";
-    let control = tempfile::tempdir().expect("unsandboxed control root");
-    let output = Command::new("/bin/bash")
-        .args(["-c", source])
-        .current_dir(control.path())
-        .output()
-        .await
-        .expect("control launches");
-    assert!(output.status.success());
-    for name in ["first/.git", "second/.git", "third/.git", "target/.git"] {
+    let names = ["first/.git", "second/.git", "third/.git", "target/.git"];
+    // Quarantine moves entries under HOME, so a child with a fake HOME runs the session.
+    let Some(base) = std::env::var_os("ELEFANTE_QUARANTINE_FIXTURE_BASE") else {
+        let control = tempfile::tempdir().expect("unsandboxed control root");
+        let output = Command::new("/bin/bash")
+            .args(["-c", source])
+            .current_dir(control.path())
+            .output()
+            .await
+            .expect("control launches");
+        assert!(output.status.success());
+        for name in names {
+            assert!(
+                control.path().join(name).exists(),
+                "positive control: {name}"
+            );
+        }
+        let fixture = tempfile::tempdir().expect("quarantine fixture");
+        let base = fixture.path().canonicalize().expect("canonical fixture");
+        for directory in ["home", "workspace"] {
+            std::fs::create_dir(base.join(directory)).expect("fixture directory");
+        }
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "quarantines_all_new_git_metadata_even_when_one_is_malformed",
+            ])
+            .env("ELEFANTE_QUARANTINE_FIXTURE_BASE", &base)
+            .env("HOME", base.join("home"))
+            .output()
+            .await
+            .expect("quarantine fixture child");
         assert!(
-            control.path().join(name).exists(),
-            "positive control: {name}"
+            child.status.success(),
+            "quarantine child failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
         );
-    }
-
-    let root = tempfile::tempdir().expect("isolated root");
-    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
-        .expect("session setup");
+        return;
+    };
+    let base = std::path::PathBuf::from(base);
+    let root = base.join("workspace");
+    let session = SessionSandbox::new(&root).expect("session setup");
     let error = session.run_shell(source, Network::Off).await
         .expect_err("new Git metadata must be quarantined; install bubblewrap and enable unprivileged user namespaces on Linux");
     assert!(
         error.contains("4 new Git metadata entries quarantined"),
         "{error}"
     );
-    for name in ["first/.git", "second/.git", "third/.git", "target/.git"] {
-        assert!(!root.path().join(name).exists(), "{name} remained in root");
+    for name in names {
+        assert!(!root.join(name).exists(), "{name} remained in root");
     }
+    let quarantined: usize = std::fs::read_dir(base.join("home/.elefante/quarantine"))
+        .expect("quarantine under the fake HOME")
+        .map(|session| {
+            std::fs::read_dir(session.expect("quarantine entry").path())
+                .expect("session quarantine")
+                .count()
+        })
+        .sum();
+    assert_eq!(quarantined, 4);
     assert_eq!(
-        std::fs::read(root.path().join("ordinary")).expect("ordinary output"),
+        std::fs::read(root.join("ordinary")).expect("ordinary output"),
         b"ordinary"
     );
 }
@@ -856,6 +890,10 @@ async fn git_metadata_writes_fail_but_git_reads_and_host_controls_work() {
 async fn unix_socket_outside_session_is_blocked_while_private_socket_works() {
     use elefante_core::sandbox::SessionSandbox;
     use tokio::{io::AsyncWriteExt, net::UnixListener};
+    assert!(
+        std::path::Path::new("/usr/bin/curl").is_file(),
+        "install curl at /usr/bin/curl; the socket gate needs it as its client"
+    );
 
     let root = tempfile::tempdir().expect("fixture root");
     let outside = tempfile::tempdir().expect("outside socket fixture");
@@ -890,10 +928,6 @@ async fn unix_socket_outside_session_is_blocked_while_private_socket_works() {
         .expect("sandbox executes; install bubblewrap and enable user namespaces on Linux, or enable sandbox-exec on macOS");
     assert!(!blocked.success, "outside socket reached: {blocked:?}");
     assert!(
-    assert!(
-        std::path::Path::new("/usr/bin/curl").is_file(),
-        "install curl at /usr/bin/curl; the socket gate needs it as its client"
-    );
         tokio::time::timeout(Duration::from_millis(100), outside_listener.accept())
             .await
             .is_err(),
@@ -949,6 +983,10 @@ async fn assert_protected_socket_inaccessible(
     path: &std::path::Path,
 ) {
     use tokio::{io::AsyncWriteExt, net::UnixListener};
+    assert!(
+        std::path::Path::new("/usr/bin/curl").is_file(),
+        "install curl at /usr/bin/curl; the socket gate needs it as its client"
+    );
     let listener = UnixListener::bind(path).expect("synthetic service socket");
     let command = format!(
         "/usr/bin/curl --silent --max-time 2 --unix-socket '{}' http://localhost/",
@@ -983,10 +1021,6 @@ async fn assert_protected_socket_inaccessible(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
                 .is_err(),
-    assert!(
-        std::path::Path::new("/usr/bin/curl").is_file(),
-        "install curl at /usr/bin/curl; the socket gate needs it as its client"
-    );
             "protected listener accepted a sandboxed connection under {network:?}"
         );
     }

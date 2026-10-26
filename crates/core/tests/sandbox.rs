@@ -890,6 +890,10 @@ async fn unix_socket_outside_session_is_blocked_while_private_socket_works() {
         .expect("sandbox executes; install bubblewrap and enable user namespaces on Linux, or enable sandbox-exec on macOS");
     assert!(!blocked.success, "outside socket reached: {blocked:?}");
     assert!(
+    assert!(
+        std::path::Path::new("/usr/bin/curl").is_file(),
+        "install curl at /usr/bin/curl; the socket gate needs it as its client"
+    );
         tokio::time::timeout(Duration::from_millis(100), outside_listener.accept())
             .await
             .is_err(),
@@ -979,6 +983,10 @@ async fn assert_protected_socket_inaccessible(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
                 .is_err(),
+    assert!(
+        std::path::Path::new("/usr/bin/curl").is_file(),
+        "install curl at /usr/bin/curl; the socket gate needs it as its client"
+    );
             "protected listener accepted a sandboxed connection under {network:?}"
         );
     }

@@ -64,6 +64,26 @@ impl HarnessGit {
     }
 
     async fn preflight(&self) -> Result<(), String> {
+        let harness = self.clone();
+        tokio::task::spawn_blocking(move || harness.check_disk())
+            .await
+            .map_err(|error| format!("harness git preflight failed: {error}"))??;
+        let indexed = self.read(&["ls-files", "--cached", "-z"]).await?;
+        for path in indexed.split('\0').filter(|s| !s.is_empty()) {
+            if Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes")
+            {
+                let contents = self.read(&["show", &format!(":{path}")]).await?;
+                check_attributes(&contents)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks repository identity, config targets and attribute files on disk. It spawns
+    /// `git config` and walks the root, so preflight runs it on a blocking thread.
+    fn check_disk(&self) -> Result<(), String> {
         let Some(gitdir) = &self.repository else {
             return Err("harness git requires a repository present at session start".into());
         };
@@ -102,16 +122,6 @@ impl HarnessGit {
         }
         for path in &attributes {
             check_file(path)?;
-        }
-        let indexed = self.read(&["ls-files", "--cached", "-z"]).await?;
-        for path in indexed.split('\0').filter(|s| !s.is_empty()) {
-            if Path::new(path)
-                .file_name()
-                .is_some_and(|name| name == ".gitattributes")
-            {
-                let contents = self.read(&["show", &format!(":{path}")]).await?;
-                check_attributes(&contents)?;
-            }
         }
         Ok(())
     }

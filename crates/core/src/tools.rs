@@ -492,8 +492,11 @@ impl ToolExecutor {
                     );
                 };
                 let _lock = self.sandbox.lock.write().await;
-                if let Err(error) = self.sandbox.scan() {
-                    return ToolResult::error(error);
+                let sandbox = Arc::clone(&self.sandbox);
+                match tokio::task::spawn_blocking(move || sandbox.scan()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => return ToolResult::error(error),
+                    Err(error) => return ToolResult::error(format!("scan failed: {error}")),
                 }
                 return match git.execute(&write).await {
                     Ok(content) => ToolResult::success(content),

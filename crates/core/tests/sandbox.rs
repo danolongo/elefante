@@ -996,6 +996,55 @@ fn synthetic_child_failure_stage(output: &std::process::Output) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn build_fd_probe(root: &std::path::Path) -> std::path::PathBuf {
+    assert!(
+        std::path::Path::new("/usr/bin/cc").is_file(),
+        "install a C compiler for the Linux inherited-fd gate"
+    );
+    let source = root.join("fd_probe.c");
+    let binary = root.join("fd_probe");
+    std::fs::write(
+        &source,
+        r#"
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    DIR *entries = opendir("/proc/self/fd");
+    if (!entries) return 2;
+    int own = dirfd(entries);
+    struct dirent *entry;
+    while ((entry = readdir(entries))) {
+        char *end;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (*end == '\0' && fd > 2 && fd != own) {
+            printf("open_fd=%ld\n", fd);
+            closedir(entries);
+            return 1;
+        }
+    }
+    closedir(entries);
+    return 0;
+}
+"#,
+    )
+    .expect("write fd fixture source");
+    let compiled = Command::new("/usr/bin/cc")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .await
+        .expect("fd fixture compiler runs");
+    assert!(
+        compiled.status.success(),
+        "fd fixture compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    binary
+}
+
 #[tokio::test]
 async fn synthetic_key_does_not_enter_sandboxed_process() {
     use elefante_core::sandbox::SessionSandbox;
@@ -1051,10 +1100,6 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
     assert!(!parent.success, "sandbox exposed its host parent process");
     #[cfg(target_os = "linux")]
     {
-        assert!(
-            std::path::Path::new("/usr/bin/python3").is_file(),
-            "install python3 for the Linux inherited-fd gate"
-        );
         let proc = session
             .run_shell(
                 "for entry in /proc/[0-9]*/environ; do if grep -a -q OPENROUTER_API_KEY \"$entry\" 2>/dev/null; then exit 1; fi; done",
@@ -1063,26 +1108,27 @@ async fn synthetic_key_does_not_enter_sandboxed_process() {
             .await
             .expect("sandboxed process inspection");
         assert!(proc.success, "synthetic key exposed in sandbox /proc");
-        let fd_probe = "/usr/bin/python3 -c 'import os,sys; fds=sorted(int(fd) for fd in os.listdir(f\"/proc/{os.getppid()}/fd\") if int(fd)>2); print(f\"open_fd={fds[0]}\") if fds else None; sys.exit(bool(fds))'; status=$?; exit \"$status\"";
-        let clean_control = run_process(shell(fd_probe), Duration::from_secs(3))
+        build_fd_probe(root.path()).await;
+        let mut clean_command = shell("./fd_probe");
+        clean_command.current_dir(root.path());
+        let clean_control = run_process(clean_command, Duration::from_secs(3))
             .await
             .expect("clean host fd control");
         assert!(
             clean_control.success,
             "probe counted a transient host descriptor: {clean_control:?}"
         );
-        let control = run_process(
-            shell(&format!("exec 3< /dev/null; {fd_probe}")),
-            Duration::from_secs(3),
-        )
-        .await
-        .expect("unsandboxed fd control");
+        let mut retained_command = shell("exec 3< /dev/null; exec ./fd_probe");
+        retained_command.current_dir(root.path());
+        let control = run_process(retained_command, Duration::from_secs(3))
+            .await
+            .expect("unsandboxed fd control");
         assert!(
-            !control.success,
-            "fd probe missed an intentionally open descriptor"
+            !control.success && control.content.contains("open_fd=3"),
+            "fd probe did not identify the intentionally retained FD 3: {control:?}"
         );
         let fds = session
-            .run_shell(fd_probe, Network::Off)
+            .run_shell("./fd_probe", Network::Off)
             .await
             .expect("sandboxed fd inspection");
         assert!(

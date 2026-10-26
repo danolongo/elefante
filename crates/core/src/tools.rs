@@ -556,10 +556,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
     let mut definitions = vec![
         definition(
             "bash",
-            "Run a policy-approved shell command in the workspace.",
+            "Run a policy-approved shell command in the workspace. The shell has no network; set `network` to true to ask the user to approve network access for this one command.",
             json!({
-                "type": "object", "properties": { "command": { "type": "string" } },
-                "required": ["command"], "additionalProperties": false
+                "type": "object", "properties": {
+                    "command": { "type": "string" }, "network": { "type": "boolean" }
+                }, "required": ["command"], "additionalProperties": false
             }),
         ),
         definition(

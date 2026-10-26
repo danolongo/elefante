@@ -87,6 +87,13 @@ fn definitions_are_stable_sorted_and_strict() {
             .iter()
             .all(|definition| definition.input_schema["additionalProperties"] == false)
     );
+    let bash = &first[0];
+    assert_eq!(
+        bash.input_schema["properties"]["network"]["type"],
+        "boolean"
+    );
+    assert_eq!(bash.input_schema["required"], json!(["command"]));
+    assert!(bash.description.contains("`network`"));
 }
 
 #[tokio::test]

@@ -1045,6 +1045,7 @@ async fn build_fd_probe(root: &std::path::Path) -> std::path::PathBuf {
 #ifdef __linux__
 #include <dirent.h>
 #include <stdlib.h>
+#include <unistd.h>
 int main(void) {
     DIR *entries = opendir("/proc/self/fd");
     if (!entries) return 2;
@@ -1054,7 +1055,11 @@ int main(void) {
         char *end;
         long fd = strtol(entry->d_name, &end, 10);
         if (*end == '\0' && fd > 2 && fd != own) {
-            printf("open_fd=%ld\n", fd);
+            char link[64], target[512] = "";
+            snprintf(link, sizeof link, "/proc/self/fd/%ld", fd);
+            ssize_t length = readlink(link, target, sizeof target - 1);
+            if (length > 0) target[length] = '\0';
+            printf("open_fd=%ld target=%s\n", fd, target);
             closedir(entries);
             return 1;
         }
@@ -1064,13 +1069,18 @@ int main(void) {
 }
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 int main(void) {
     int limit = getdtablesize();
     if (limit > 65536) limit = 65536;
     for (int fd = 3; fd < limit; fd++) {
         if (fcntl(fd, F_GETFD) != -1) {
-            printf("open_fd=%d\n", fd);
+            char target[1024] = "";
+            struct stat info;
+            fcntl(fd, F_GETPATH, target);
+            fstat(fd, &info);
+            printf("open_fd=%d mode=%o target=%s\n", fd, info.st_mode & S_IFMT, target);
             return 1;
         }
     }

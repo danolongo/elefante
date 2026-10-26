@@ -53,6 +53,8 @@ fn denies_traversal_and_secret_variants() {
         "private.key",
         ".ssh/config",
         ".aws/credentials",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
         ".elefante/credentials.toml",
         ".elefante/memory.key",
         ".elefante/memory.db",
@@ -209,6 +211,8 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         "deep/dir/private.KEY",
         ".ssh/config",
         "home/.aws/credentials",
+        "home/.cargo/credentials",
+        "home/.cargo/credentials.toml",
         ".elefante/credentials.toml",
         ".elefante/memory.db",
         ".elefante",
@@ -230,6 +234,8 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         ".github/workflows/ci.yml",
         ".elefanteish/x",
         ".aws/config",
+        ".cargo/config.toml",
+        "src/credentials.toml",
     ] {
         // `.envrc.md.bak` is a directory name that merely begins with `.env`; it does not match
         // `.env` exactly nor `.env.` prefix, so it must stay indexable.

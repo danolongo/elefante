@@ -320,6 +320,14 @@ fn secret_rule(path: &Path, harness_state: bool) -> Option<&'static str> {
         if *component == ".aws" && components.get(index + 1) == Some(&"credentials") {
             return Some(".aws/credentials");
         }
+        if *component == ".cargo"
+            && matches!(
+                components.get(index + 1),
+                Some(&("credentials" | "credentials.toml"))
+            )
+        {
+            return Some(".cargo/credentials or .cargo/credentials.toml");
+        }
         if *component == ".elefante" && components.get(index + 1) == Some(&"credentials.toml") {
             return Some(".elefante/credentials.toml");
         }

@@ -657,7 +657,8 @@ that phase can pass its gate.
   `switch`, `checkout`, `branch`, `stash`, `tag`, `merge`, `cherry-pick`, `rebase`) and validates
   paths and refs. `reset`, `clean`, `push`, `fetch`, `pull`, `config` writes and unknown options
   are refused, also behind wrappers such as `env`, `exec` or `xargs`. `checkout <ref>` runs as
-  `checkout <ref> --`, so git never reads the ref as a pathspec. Every other subcommand, such as
+  `checkout <ref> --`, so git never reads the ref as a pathspec, and a branch may share its
+  name with a file or directory. Every other subcommand, such as
   `grep`, `blame` or an alias, is a read and runs in the sandbox. Every routed write asks for approval; the disabled sandbox asks for every bash
   call. The harness uses an absolute git binary, a cleared environment and flags that disable
   hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.

@@ -268,11 +268,8 @@ fn valid_write(sub: &str, args: &[String], root: &Path) -> bool {
     match sub {
         "add" | "rm" | "mv" | "restore" => valid_paths(sub, args, root),
         "switch" => one_ref(args) || flag_ref(args, "-c"),
-        // A ref that names a file would read as a pathspec and discard that file's changes.
-        "checkout" => {
-            (one_ref(args) && root.join(&args[0]).symlink_metadata().is_err())
-                || flag_ref(args, "-b")
-        }
+        // `invocation` appends `--`, so git reads the ref as a tree-ish, never as a pathspec.
+        "checkout" => one_ref(args) || flag_ref(args, "-b"),
         "branch" => one_ref(args) || flag_ref(args, "-d"),
         "stash" => match args.first().map(String::as_str) {
             Some("pop" | "apply") => args.len() == 1,

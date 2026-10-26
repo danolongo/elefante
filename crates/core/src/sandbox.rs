@@ -790,13 +790,13 @@ pub struct ProcessOutput {
 struct ProcessGroup(Option<u32>);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if let Some(id) = self.0 {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{id}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let group = self
+            .0
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(group) = group {
+            // The group may already be gone; nothing else can be done with an error here.
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
     }
 }

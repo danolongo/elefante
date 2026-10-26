@@ -89,7 +89,9 @@ fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Polic
         protected.push(path);
     }
     if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR") {
-        protected.push(PathBuf::from(directory).join("elefante.sock"));
+        let directory = PathBuf::from(directory);
+        protected.push(directory.join("elefante.sock"));
+        protected.push(directory.join("token"));
     }
     Ok(Policy {
         root: root.into(),

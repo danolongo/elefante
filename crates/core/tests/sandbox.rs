@@ -961,7 +961,39 @@ async fn configured_daemon_socket_paths_reject_connections() {
             "synthetic socket was not protected"
         );
         assert_protected_socket_inaccessible(&session, path).await;
+        // The daemon writes its token beside its socket.
+        let token = path.with_file_name("token");
+        assert!(
+            policy.protected.contains(&token),
+            "synthetic token was not protected: {}",
+            token.display()
+        );
+        assert_protected_file_unreadable(&session, &token).await;
     }
+}
+
+async fn assert_protected_file_unreadable(
+    session: &elefante_core::sandbox::SessionSandbox,
+    path: &std::path::Path,
+) {
+    std::fs::write(path, "synthetic token\n").expect("synthetic token file");
+    let command = format!("cat '{}'", path.display());
+    let control = run_process(shell(&command), Duration::from_secs(3))
+        .await
+        .expect("unsandboxed control executes");
+    assert!(
+        control.success && control.content.contains("synthetic token"),
+        "positive control for {}: {control:?}",
+        path.display()
+    );
+    let sandboxed = session
+        .run_shell(&command, Network::Off)
+        .await
+        .expect("sandbox runs");
+    assert!(
+        !sandboxed.success || !sandboxed.content.contains("synthetic token"),
+        "protected token leaked: {sandboxed:?}"
+    );
 }
 
 fn synthetic_child_failure_stage(output: &std::process::Output) -> String {

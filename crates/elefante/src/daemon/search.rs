@@ -173,7 +173,7 @@ mod tests {
             requests[0].web_search,
             Some(elefante_provider::WebSearch { max_results: 3 })
         );
-        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].tools, []);
         let total = *total.lock().unwrap();
         assert_eq!(total.input_tokens, 107);
         assert_eq!(total.cost, Some(0.75));

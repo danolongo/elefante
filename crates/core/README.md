@@ -241,7 +241,7 @@ cargo test -p elefante-core     # no network, no credentials; needs the host's s
 ```
 
 `tests/session.rs` (20) covers multi-turn history, cancellation, and pairing under interrupt.
-`tests/loop.rs` (6) covers the single-turn path. `tests/tools.rs` (22) covers the tools against
+`tests/loop.rs` (6) covers the single-turn path. `tests/tools.rs` (24) covers the tools against
 `tempfile` workspaces — real files, real `bash`, no network. `tests/context.rs` (12) covers where context goes in
 a request, that it never enters history, and that the audit event follows `turn.started` without the rendered text. `tests/learn.rs` (29) and `tests/learn_wire.rs` (7) cover the learner, including the sink. `tests/prompt.rs` (2) keeps the standing prompt small, with and without the index hint.
 

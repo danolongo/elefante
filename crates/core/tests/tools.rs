@@ -711,3 +711,43 @@ async fn new_git_metadata_refuses_bash_and_harness_git_until_removed() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&staged.stdout), "first\nsecond\n");
 }
+
+#[tokio::test]
+async fn git_hint_needs_a_refused_git_path_in_the_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let status = std::process::Command::new("/usr/bin/git")
+        .current_dir(&root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "Git fixture");
+    let executor = ToolExecutor::new(&root).unwrap();
+    let hint = "run git write commands on their own";
+
+    let metadata = executor
+        .execute("bash", json!({"command": "printf x > .git/blocked"}))
+        .await;
+    assert!(
+        metadata.is_error && metadata.content.contains(hint),
+        "{}",
+        metadata.content
+    );
+
+    // The command names `.gitignore` and hits a refused write, but the refused path is not `.git`.
+    let outside = executor
+        .execute(
+            "bash",
+            json!({"command": "printf x > .gitignore && printf x > /usr/.gitignore"}),
+        )
+        .await;
+    assert!(root.join(".gitignore").exists(), "{}", outside.content);
+    assert!(
+        outside.is_error
+            && (outside.content.contains("Read-only file system")
+                || outside.content.contains("Operation not permitted")),
+        "{}",
+        outside.content
+    );
+    assert!(!outside.content.contains(hint), "{}", outside.content);
+}

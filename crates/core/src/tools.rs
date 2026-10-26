@@ -513,11 +513,7 @@ impl ToolExecutor {
         match self.sandbox.run_shell(&input.command, network).await {
             Ok(output) => {
                 let mut content = output.content;
-                if !output.success
-                    && input.command.to_ascii_lowercase().contains(".git")
-                    && (content.contains("Read-only file system")
-                        || content.contains("Operation not permitted"))
-                {
+                if !output.success && refuses_git_path(&content) {
                     content.push_str("\n.git is read-only in the shell; run git write commands on their own through the harness");
                 }
                 ToolResult {
@@ -660,6 +656,17 @@ pub(crate) fn clip_middle(value: &str, limit: usize, original: usize) -> String 
         tail_start += 1;
     }
     format!("{}{}{}", &value[..head_end], marker, &value[tail_start..])
+}
+
+/// Whether a line of shell output reports a refused write to a path with a `.git` component.
+fn refuses_git_path(output: &str) -> bool {
+    output.lines().any(|line| {
+        (line.contains("Read-only file system") || line.contains("Operation not permitted"))
+            && line
+                .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ':'))
+                .flat_map(|word| word.split('/'))
+                .any(|component| component.eq_ignore_ascii_case(".git"))
+    })
 }
 
 fn contains_glob_meta(pattern: &str) -> bool {

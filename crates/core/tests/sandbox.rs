@@ -1764,3 +1764,61 @@ int main(void) {
         "sandbox did not return EPERM for process_vm_readv: {blocked:?}"
     );
 }
+
+#[tokio::test]
+async fn in_root_hooks_path_is_read_only_and_a_missing_one_refuses() {
+    use elefante_core::sandbox::SessionSandbox;
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let root = fixture.path().canonicalize().expect("canonical root");
+    for args in [&["init", "-q"][..], &["config", "core.hooksPath", ".husky"]] {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .expect("Git fixture command");
+        assert!(
+            output.status.success(),
+            "Git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let session = SessionSandbox::new(&root).expect("session setup");
+    let hooks = root.join(".husky");
+    let missing = session
+        .run_shell("printf ordinary > ordinary", Network::Off)
+        .await
+        .expect_err("a missing in-root hooksPath target refuses");
+    assert!(
+        missing.to_ascii_lowercase().contains("core.hookspath")
+            && missing.contains(&hooks.display().to_string()),
+        "{missing}"
+    );
+    assert!(!root.join("ordinary").exists());
+
+    std::fs::create_dir(&hooks).expect("hooks fixture");
+    let control = run_process(
+        shell(&format!(
+            "cd '{}' && printf host > .husky/host",
+            root.display()
+        )),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("host control executes");
+    assert!(control.success, "host write to .husky: {control:?}");
+    let blocked = session
+        .run_shell("printf hook > .husky/pre-commit", Network::Off)
+        .await
+        .expect("sandbox executes");
+    assert!(!blocked.success, "sandboxed hook write: {blocked:?}");
+    assert!(!hooks.join("pre-commit").exists());
+    let ordinary = session
+        .run_shell("printf ordinary > ordinary", Network::Off)
+        .await
+        .expect("sandbox executes");
+    assert!(ordinary.success, "ordinary in-root write: {ordinary:?}");
+    assert_eq!(
+        std::fs::read(root.join("ordinary")).expect("ordinary output"),
+        b"ordinary"
+    );
+}

@@ -344,17 +344,26 @@ impl SessionSandbox {
         if let Err(error) = session.configure_toolchains() {
             session.state = Sandbox::Unavailable(error);
         }
-        if !matches!(session.state, Sandbox::Unavailable(_) | Sandbox::Disabled) {
-            match initial_git_directory(root) {
-                Ok(directory) => session.main_git = directory,
-                Err(error) => session.state = Sandbox::Unavailable(error),
-            }
-            match session.scan() {
-                Ok(policy) => session.initial_git = policy.read_only.into_iter().collect(),
-                Err(error) => session.state = Sandbox::Unavailable(error),
-            }
+        if !matches!(session.state, Sandbox::Unavailable(_)) {
+            session.discover_git(root);
         }
         Ok(session)
+    }
+
+    /// Records the `.git` entries present at session start. Later scans refuse any others.
+    fn discover_git(&mut self, root: &Path) {
+        let initial = initial_git_directory(root).and_then(|directory| {
+            self.main_git = directory;
+            self.walk()
+        });
+        match initial {
+            Ok((_, repositories)) => {
+                self.initial_git = repositories.into_iter().map(|(entry, _)| entry).collect();
+            }
+            // A disabled shell never scans. Harness git still scans, so it refuses instead.
+            Err(_) if matches!(self.state, Sandbox::Disabled) => {}
+            Err(error) => self.state = Sandbox::Unavailable(error),
+        }
     }
 
     fn configure_toolchains(&mut self) -> Result<(), String> {
@@ -411,13 +420,68 @@ impl SessionSandbox {
         self.state = Sandbox::Disabled;
     }
 
-    /// Rescans every directory for git metadata, and secret names without reading their contents.
+    /// Rescans the root before each command: git metadata and repository config feed `read_only`,
+    /// and secret names feed `hidden`. Secret contents are never read.
     ///
     /// # Errors
-    /// Any unreadable directory or unsupported git indirection fails closed.
+    /// Fails closed for an unreadable directory, unsupported git indirection, Git metadata absent at
+    /// session start, and an in-root config target that is missing or reached through a symlink.
     pub fn scan(&self) -> Result<Policy, String> {
+        let (mut policy, repositories) = self.walk()?;
+        if let Some((entry, _)) = repositories
+            .iter()
+            .find(|(entry, _)| !self.initial_git.contains(entry))
+        {
+            return Err(format!(
+                "new Git metadata at {} blocks bash and harness git until it is removed",
+                entry.display()
+            ));
+        }
+        for (entry, gitdir) in &repositories {
+            let worktree = entry.parent().ok_or("Git metadata has no parent")?;
+            let config =
+                crate::harness_git::repo_config(&self.git, worktree, gitdir, Some(&policy.home))?;
+            for target in config.targets {
+                let protected = if target.path.starts_with(&policy.root) {
+                    match &target.canonical {
+                        None => {
+                            return Err(format!(
+                                "Git config {} target {} is missing; create it or remove the setting",
+                                target.key,
+                                target.path.display()
+                            ));
+                        }
+                        Some(canonical) if *canonical != target.path => {
+                            return Err(format!(
+                                "Git config {} target {} goes through a symlink inside the root",
+                                target.key,
+                                target.path.display()
+                            ));
+                        }
+                        Some(_) => target.path,
+                    }
+                } else {
+                    // The sandbox already refuses writes outside the root.
+                    match target.canonical {
+                        Some(canonical) if canonical.starts_with(&policy.root) => canonical,
+                        _ => continue,
+                    }
+                };
+                if !policy.read_only.contains(&protected) {
+                    policy.read_only.push(protected);
+                }
+            }
+        }
+        policy.validate().map_err(|error| error.to_string())?;
+        Ok(policy)
+    }
+
+    /// Walks the root for `.git` entries, their validated targets and secret names. Returns each
+    /// `.git` entry with the git directory it names.
+    fn walk(&self) -> Result<(Policy, Vec<(PathBuf, PathBuf)>), String> {
         use std::os::unix::fs::MetadataExt;
         let mut policy = self.policy.clone();
+        let mut repositories = Vec::new();
         let mut queue = vec![(policy.root.clone(), false)];
         while let Some((directory, secret_pruned)) = queue.pop() {
             for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
@@ -436,6 +500,7 @@ impl SessionSandbox {
                     } else {
                         git_reference(&path, true)?
                     };
+                    repositories.push((path.clone(), gitdir.clone()));
                     let mut targets = vec![gitdir.clone()];
                     if gitdir.join("commondir").exists() {
                         targets.push(git_reference(&gitdir.join("commondir"), false)?);
@@ -505,8 +570,7 @@ impl SessionSandbox {
                 }
             }
         }
-        policy.validate().map_err(|error| error.to_string())?;
-        Ok(policy)
+        Ok((policy, repositories))
     }
 
     /// Executes a shell command under the scanned policy.
@@ -774,7 +838,8 @@ fn git_reference(path: &Path, gitfile: bool) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn initial_git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
+/// The git directory that `root/.git` names: the directory itself, or a validated gitfile target.
+pub(crate) fn git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
     let path = root.join(".git");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -784,16 +849,28 @@ fn initial_git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
     if metadata.file_type().is_symlink() {
         return Err("symlink Git metadata is refused".into());
     }
-    let directory = if metadata.is_dir() {
-        path
+    if metadata.is_dir() {
+        Ok(Some(path))
     } else {
-        git_reference(&path, true)?
-    };
-    let common = if directory.join("commondir").exists() {
-        git_reference(&directory.join("commondir"), false)?
+        git_reference(&path, true).map(Some)
+    }
+}
+
+/// The validated `commondir` target of `gitdir`, or `gitdir` itself when it has none.
+pub(crate) fn common_directory(gitdir: &Path) -> Result<PathBuf, String> {
+    let commondir = gitdir.join("commondir");
+    if commondir.exists() {
+        git_reference(&commondir, false)
     } else {
-        directory
+        Ok(gitdir.to_owned())
+    }
+}
+
+fn initial_git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(directory) = git_directory(root)? else {
+        return Ok(None);
     };
+    let common = common_directory(&directory)?;
     if !common.starts_with(root)
         && (!common.join("objects").is_dir()
             || !common.join("refs").is_dir()

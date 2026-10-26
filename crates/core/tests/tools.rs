@@ -654,3 +654,60 @@ async fn memory_search_accepts_note_and_a_bad_kind_names_every_valid_one() {
         "the bad request never reached the index"
     );
 }
+
+#[tokio::test]
+async fn new_git_metadata_refuses_bash_and_harness_git_until_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("/usr/bin/git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Git fixture: {args:?}");
+    };
+    git(&["init", "-q"]);
+    let executor = ToolExecutor::new(&root)
+        .unwrap()
+        .with_git_identity(elefante_guard::git::Identity {
+            name: "Test".into(),
+            email: "test@example.invalid".into(),
+        })
+        .unwrap();
+    let run = |command: &'static str| executor.execute("bash", json!({ "command": command }));
+    for command in ["printf before > first", "git add first"] {
+        let control = run(command).await;
+        assert!(!control.is_error, "control {command}: {}", control.content);
+    }
+
+    git(&["init", "-q", "sub"]);
+    let entry = root.join("sub/.git").display().to_string();
+    for command in ["printf after > second", "git add first"] {
+        let refused = run(command).await;
+        assert!(
+            refused.is_error
+                && refused.content.contains("new Git metadata")
+                && refused.content.contains(&entry),
+            "{command}: {}",
+            refused.content
+        );
+    }
+    assert!(!root.join("second").exists());
+
+    fs::remove_dir_all(root.join("sub/.git")).unwrap();
+    for command in ["printf after > second", "git add second"] {
+        let control = run(command).await;
+        assert!(
+            !control.is_error,
+            "after removal {command}: {}",
+            control.content
+        );
+    }
+    let staged = std::process::Command::new("/usr/bin/git")
+        .current_dir(&root)
+        .args(["ls-files"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "first\nsecond\n");
+}

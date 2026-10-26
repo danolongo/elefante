@@ -3,6 +3,7 @@ use elefante_guard::git::{self, GitWrite, Identity};
 use std::{
     collections::BTreeSet,
     fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -14,7 +15,8 @@ pub struct HarnessGit {
     root: PathBuf,
     git: PathBuf,
     identity: Identity,
-    repository: Option<(PathBuf, PathBuf)>,
+    /// The git directory `root/.git` named at session start.
+    repository: Option<PathBuf>,
 }
 
 impl HarnessGit {
@@ -27,7 +29,7 @@ impl HarnessGit {
             return Err("Git executable must be absolute".into());
         }
         let root = root.canonicalize().map_err(|e| e.to_string())?;
-        let repository = repository(&root)?;
+        let repository = crate::sandbox::git_directory(&root)?;
         Ok(Self {
             root,
             git: git.into(),
@@ -62,81 +64,32 @@ impl HarnessGit {
     }
 
     async fn preflight(&self) -> Result<(), String> {
-        let Some((worktree, gitdir)) = &self.repository else {
+        let Some(gitdir) = &self.repository else {
             return Err("harness git requires a repository present at session start".into());
         };
-        if repository(&self.root)?.as_ref() != self.repository.as_ref() {
+        if crate::sandbox::git_directory(&self.root)?.as_ref() != Some(gitdir) {
             return Err("repository identity changed since session start".into());
         }
-        let common = if gitdir.join("commondir").exists() {
-            resolve(
-                gitdir,
-                fs::read_to_string(gitdir.join("commondir"))
-                    .map_err(|e| e.to_string())?
-                    .trim(),
-            )
-        } else {
-            gitdir.clone()
-        };
-        let mut pending = vec![common.join("config"), gitdir.join("config.worktree")];
-        let mut visited = BTreeSet::new();
-        while let Some(config) = pending.pop() {
-            if !config.exists() {
-                continue;
+        let common = crate::sandbox::common_directory(gitdir)?;
+        let config = repo_config(&self.git, &self.root, gitdir, None)?;
+        if config.drivers {
+            return Err("harness git refuses configured custom Git drivers".into());
+        }
+        for target in &config.targets {
+            // Unknown home expansion cannot be proven outside the writable root.
+            if target.home {
+                return Err("harness git refuses home-expanded config targets".into());
             }
-            let config = config.canonicalize().map_err(|e| e.to_string())?;
-            if !visited.insert(config.clone()) {
-                continue;
-            }
-            if visited.len() > 32 {
-                return Err("too many Git config includes".into());
-            }
-            let path = config.to_str().ok_or("non-UTF-8 Git config path")?;
-            let content = self
-                .read(&[
-                    "config",
-                    "--no-includes",
-                    "--null",
-                    "--file",
-                    path,
-                    "--list",
-                ])
-                .await?;
-            for entry in content.split('\0').filter(|s| !s.is_empty()) {
-                let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
-                let key = key.to_ascii_lowercase();
-                if key.starts_with("filter.")
-                    || (key.starts_with("merge.") && key.ends_with(".driver"))
-                {
-                    return Err("harness git refuses configured custom Git drivers".into());
-                }
-                let include = key == "include.path"
-                    || (key.starts_with("includeif.") && key.rsplit('.').next() == Some("path"));
-                if include || key == "core.hookspath" {
-                    // Unknown home expansion cannot be proven outside the writable root.
-                    if value.starts_with('~') {
-                        return Err("harness git refuses home-expanded config targets".into());
-                    }
-                    let target = resolve(
-                        if include {
-                            config.parent().unwrap_or(gitdir)
-                        } else {
-                            worktree
-                        },
-                        value,
-                    );
-                    let target = target.canonicalize().unwrap_or(target);
-                    if target.starts_with(&self.root) {
-                        return Err(
-                            "harness git refuses in-root include or hooksPath targets".into()
-                        );
-                    }
-                    if include {
-                        pending.push(target);
-                    }
-                }
+            if target.path.starts_with(&self.root)
+                || target
+                    .canonical
+                    .as_ref()
+                    .is_some_and(|canonical| canonical.starts_with(&self.root))
+            {
+                return Err("harness git refuses in-root include or hooksPath targets".into());
             }
         }
+        let worktree = &self.root;
         let mut attributes = BTreeSet::new();
         collect_attributes(worktree, &mut attributes)?;
         for path in [
@@ -169,11 +122,7 @@ impl HarnessGit {
         command
             .args(invocation.args)
             .args(args)
-            .current_dir(
-                self.repository
-                    .as_ref()
-                    .map_or(invocation.cwd.as_path(), |(root, _)| root.as_path()),
-            )
+            .current_dir(invocation.cwd)
             .env_clear()
             .envs(invocation.environment)
             .kill_on_drop(true)
@@ -203,34 +152,161 @@ impl HarnessGit {
     }
 }
 
-fn repository(root: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    for ancestor in root.ancestors() {
-        let entry = ancestor.join(".git");
-        if !entry.exists() {
+/// One `include.path`, `includeIf.*.path` or `core.hooksPath` value and where it points.
+pub(crate) struct ConfigTarget {
+    pub key: String,
+    /// The target with `..` resolved lexically and symlinks kept.
+    pub path: PathBuf,
+    /// The canonical target, when it exists.
+    pub canonical: Option<PathBuf>,
+    /// The value starts with `~`.
+    pub home: bool,
+}
+
+/// What harness git and the shell scan both read from a repository's config.
+#[derive(Default)]
+pub(crate) struct RepoConfig {
+    /// A `filter.*` or `merge.*.driver` key is set.
+    pub drivers: bool,
+    pub targets: Vec<ConfigTarget>,
+}
+
+/// Reads `<common>/config` and `<gitdir>/config.worktree` and follows their includes, up to 32
+/// files. `worktree` anchors a relative `core.hooksPath`. Without `home`, a `~` target is recorded
+/// but not followed.
+///
+/// # Errors
+/// Fails for unreadable or oversized config files, unparsable config, `~user` targets and include
+/// loops past the limit.
+pub(crate) fn repo_config(
+    git: &Path,
+    worktree: &Path,
+    gitdir: &Path,
+    home: Option<&Path>,
+) -> Result<RepoConfig, String> {
+    let common = crate::sandbox::common_directory(gitdir)?;
+    let mut pending = vec![common.join("config"), gitdir.join("config.worktree")];
+    let mut visited = BTreeSet::new();
+    let mut config = RepoConfig::default();
+    while let Some(path) = pending.pop() {
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !visited.insert(path.clone()) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&entry).map_err(|e| e.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err("symlinked .git is refused".into());
+        if visited.len() > 32 {
+            return Err("too many Git config includes".into());
         }
-        let directory = if metadata.is_dir() {
-            entry
-        } else {
-            let content = fs::read_to_string(&entry).map_err(|e| e.to_string())?;
-            resolve(
-                ancestor,
-                content
-                    .trim()
-                    .strip_prefix("gitdir: ")
-                    .ok_or("invalid gitdir file")?,
-            )
-        };
-        return Ok(Some((
-            ancestor.into(),
-            directory.canonicalize().map_err(|e| e.to_string())?,
-        )));
+        let listing = list_config(git, worktree, &read_config(&path)?)?;
+        for entry in listing.split('\0').filter(|s| !s.is_empty()) {
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+            let key = key.to_ascii_lowercase();
+            if key.starts_with("filter.") || (key.starts_with("merge.") && key.ends_with(".driver"))
+            {
+                config.drivers = true;
+            }
+            let include = key == "include.path"
+                || (key.starts_with("includeif.") && key.rsplit('.').next() == Some("path"));
+            if !include && key != "core.hookspath" {
+                continue;
+            }
+            let base = if include {
+                path.parent().unwrap_or(gitdir)
+            } else {
+                worktree
+            };
+            let target = match value.strip_prefix('~') {
+                None => resolve(base, value),
+                Some(rest) => {
+                    let rest = match rest.strip_prefix('/') {
+                        Some(rest) => rest,
+                        None if rest.is_empty() => rest,
+                        None => {
+                            return Err(format!(
+                                "unsupported home-expanded Git config target {value}"
+                            ));
+                        }
+                    };
+                    let Some(home) = home else {
+                        config.targets.push(ConfigTarget {
+                            key,
+                            path: value.into(),
+                            canonical: None,
+                            home: true,
+                        });
+                        continue;
+                    };
+                    resolve(home, rest)
+                }
+            };
+            let canonical = target.canonicalize().ok();
+            if include {
+                pending.push(canonical.clone().unwrap_or_else(|| target.clone()));
+            }
+            config.targets.push(ConfigTarget {
+                key,
+                path: target,
+                canonical,
+                home: value.starts_with('~'),
+            });
+        }
     }
-    Ok(None)
+    Ok(config)
+}
+
+/// Reads a config file without blocking on a FIFO or following a swapped-in device.
+fn read_config(path: &Path) -> Result<Vec<u8>, String> {
+    use rustix::fs::{Mode, OFlags};
+    let refused = || format!("Git config {} is not a small regular file", path.display());
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("Git config {}: {error}", path.display()))?;
+    let file = fs::File::from(descriptor);
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(refused());
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(refused());
+    }
+    Ok(bytes)
+}
+
+/// Lists one config file's entries with includes off, through the hardened git invocation.
+fn list_config(git: &Path, root: &Path, contents: &[u8]) -> Result<String, String> {
+    let invocation = git::hardened(git, root);
+    let mut child = std::process::Command::new(&invocation.program)
+        .args(&invocation.args)
+        .args(["config", "--no-includes", "--null", "--file", "-", "--list"])
+        .current_dir(&invocation.cwd)
+        .env_clear()
+        .envs(&invocation.environment)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("missing Git config stdin")?;
+    // A separate writer keeps a large config from filling both pipes at once.
+    let output = std::thread::scope(|scope| {
+        scope.spawn(move || stdin.write_all(contents));
+        child.wait_with_output()
+    })
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Git config could not be parsed".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "non-UTF-8 Git config".into())
 }
 
 fn resolve(base: &Path, target: &str) -> PathBuf {

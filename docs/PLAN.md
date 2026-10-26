@@ -637,6 +637,9 @@ that phase can pass its gate.
   registry, `/etc/alternatives` for GCC and `/etc/ssl/certs` for TLS clients; writable caches
   lived under the private temp directory. No whole real home or Cargo home was bound.
   A new nested `.git` is quarantined after the command, including under ignored directories.
+  If a move fails, the next root scan refuses until the entry is gone. On every OS, a `.git` that
+  was absent at session start makes bash and harness git refuse, and in-root include or hooksPath
+  targets are read-only in the shell.
 - **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
   bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
   process that leaves the group can survive, but remains sandboxed; the output reader stops two
@@ -657,7 +660,8 @@ that phase can pass its gate.
   `grep`, `blame` or an alias, is a read and runs in the sandbox. Every routed write asks for approval; the disabled sandbox asks for every bash
   call. The harness uses an absolute git binary, a cleared environment and flags that disable
   hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
-  It refuses repositories with in-root include or hooksPath targets or LFS filters. Hooks do not
+  It acts only on the `root/.git` present at session start and shares the bash timeout. It
+  refuses in-root or `~/` include or hooksPath targets and LFS filters. Hooks do not
   run on harness commits. Git attributes can select custom clean/smudge filters or merge drivers,
   so the harness also refuses a repository with any `filter=` or custom `merge=` attribute in
   the worktree, index fallback or `.git/info/attributes`. The invocation disables global

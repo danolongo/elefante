@@ -340,9 +340,10 @@ else refused.
   `GIT_AUTHOR_*` / `GIT_COMMITTER_*` from `Identity`.
 
 **Preconditions, checked by the caller (Phase 2).** Harness git refuses when:
-- the root had no repository at session start;
-- the repo config has `include.path` or `includeIf` targets, or `core.hooksPath`, inside the
-  root. A `hooksPath` target is also added to `read_only`;
+- `root/.git` is absent or names a different git directory than at session start. Harness git
+  checks only `root/.git` and never searches parent directories;
+- the local `config` or `config.worktree`, or any file they include, has `include.path` or
+  `includeIf` targets, or `core.hooksPath`, inside the root or written with `~/`;
 - any worktree or indexed `.gitattributes`, or `.git/info/attributes`, activates a custom
   `filter=` or `merge=` driver. Git can execute these during `add`, `checkout`, `merge` and related
   writes. The scan is unpruned and includes the index fallback for a missing worktree file.
@@ -394,8 +395,9 @@ profile.
 dir (created 0700, removed at close, swept at daemon start), and the resolved binaries.
 
 **What each state does:**
-- `Unavailable` makes every bash call fail with the reason, the setup instructions, and a note
-  that `ELEFANTE_SANDBOX=0` opts out.
+- `Unavailable` makes every bash call fail with `sandbox unavailable: <reason>`. Only a missing
+  mechanism adds setup advice: on Linux, install bubblewrap and enable unprivileged user
+  namespaces; on every OS, set `ELEFANTE_SANDBOX=0` to opt out. A refused root gets no advice.
 - `Disabled` makes **every bash call `Escalate`** (rule `sandbox-off`), because the classifier
   rules deleted in 2d no longer guard it. The environment allowlist, timeout and output cap still
   apply.
@@ -404,13 +406,19 @@ dir (created 0700, removed at close, swept at daemon start), and the resolved bi
 - Find every `.git` entry, in any case: a directories-only walk that is never pruned.
 - Validate `gitdir`/`commondir` targets. They must point inside the root or into the main
   repository's git dir; otherwise the target is not bound and git there fails.
-- Read the repo config for `hooksPath` and include targets.
+- Read each repository's local `config` and `config.worktree`, following includes. Every
+  `hooksPath` or include target inside the root becomes read-only. A missing target, or one
+  reached through a symlink inside the root, refuses the call until the user creates it or
+  removes the setting.
+- Refuse any `.git` entry that was absent at session start, naming its path, until the user
+  removes it. Harness git runs the same scan, so it refuses too.
 - Run the name-based secret scan (pruned per S8).
 
 The results feed `read_only` and `hidden`.
 
 **Linux, after each command:** a new `.git` (any case) anywhere in the root is moved to
-`~/.elefante/quarantine/<session>/<n>/` and reported.
+`~/.elefante/quarantine/<session>/<n>/` and reported. If a move fails, the next root scan finds the
+entry and refuses.
 
 **Per-root `RwLock`.** Sandboxed bash takes it shared; harness git takes it exclusive and runs the
 post-scan first. Parallel bash calls stay parallel.
@@ -435,6 +443,8 @@ post-scan first. Parallel bash calls stay parallel.
 **`CappedOutput`.**
 - Reads stdout and stderr concurrently, keeping the head and a tail ring buffer, and records the
   total size.
+- Fits both streams into one 32 KiB budget. A stream that needs at most half keeps all of it, and
+  the other stream gets the rest. Each clipped stream's marker states its original size.
 - Stops reading 2 s after bash exits. A leftover process holding the pipe can no longer stall the
   turn until the timeout.
 - Replaces `wait_with_output`.
@@ -445,8 +455,8 @@ orphans.
 
 **Input and output.**
 - Input: optional `network: bool`.
-- Output cap: `clip_middle` in `tools.rs`. Limits: bash, grep and web_search 32 KiB; read
-  128 KiB.
+- Output cap: `run_process` fits bash output into 32 KiB. `clip_middle` in `tools.rs` caps grep
+  and web_search at 32 KiB and read at 128 KiB, and clips any growth from scrubbing.
 - When stderr shows EROFS on `.git` (from a read-only git command that tried to write), one hint
   is appended: "run git write commands on their own".
 
@@ -454,9 +464,9 @@ orphans.
 
 `ToolExecutor::git(GitWrite)`:
 - checks the 1b preconditions;
-- takes the root lock exclusively;
+- takes the root lock exclusively and runs the root scan;
 - runs `invocation`;
-- applies the same cap, scrubber and timeout as bash.
+- applies the same cap, scrubber and `ELEFANTE_BASH_TIMEOUT_SECS` timeout as bash.
 
 ### 2d. Gate changes and classifier shrink (`core/src/lib.rs:195` `check_in`; `guard/src/bash.rs`)
 

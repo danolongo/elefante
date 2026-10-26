@@ -58,7 +58,10 @@ async fn timeout_kills_a_grandchild_before_its_delayed_write() {
     let error = run_process(shell(&blocked_source), Duration::from_millis(30))
         .await
         .expect_err("timed-out command must be killed");
-    assert!(error.contains("timed out"));
+    assert!(
+        error.starts_with("command timed out after 0.03 s"),
+        "{error}"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!blocked.exists(), "grandchild survived the timeout");
     let control_source = format!(

@@ -242,3 +242,35 @@ async fn target_revision_attributes_cannot_activate_configured_driver() {
         "positive checkout control"
     );
 }
+
+#[tokio::test]
+async fn harness_git_uses_the_configured_command_timeout() {
+    if std::env::var_os("ELEFANTE_TIMEOUT_FIXTURE_CHILD").is_some() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        fs::write(temp.path().join("file"), "hello").unwrap();
+        let error = add(temp.path(), &harness(temp.path()))
+            .await
+            .expect_err("a zero timeout expires");
+        assert!(error.starts_with("command timed out after 0 s"), "{error}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "-q"]);
+    fs::write(temp.path().join("file"), "hello").unwrap();
+    add(temp.path(), &harness(temp.path()))
+        .await
+        .expect("the default timeout lets the same write finish");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "harness_git_uses_the_configured_command_timeout"])
+        .env("ELEFANTE_TIMEOUT_FIXTURE_CHILD", "1")
+        .env("ELEFANTE_BASH_TIMEOUT_SECS", "0")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "timeout child failed: {}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}

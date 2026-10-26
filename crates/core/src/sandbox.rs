@@ -621,11 +621,7 @@ impl SessionSandbox {
             .env_clear()
             .envs(environment)
             .current_dir(&policy.root);
-        let timeout = std::env::var("ELEFANTE_BASH_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(120);
-        let result = run_process(command, Duration::from_secs(timeout)).await;
+        let result = run_process(command, command_timeout()).await;
         #[cfg(target_os = "linux")]
         if sandboxed {
             self.quarantine_new_git()?;
@@ -789,6 +785,17 @@ fn initial_git_directory(root: &Path) -> Result<Option<PathBuf>, String> {
 
 const OUTPUT_LIMIT: usize = 32 * 1024;
 
+/// The wall-clock limit for one bash call or harness git write: `ELEFANTE_BASH_TIMEOUT_SECS`,
+/// default 120 seconds.
+#[must_use]
+pub fn command_timeout() -> Duration {
+    let seconds = std::env::var("ELEFANTE_BASH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120);
+    Duration::from_secs(seconds)
+}
+
 /// The host isolation mechanism discovered at startup.
 #[derive(Debug, Clone)]
 pub enum Sandbox {
@@ -908,9 +915,12 @@ pub async fn run_process(mut command: Command, timeout: Duration) -> Result<Proc
         }
         Ok::<_, String>(status)
     };
-    let status = tokio::time::timeout(timeout, wait)
-        .await
-        .map_err(|_| "bash timed out; process group terminated".to_owned())??;
+    let status = tokio::time::timeout(timeout, wait).await.map_err(|_| {
+        format!(
+            "command timed out after {} s; process group terminated",
+            timeout.as_secs_f32()
+        )
+    })??;
     let mut content = std::mem::take(&mut *out.lock().await).text();
     content.push_str(&std::mem::take(&mut *err.lock().await).text());
     if !status.success() {

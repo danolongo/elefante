@@ -51,7 +51,7 @@ impl HarnessGit {
             .envs(invocation.environment);
         let output = Box::pin(crate::sandbox::run_process(
             command,
-            Duration::from_secs(120),
+            crate::sandbox::command_timeout(),
         ))
         .await?;
         if output.success {

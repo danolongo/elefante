@@ -57,8 +57,7 @@ jobs:
         run: |
           for f in /dev/fd/*; do n=${f##*/}; if [ "$n" -gt 2 ] && [ -e "$f" ]; then eval "exec $n<&-"; fi; done
           cargo test --workspace --no-fail-fast
-      # Catches a ninth crate added without one. It cannot catch a stale README — that needs
-      # the rustdoc include_str! wiring noted in docs/DEVELOPER_GUIDE.md §13.
+      # Catches a crate added without a README. It cannot catch a stale README.
       - name: crate readmes exist
         if: runner.os == 'Linux'
         run: |

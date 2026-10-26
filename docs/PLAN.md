@@ -622,8 +622,8 @@ that phase can pass its gate.
   under `/var/run` or under `/dev`, apart from the device nodes, the resolver directory and
   validated git directories. The daemon feeds two stacked `seccompiler` programs
   through repeated bubblewrap `--add-seccomp-fd` arguments. It writes each program into an
-  anonymous memory file that keeps close-on-exec. A fixed `/bin/sh` trampoline reopens both
-  files as fds 3 and 4 in the launched process only, then execs bubblewrap. The programs return
+  anonymous memory file that keeps close-on-exec. The fixed `bash` launcher reopens both files
+  as fds 3 and 4 in the launched process only, then execs bubblewrap. The programs return
   ENOSYS for `clone3` and `io_uring_*` so runtimes fall back, and EPERM for
   namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
   programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture

@@ -39,9 +39,10 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
 | `src/ui/Transcript.tsx` | 66 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/toolView.ts` | 72 | Pure: a tool call as a header subject (`✓ bash \`ls\` (12 ms)`) and at most three body lines indented four spaces. A `read` is just its path, never the file. |
-| `src/ui/Modal.tsx` | 43 | Approval, first-run key, memory-consent and `/memory` modals. The approval modal shows the command through `displaySafe` and a `[network]` badge when the command asks for internet access. |
+| `src/ui/Modal.tsx` | 35 | First-run key, memory-consent and `/memory` modals. |
+| `src/ui/ApprovalPrompt.tsx` | 26 | The approval prompt, drawn in place of the prompt bar. It shows the command through `displaySafe`, the rule, and a `[network]` badge when the command asks for internet access. |
 | `src/ui/MemoryPanel.tsx` | 58 | The `/memory` panel: list, scroll, forget with a Y/N confirmation, close. |
-| `src/ui/App.tsx` | 48 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
+| `src/ui/App.tsx` | 52 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
 | `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
 | `src/ui/copy.ts` | 22 | Where selected text goes: OSC52, plus `pbcopy` on macOS. |
 | `src/ui/Mascot.tsx` | 57 | `useMascot` decides which stage the elephant is on; `TopMascot` (with the wordmark) and `PerchMascot` place it. |
@@ -65,8 +66,9 @@ effort, and limits also read `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`, `ELEFANTE_MAX_
 `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.
 
 Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
-the model's reasoning (hidden at start; the "Thinking" line stays either way). Approval
-modals accept Y/N, and Esc there means *deny* — it does not also interrupt the turn.
+the model's reasoning (hidden at start; the "Thinking" line stays either way). An approval
+replaces the prompt bar with a Yes / No choice: Y allows, N denies, `↑↓` and Enter pick, and Esc
+means *deny* — it does not also interrupt the turn.
 
 The answer is rendered as markdown (headings, lists, bold, italic, inline and fenced code).
 **Copying:** the terminal's own selection is blocked while the mouse is captured, so drag to select

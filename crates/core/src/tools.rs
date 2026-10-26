@@ -176,6 +176,12 @@ impl ToolExecutor {
         self.memory.is_some()
     }
 
+    /// Whether approved harness Git writes have an identity to commit with.
+    #[must_use]
+    pub fn has_git_identity(&self) -> bool {
+        self.harness_git.is_some()
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root

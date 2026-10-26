@@ -84,3 +84,46 @@ fn disabled_requires_approval_and_unavailable_reaches_fail_closed_runner() {
         GateDecision::Allow,
     );
 }
+
+#[test]
+fn harness_git_writes_need_an_identity_before_approval() {
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root.path())
+        .arg("init")
+        .output()
+        .expect("fixture Git launches");
+    assert!(status.status.success(), "fixture Git init failed");
+    let gate = ToolGate::default();
+    let input = json!({"command":"git add -A"});
+    let anonymous = elefante_core::tools::ToolExecutor::new(root.path()).unwrap();
+    assert!(!anonymous.has_git_identity());
+    assert_eq!(
+        gate.check_with_tools("bash", &input, &anonymous),
+        GateDecision::Deny {
+            rule: "git-identity-missing"
+        },
+    );
+    // Shell commands other than harness writes are unaffected by the missing identity.
+    assert_eq!(
+        gate.check_with_tools("bash", &json!({"command":"ls"}), &anonymous),
+        GateDecision::Allow,
+    );
+    let identified = elefante_core::tools::ToolExecutor::new(root.path())
+        .unwrap()
+        .with_git_identity(elefante_guard::git::Identity {
+            name: "Fixture".into(),
+            email: "fixture@example.invalid".into(),
+        })
+        .unwrap();
+    assert!(identified.has_git_identity());
+    assert_eq!(
+        gate.check_with_tools("bash", &input, &identified),
+        GateDecision::Escalate {
+            rule: "git-write",
+            command: "git add -A".into(),
+            network: false,
+        },
+    );
+}

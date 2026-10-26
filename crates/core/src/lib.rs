@@ -223,7 +223,21 @@ impl ToolGate {
             }
             return GateDecision::Allow;
         }
-        self.check_in(name, input, tools.root(), tools.sandbox_state())
+        let decision = self.check_in(name, input, tools.root(), tools.sandbox_state());
+        // Never ask the user to approve a harness write that cannot commit.
+        if matches!(
+            decision,
+            GateDecision::Escalate {
+                rule: "git-write",
+                ..
+            }
+        ) && !tools.has_git_identity()
+        {
+            return GateDecision::Deny {
+                rule: "git-identity-missing",
+            };
+        }
+        decision
     }
 
     #[must_use]

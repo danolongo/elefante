@@ -1264,6 +1264,55 @@ async fn planted_temp_symlinks_cannot_redirect_daemon_writes() {
 }
 
 #[tokio::test]
+async fn descriptors_the_daemon_inherited_never_reach_a_command() {
+    use elefante_core::sandbox::SessionSandbox;
+    if std::env::var_os("ELEFANTE_STRAY_FD_CHILD").is_none() {
+        let executable = std::env::current_exe().expect("test executable");
+        // The child starts with fd 7 open and inheritable, as a daemon might from its launcher.
+        let output = Command::new("/bin/bash")
+            .args(["-c", r#"exec 7</dev/null; exec "$0" "$@""#])
+            .arg(executable)
+            .args([
+                "--exact",
+                "descriptors_the_daemon_inherited_never_reach_a_command",
+            ])
+            .env("ELEFANTE_STRAY_FD_CHILD", "1")
+            .output()
+            .await
+            .expect("stray-descriptor child");
+        assert!(
+            output.status.success(),
+            "stray-descriptor child failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let root = tempfile::tempdir().expect("fixture root");
+    build_fd_probe(root.path()).await;
+    let mut host_command = shell("./fd_probe");
+    host_command.current_dir(root.path());
+    let host = run_process(host_command, Duration::from_secs(3))
+        .await
+        .expect("host fd probe runs");
+    assert!(
+        !host.success && host.content.contains("open_fd=7"),
+        "the stray descriptor was not inherited by a host child: {}",
+        host.content
+    );
+    let session = SessionSandbox::new(&root.path().canonicalize().expect("canonical root"))
+        .expect("session setup");
+    let sandboxed = session
+        .run_shell("./fd_probe", Network::Off)
+        .await
+        .expect("sandboxed fd probe runs");
+    assert!(
+        sandboxed.success,
+        "a command received a descriptor the daemon inherited: {}",
+        sandboxed.content
+    );
+}
+
+#[tokio::test]
 async fn concurrent_sandboxed_command_leaks_no_descriptor() {
     use elefante_core::sandbox::SessionSandbox;
     let root = tempfile::tempdir().expect("fixture root");

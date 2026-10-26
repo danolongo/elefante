@@ -682,7 +682,9 @@ that phase can pass its gate.
   sandbox-only git flags). On macOS, fixed `PATH` puts the resolved Command Line Tools compiler
   directory ahead of `/usr/bin`: the `/usr/bin/clang` shim created assembler temporaries outside
   the private temp directory even when `TMPDIR` was set, while the direct compiler did not.
-  `OPENROUTER_API_KEY` is never passed. Shell uses `bash -c`, not a login shell, with a 120-second
+  `OPENROUTER_API_KEY` is never passed. A fixed `bash` launcher closes every descriptor above
+  stderr before it execs the sandbox, so a descriptor the daemon inherited never reaches a
+  command. Shell uses `bash -c`, not a login shell, with a 120-second
   default timeout. `bash` and `grep` output is capped at 32 KiB, `read` at 128 KiB, keeping head,
   tail and the total size. Daemon file tools and the indexer open root-relative paths without
   following symlinks, after rejecting absolute and parent components; they refuse hard-linked

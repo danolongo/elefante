@@ -555,8 +555,8 @@ impl SessionSandbox {
             Sandbox::Seatbelt => {
                 let (profile, params) =
                     sandbox::seatbelt_profile(&policy).map_err(|error| error.to_string())?;
-                let mut command = Command::new("/usr/bin/sandbox-exec");
-                command.args(["-p", &profile]);
+                let mut command = launcher(&self.bash, &format!("{CLOSE_INHERITED}{EXEC}"));
+                command.arg("/usr/bin/sandbox-exec").args(["-p", &profile]);
                 for (key, value) in params {
                     command
                         .arg("-D")
@@ -566,8 +566,8 @@ impl SessionSandbox {
                 command
             }
             Sandbox::Disabled => {
-                let mut command = Command::new(&self.bash);
-                command.args(["-c", source]);
+                let mut command = launcher(&self.bash, &format!("{CLOSE_INHERITED}{EXEC}"));
+                command.arg(&self.bash).args(["-c", source]);
                 command
             }
             Sandbox::Bubblewrap { bwrap } => {
@@ -582,8 +582,9 @@ impl SessionSandbox {
                     };
                     let args =
                         sandbox::bwrap_args(&policy, &spec).map_err(|error| error.to_string())?;
-                    let mut command = Command::new("/bin/sh");
-                    command.args(["-c", SECCOMP_TRAMPOLINE]).arg(bwrap);
+                    let mut command =
+                        launcher(&self.bash, &format!("{CLOSE_INHERITED}{SECCOMP_EXEC}"));
+                    command.arg(bwrap);
                     for file in &filters {
                         command.arg(format!(
                             "/proc/{}/fd/{}",
@@ -695,10 +696,23 @@ fn seccomp_filters(network: Network) -> Result<Vec<fs::File>, String> {
     Ok(files)
 }
 
+/// Closes every descriptor above stderr that the daemon inherited from whatever launched it, so a
+/// command never receives one. `bash`, unlike `dash`, accepts multi-digit descriptor numbers.
+const CLOSE_INHERITED: &str = r#"for f in /dev/fd/*; do n=${f##*/}; if [ "$n" -gt 2 ] && [ -e "$f" ]; then eval "exec $n<&-"; fi; done; "#;
+
+const EXEC: &str = r#"exec "$0" "$@""#;
+
 /// Reopens the two seccomp programs as fds 3 and 4 in the launched process only, then execs
 /// bubblewrap. A failed reopen stops the `exec`, so the command never runs unfiltered.
 #[cfg(target_os = "linux")]
-const SECCOMP_TRAMPOLINE: &str = r#"a=$1 b=$2; shift 2; exec "$0" "$@" 3<"$a" 4<"$b""#;
+const SECCOMP_EXEC: &str = r#"a=$1 b=$2; shift 2; exec "$0" "$@" 3<"$a" 4<"$b""#;
+
+/// Starts `script` in the fixed `bash`; the program to exec and its arguments follow.
+fn launcher(bash: &Path, script: &str) -> Command {
+    let mut command = Command::new(bash);
+    command.args(["-c", script]);
+    command
+}
 
 fn git_reference(path: &Path, gitfile: bool) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;

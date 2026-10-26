@@ -10,13 +10,13 @@ bun run src/main.tsx
 ```
 
 **One lockfile.** `bun.lock` is the only committed lockfile. Do not add `package-lock.json`, and
-do not gitignore `bun.lock`. Bun reads `bun.lock` and never reads `package-lock.json`. With both
+do not gitignore `bun.lock`. While `bun.lock` exists, Bun never reads `package-lock.json`. With both
 files present, `bun install --frozen-lockfile` and `npm ci` each succeed and install different
 trees, with no warning (measured on Bun 1.4.2).
 
 **Packaging.** `bun build --compile` produces one self-contained binary with the native library
-embedded. CI compiles it on every push so the option stays open. Shipping that binary waits for a
-release.
+embedded. CI compiles it on every pull request and on pushes to `main`, so the option stays open.
+Shipping that binary waits for a release.
 
 `elefante` with no prompt is the normal way in: the Rust CLI starts the daemon if none is
 listening, then runs this entrypoint under `bun` with the resolved model, effort, and limits.
@@ -30,7 +30,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 
 | File | Lines | Contents |
 |---|---:|---|
-| `src/protocol.ts` | 306 | Framing, sequence windows, attach and gap handling, `connectOrExplain`; accepts unknown notification methods; parses the optional `memory` object, `memory.list` and `memory.consent` results. |
+| `src/protocol.ts` | 356 | Framing, sequence windows, attach and gap handling, `connectOrExplain`; reads the daemon's `token` beside the socket and sends `auth` first, mapping an older daemon's `-32601` to `OlderDaemonError`; accepts unknown notification methods; parses the optional `memory` and `sandbox` objects, the approval `network` flag, and `memory.list` and `memory.consent` results. |
 | `src/session.ts` | 59 | The pure reducer: `reduceSession`, `restoreSnapshot`, `addUsage`. No I/O, no clock. Keeps each turn's output as ordered `segments` (reasoning, text, tool calls). |
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
 | `src/commands.ts` | 11 | Pure: `parseCommand` — only exactly `/memory` and `/forget <integer>` (spaces or tabs between) are commands; `//x` sends `/x`; anything else is a prompt. |
@@ -39,7 +39,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
 | `src/ui/Transcript.tsx` | 66 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/toolView.ts` | 72 | Pure: a tool call as a header subject (`✓ bash \`ls\` (12 ms)`) and at most three body lines indented four spaces. A `read` is just its path, never the file. |
-| `src/ui/Modal.tsx` | 40 | Approval, first-run key, memory-consent and `/memory` modals. |
+| `src/ui/Modal.tsx` | 43 | Approval, first-run key, memory-consent and `/memory` modals. The approval modal shows the command through `displaySafe` and a `[network]` badge when the command asks for internet access. |
 | `src/ui/MemoryPanel.tsx` | 58 | The `/memory` panel: list, scroll, forget with a Y/N confirmation, close. |
 | `src/ui/App.tsx` | 48 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
 | `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
@@ -51,7 +51,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/elephant/wordmark.ts`, `Logo.tsx` | 16, 19 | The "elefante" wordmark as pixel rows, and the component that paints it once. |
 | `src/ui/elephant/paint.ts` | 47 | Composes a frame into pixels and paints it as half-block cells. |
 | `src/ui/elephant/phase.ts` | 21 | The `intro → perch` transition, as pure functions. |
-| `src/ui/Status.tsx` | 12 | Thinking indicator, elapsed time, usage, and the memory suffix when memory is not healthy. |
+| `src/ui/Status.tsx` | 16 | Thinking indicator, elapsed time, usage, the memory suffix when memory is not healthy, and `sandbox: off` or `sandbox: unavailable` in the warning colour. |
 | `src/ui/Input.tsx` | 13 | Prompt entry; routes `/memory` and `/forget <id>` through `parseCommand`. |
 | `src/ui/theme.ts` | 6 | The blue behind the prompt border and its two neighbouring tints. |
 

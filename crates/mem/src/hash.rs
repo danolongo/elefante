@@ -102,16 +102,6 @@ pub struct Hashed {
     pub bytes: Vec<u8>,
 }
 
-/// Reads `path` in full and hashes it.
-///
-/// # Errors
-/// Any I/O error from reading the file.
-pub fn read_and_hash(path: &Path) -> io::Result<Hashed> {
-    let absolute = std::path::absolute(path)?;
-    let root = open_root(Path::new("/"))?;
-    read_relative(&root, absolute.strip_prefix("/").map_err(io::Error::other)?)
-}
-
 fn hash_bytes(mut bytes: Vec<u8>) -> Hashed {
     let blake3 = *blake3::hash(&bytes).as_bytes();
     let binary = bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0);

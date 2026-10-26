@@ -480,7 +480,7 @@ approved escalation still runs sandboxed; only `network-requested` switches to
 
 ### 2e. Hardened file access, in the daemon and the indexer
 
-`read`, `write`, `edit`, `glob`, `grep` and `mem/src/hash.rs:25` (`read_and_hash`):
+`read`, `write`, `edit`, `glob`, `grep` and `mem/src/hash.rs` (`hash_files`):
 - **Open relative to a root directory descriptor** (S7): `openat2(RESOLVE_BENEATH |
   RESOLVE_NO_SYMLINKS)` on Linux; dirfd `openat` with `O_NOFOLLOW_ANY` on macOS. In-root symlinks
   that `PathPolicy` allows today are resolved by `PathPolicy` first, and the canonical path is then

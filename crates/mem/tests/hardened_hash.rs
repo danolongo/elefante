@@ -1,18 +1,33 @@
-use elefante_mem::{hash::hash_files, hash::read_and_hash, stats::Counters, walk::WalkedFile};
+use elefante_mem::{
+    hash::{Hashed, hash_files},
+    stats::Counters,
+    walk::WalkedFile,
+};
 use std::{fs, os::unix::fs::symlink};
 
 #[test]
 fn hashing_refuses_links_but_reads_regular_files() {
-    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let root = tempfile::tempdir().unwrap();
     let ordinary = root.path().join("ordinary");
     fs::write(&ordinary, "safe").unwrap();
-    assert_eq!(read_and_hash(&ordinary).unwrap().bytes, b"safe");
+    assert_eq!(hash_one(root.path(), "ordinary").unwrap().bytes, b"safe");
     let link = root.path().join("link");
     symlink(&ordinary, &link).unwrap();
-    assert!(read_and_hash(&link).is_err());
+    assert!(hash_one(root.path(), "link").is_err());
     fs::remove_file(&link).unwrap();
     fs::hard_link(&ordinary, &link).unwrap();
-    assert!(read_and_hash(&link).is_err());
+    assert!(hash_one(root.path(), "link").is_err());
+}
+
+fn hash_one(root: &std::path::Path, path: &str) -> std::io::Result<Hashed> {
+    let file = WalkedFile {
+        path: path.into(),
+        size: 0,
+        mtime_ns: 0,
+    };
+    hash_files(root, &[file], &Counters::default())
+        .pop()
+        .expect("one result per file")
 }
 
 #[test]

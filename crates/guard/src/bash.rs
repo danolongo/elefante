@@ -315,10 +315,7 @@ fn classify_git(tokens: &[String]) -> BashDecision {
         .skip(1)
         .find(|token| !token.starts_with('-'))
         .map(String::as_str);
-    if matches!(
-        subcommand,
-        Some("status" | "diff" | "log" | "show" | "branch" | "rev-parse" | "ls-files")
-    ) {
+    if crate::git::is_read(&tokens[1..]) {
         BashDecision {
             verdict: Verdict::Allow,
             rule: "read-only-git",

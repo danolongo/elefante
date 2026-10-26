@@ -43,22 +43,68 @@ pub struct Invocation {
     pub environment: BTreeMap<OsString, OsString>,
 }
 
+/// Subcommands that can change the repository. Every other subcommand is a read.
+const WRITE_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "rm",
+    "mv",
+    "restore",
+    "commit",
+    "switch",
+    "checkout",
+    "branch",
+    "stash",
+    "tag",
+    "merge",
+    "cherry-pick",
+    "rebase",
+    "reset",
+    "clean",
+    "push",
+    "fetch",
+    "pull",
+    "config",
+];
+
+/// Commands that run their arguments as another command.
+const WRAPPERS: &[&str] = &[
+    "env", "command", "exec", "nice", "nohup", "time", "timeout", "xargs", "sudo", "builtin",
+];
+
+/// Reports whether `words`, the words after `git`, form a read. A read is a subcommand outside
+/// `WRITE_SUBCOMMANDS`, or a listing form of `branch`, `tag`, `stash` or `config`.
+pub(crate) fn is_read(words: &[String]) -> bool {
+    let Some((subcommand, args)) = words.split_first() else {
+        return false;
+    };
+    let first = args.first().map(String::as_str);
+    match subcommand.as_str() {
+        "branch" | "tag" => args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-a" | "-l" | "--list" | "-v")),
+        "stash" => matches!(first, Some("list" | "show")),
+        "config" => matches!(first, Some("--get" | "--get-all" | "--list" | "-l")),
+        "--version" => args.is_empty(),
+        other => !other.starts_with('-') && !WRITE_SUBCOMMANDS.contains(&other),
+    }
+}
+
+fn refuse_if(write: bool) -> GitRoute {
+    if write {
+        GitRoute::Refused(REFUSAL)
+    } else {
+        GitRoute::NotHarness
+    }
+}
+
 /// Routes only whole, static, single git commands. Reads stay in the shell sandbox.
 #[must_use]
 pub fn route(source: &str, root: &Path) -> GitRoute {
     let Some(words) = literal_words(source) else {
-        return if contains_write(source) {
-            GitRoute::Refused(REFUSAL)
-        } else {
-            GitRoute::NotHarness
-        };
+        return refuse_if(contains_write(source));
     };
     if words.first().is_none_or(|word| word != "git") {
-        return if contains_write(source) {
-            GitRoute::Refused(REFUSAL)
-        } else {
-            GitRoute::NotHarness
-        };
+        return refuse_if(contains_write(source));
     }
     if !source.trim_start_matches([' ', '\t']).starts_with("git ")
         && !source.trim_start_matches([' ', '\t']).starts_with("git\t")
@@ -66,31 +112,19 @@ pub fn route(source: &str, root: &Path) -> GitRoute {
     {
         return GitRoute::Refused(REFUSAL);
     }
-    let Some(subcommand) = words.get(1).map(String::as_str) else {
-        return GitRoute::NotHarness;
-    };
-    let args = &words[2..];
-    if matches!(
-        subcommand,
-        "status"
-            | "diff"
-            | "log"
-            | "show"
-            | "rev-parse"
-            | "ls-files"
-            | "ls-tree"
-            | "show-ref"
-            | "describe"
-    ) || (matches!(subcommand, "branch" | "tag") && args.is_empty())
-    {
+    let rest = &words[1..];
+    if rest.is_empty() || is_read(rest) {
         return GitRoute::NotHarness;
     }
-    if valid_write(subcommand, args, root) {
+    if valid_write(&rest[0], &rest[1..], root) {
         GitRoute::Harness(GitWrite {
-            args: words[1..].to_vec(),
+            args: rest.to_vec(),
         })
     } else {
-        GitRoute::Refused(REFUSAL)
+        refuse_if(
+            rest.iter()
+                .any(|word| WRITE_SUBCOMMANDS.contains(&word.as_str())),
+        )
     }
 }
 
@@ -114,10 +148,9 @@ fn command_contains_write(node: tree_sitter::Node<'_>, source: &str) -> bool {
             .child_by_field_name("name")
             .map(|name| &source[name.byte_range()])
             .unwrap_or_default();
-        let name = literal_words(raw_name)
-            .and_then(|words| (words.len() == 1).then(|| words[0].clone()))
+        let name = single_word(raw_name)
             .unwrap_or_else(|| raw_name.trim_matches(['"', '\'', '$']).to_owned());
-        let wrapped = matches!(name.as_str(), "env" | "command");
+        let wrapped = WRAPPERS.contains(&name.as_str());
         if name == "git"
             || name.ends_with("/git")
             || wrapped
@@ -128,71 +161,43 @@ fn command_contains_write(node: tree_sitter::Node<'_>, source: &str) -> bool {
             let mut arguments = node
                 .named_children(&mut cursor)
                 .filter(|child| !matches!(child.kind(), "command_name" | "variable_assignment"))
+                .map(|child| single_word(&source[child.byte_range()]))
                 .collect::<Vec<_>>();
             if wrapped {
                 if let Some(git) = arguments.iter().position(|arg| {
-                    literal_words(&source[arg.byte_range()]).is_some_and(|words| {
-                        words.len() == 1 && (words[0] == "git" || words[0].ends_with("/git"))
-                    })
+                    arg.as_ref()
+                        .is_some_and(|word| word == "git" || word.ends_with("/git"))
                 }) {
                     arguments.drain(..=git);
                 } else {
                     arguments.clear();
                 }
             }
-            let read = arguments.first().is_some_and(|first| {
-                literal_words(&source[first.byte_range()]).is_some_and(|words| {
-                    words.len() == 1
-                        && (matches!(
-                            words[0].as_str(),
-                            "status"
-                                | "diff"
-                                | "log"
-                                | "show"
-                                | "rev-parse"
-                                | "ls-files"
-                                | "ls-tree"
-                                | "show-ref"
-                                | "describe"
-                        ) || (arguments.len() == 1
-                            && matches!(words[0].as_str(), "branch" | "tag")))
-                })
-            });
-            for child in arguments.into_iter().filter(|_| !read) {
-                let text = &source[child.byte_range()];
-                if literal_words(text).is_some_and(|words| {
-                    words.len() == 1
-                        && matches!(
-                            words[0].as_str(),
-                            "add"
-                                | "rm"
-                                | "mv"
-                                | "restore"
-                                | "commit"
-                                | "switch"
-                                | "checkout"
-                                | "branch"
-                                | "stash"
-                                | "tag"
-                                | "merge"
-                                | "cherry-pick"
-                                | "rebase"
-                                | "reset"
-                                | "clean"
-                                | "push"
-                                | "fetch"
-                                | "pull"
-                                | "config"
-                        )
-                }) {
-                    return true;
-                }
+            let read = arguments
+                .iter()
+                .cloned()
+                .collect::<Option<Vec<_>>>()
+                .is_some_and(|words| is_read(&words));
+            if !read
+                && arguments
+                    .iter()
+                    .flatten()
+                    .any(|word| WRITE_SUBCOMMANDS.contains(&word.as_str()))
+            {
+                return true;
             }
         }
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| command_contains_write(child, source))
+}
+
+/// Returns the one literal word in `source`, or `None` for anything else.
+fn single_word(source: &str) -> Option<String> {
+    literal_words(source)
+        .filter(|words| words.len() == 1)
+        .map(|mut words| words.swap_remove(0))
 }
 
 fn literal_words(source: &str) -> Option<Vec<String>> {
@@ -263,7 +268,11 @@ fn valid_write(sub: &str, args: &[String], root: &Path) -> bool {
     match sub {
         "add" | "rm" | "mv" | "restore" => valid_paths(sub, args, root),
         "switch" => one_ref(args) || flag_ref(args, "-c"),
-        "checkout" => one_ref(args) || flag_ref(args, "-b"),
+        // A ref that names a file would read as a pathspec and discard that file's changes.
+        "checkout" => {
+            (one_ref(args) && root.join(&args[0]).symlink_metadata().is_err())
+                || flag_ref(args, "-b")
+        }
         "branch" => one_ref(args) || flag_ref(args, "-d"),
         "stash" => match args.first().map(String::as_str) {
             Some("pop" | "apply") => args.len() == 1,
@@ -421,6 +430,10 @@ pub fn invocation(git: &Path, root: &Path, write: &GitWrite, identity: &Identity
     invocation
         .args
         .extend(write.args.iter().map(OsString::from));
+    // A trailing `--` makes git read `checkout <ref>` as a tree-ish, never as a pathspec.
+    if write.args.len() == 2 && write.args[0] == "checkout" {
+        invocation.args.push("--".into());
+    }
     for prefix in ["GIT_AUTHOR", "GIT_COMMITTER"] {
         invocation.environment.insert(
             format!("{prefix}_NAME").into(),

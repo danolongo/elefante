@@ -645,8 +645,10 @@ that phase can pass its gate.
   redirections, environment prefixes and global options are refused. `guard::git` applies an
   exact option allowlist per local write subcommand (`add`, `rm`, `mv`, `restore`, `commit`,
   `switch`, `checkout`, `branch`, `stash`, `tag`, `merge`, `cherry-pick`, `rebase`) and validates
-  paths and refs. `reset`, `clean`, remote/configuration commands, unknown options and aliases
-  are refused. Every routed write asks for approval; the disabled sandbox asks for every bash
+  paths and refs. `reset`, `clean`, `push`, `fetch`, `pull`, `config` writes and unknown options
+  are refused, also behind wrappers such as `env`, `exec` or `xargs`. `checkout <ref>` runs as
+  `checkout <ref> --`, so git never reads the ref as a pathspec. Every other subcommand, such as
+  `grep`, `blame` or an alias, is a read and runs in the sandbox. Every routed write asks for approval; the disabled sandbox asks for every bash
   call. The harness uses an absolute git binary, a cleared environment and flags that disable
   hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
   It refuses repositories with in-root include or hooksPath targets or LFS filters. Hooks do not

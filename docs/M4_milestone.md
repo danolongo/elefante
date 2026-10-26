@@ -271,7 +271,14 @@ pub fn hardened(git: &Path, root: &Path) -> Invocation;   // base for mem/cochan
   pipe, list or env prefix. That way the command shown for approval and the argv executed are the
   same.
 - A write subcommand in any other shape is `Refused` ("run git write commands on their own").
+  That includes a write behind `env`, `command`, `exec`, `nice`, `nohup`, `time`, `timeout`,
+  `xargs`, `sudo` or `builtin`.
 - Read subcommands are **not** routed: they run in the sandbox like any bash command.
+- The write subcommands are the table below plus `reset`, `clean`, `push`, `fetch`, `pull` and
+  `config`. Every other subcommand is a read, such as `grep`, `blame`, `remote -v` or an alias.
+  The listing forms are reads too: `branch` or `tag` with only `-a`, `-l`, `--list` or `-v`,
+  `stash list|show`, `config --get|--get-all|--list|-l`, and `git --version`.
+  The router and the bash classifier share these two lists.
 
 **Per-subcommand allowlist.** Each option must match exactly; anything else is refused, which
 covers abbreviations too.
@@ -284,7 +291,7 @@ covers abbreviations too.
 | `restore` | `--staged`, `--worktree`, `--`, paths |
 | `commit` | `-m <msg>`+ (required), `-a`, `--amend`, `--no-edit` |
 | `switch` | `-c <ref>`, `<ref>` |
-| `checkout` | `-b <ref>`, `<ref>` (no pathspec form) |
+| `checkout` | `-b <ref>`, `<ref>` that names no existing path; the harness appends `--` |
 | `branch` | `<ref>`, `-d <ref>` |
 | `stash` | `push [-m <msg>]`, `pop`, `apply` |
 | `tag` | `<ref>`, `-a <ref> -m <msg>` |

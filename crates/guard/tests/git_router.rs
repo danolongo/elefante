@@ -48,6 +48,7 @@ fn routes_only_literal_local_writes() {
 #[test]
 fn refuses_unsupported_or_dynamic_writes() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("src.txt"), "tracked").unwrap();
     for source in [
         "git commit",
         "git commit --amen -m x",
@@ -72,7 +73,6 @@ fn refuses_unsupported_or_dynamic_writes() {
         "git push",
         "git fetch",
         "git config x y",
-        "git alias",
         "git checkout topic -- src",
         "git branch --delete topic",
         "git commit -m x\ntrue",
@@ -104,12 +104,30 @@ fn refuses_unsupported_or_dynamic_writes() {
         "g\\it add src",
         "env git add src",
         "command git add src",
+        "git checkout .",
+        "git checkout ..",
+        "git checkout src.txt",
+        "exec git add src",
+        "nice git commit -m x",
+        "nice -n 5 git add src",
+        "nohup git add src",
+        "time git add src",
+        "timeout 5 git add src",
+        "xargs git add < files",
+        "sudo git add src",
+        "builtin git add src",
+        "git -c core.pager=cat commit -m x",
     ] {
         assert!(
             matches!(git::route(source, root.path()), GitRoute::Refused(_)),
             "{source}"
         );
     }
+}
+
+#[test]
+fn leaves_reads_and_other_commands_in_the_sandbox() {
+    let root = tempfile::tempdir().unwrap();
     for source in [
         "git status",
         "git log -p",
@@ -122,6 +140,23 @@ fn refuses_unsupported_or_dynamic_writes() {
         "git branch | cat",
         "git log branch | cat",
         "git log --format=commit | cat",
+        "git grep foo",
+        "git blame src.txt",
+        "git blame src.txt | head",
+        "git branch -a",
+        "git branch --list",
+        "git branch -v",
+        "git tag -l",
+        "git stash list",
+        "git stash show",
+        "git config --get user.name",
+        "git remote -v",
+        "git --version",
+        "git alias",
+        "exec git status",
+        "nice git log",
+        "time git status",
+        "xargs git log < files",
     ] {
         assert_eq!(
             git::route(source, root.path()),
@@ -213,6 +248,66 @@ fn invocation_is_explicit_and_hardened() {
             .unwrap(),
         "Agent"
     );
+}
+
+#[test]
+fn checkout_ref_invocation_never_reads_the_ref_as_a_pathspec() {
+    let root = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid"
+                ])
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success(),
+            "{args:?}"
+        );
+    };
+    git(&["init", "--quiet"]);
+    std::fs::write(root.path().join("notes"), "committed").unwrap();
+    git(&["add", "notes"]);
+    git(&["commit", "--quiet", "-m", "base"]);
+    // With `notes` deleted from the worktree, plain `git checkout notes` would restore the file.
+    std::fs::remove_file(root.path().join("notes")).unwrap();
+    let GitRoute::Harness(write) = git::route("git checkout notes", root.path()) else {
+        panic!("route")
+    };
+    let identity = Identity {
+        name: "Agent".into(),
+        email: "agent@example.invalid".into(),
+    };
+    let invocation = git::invocation(Path::new("/usr/bin/git"), root.path(), &write, &identity);
+    assert_eq!(invocation.args.last().unwrap(), "--");
+    let run = |args: &[std::ffi::OsString]| {
+        std::process::Command::new(&invocation.program)
+            .args(args)
+            .current_dir(&invocation.cwd)
+            .env_clear()
+            .envs(&invocation.environment)
+            .output()
+            .unwrap()
+    };
+    assert!(!run(&invocation.args).status.success());
+    assert!(!root.path().join("notes").exists());
+    // Positive control: the same argv without `--` restores the deleted file.
+    assert!(
+        run(&invocation.args[..invocation.args.len() - 1])
+            .status
+            .success()
+    );
+    assert!(root.path().join("notes").exists());
+    let GitRoute::Harness(create) = git::route("git checkout -b topic", root.path()) else {
+        panic!("route")
+    };
+    let invocation = git::invocation(Path::new("/usr/bin/git"), root.path(), &create, &identity);
+    assert_eq!(invocation.args.last().unwrap(), "topic");
 }
 
 #[test]

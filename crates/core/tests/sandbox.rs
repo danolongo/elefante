@@ -238,6 +238,53 @@ async fn real_sandbox_preserves_workspace_writes_and_hides_secret_names() {
 }
 
 #[tokio::test]
+async fn secret_names_stay_hidden_in_build_and_package_trees() {
+    use elefante_core::sandbox::SessionSandbox;
+    let root = tempfile::tempdir().expect("fixture root");
+    let root_path = root.path().canonicalize().expect("canonical fixture root");
+    let secrets = ["target/.env", "node_modules/x/.env"];
+    for name in secrets {
+        let path = root_path.join(name);
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture");
+        std::fs::write(&path, "synthetic fixture").expect("fixture");
+    }
+    std::fs::write(root_path.join("target/ordinary"), "ordinary").expect("fixture");
+    let session = SessionSandbox::new(&root_path).expect("session setup");
+    let policy = session.scan().expect("session policy");
+    for name in secrets {
+        let path = root_path.join(name);
+        // Host control: the daemon reads the fixture.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("host control"),
+            "synthetic fixture"
+        );
+        assert!(
+            policy.hidden.iter().any(|hidden| hidden.path == path),
+            "{name} is not hidden"
+        );
+        let output = session
+            .run_shell(&format!("cat {name}"), Network::Off)
+            .await
+            .expect("sandbox executes; install bubblewrap and enable user namespaces on Linux, or enable sandbox-exec on macOS");
+        assert!(
+            !output.success && !output.content.contains("synthetic fixture"),
+            "{name}: {}",
+            output.content
+        );
+    }
+    // Positive control: an ordinary file beside the secret stays readable.
+    let ordinary = session
+        .run_shell("cat target/ordinary", Network::Off)
+        .await
+        .expect("sandbox executes");
+    assert!(
+        ordinary.success && ordinary.content == "ordinary",
+        "{}",
+        ordinary.content
+    );
+}
+
+#[tokio::test]
 async fn ten_megabytes_of_sandbox_output_is_capped_with_size_and_tail() {
     use elefante_core::sandbox::SessionSandbox;
     let root = tempfile::tempdir().expect("fixture root");

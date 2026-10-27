@@ -498,7 +498,7 @@ impl SessionSandbox {
         let mut policy = self.policy.clone();
         let mut repositories = Vec::new();
         let mut queue = vec![(policy.root.clone(), false)];
-        while let Some((directory, secret_pruned)) = queue.pop() {
+        while let Some((directory, skip_links)) = queue.pop() {
             for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
                 let entry = entry.map_err(|error| error.to_string())?;
                 let path = entry.path();
@@ -548,25 +548,24 @@ impl SessionSandbox {
                 });
                 let hard_link = kind.is_file()
                     && !in_git_metadata
-                    && !secret_pruned
+                    && !skip_links
                     && entry.metadata().map_err(|error| error.to_string())?.nlink() > 1;
                 let secret = hard_link
-                    || !secret_pruned
-                        && (name == ".elefante"
-                            || name == ".ssh"
-                            || name == ".env"
-                            || name.starts_with(".env.")
-                            || matches!(
-                                name.as_ref(),
-                                ".netrc"
-                                    | ".npmrc"
-                                    | ".git-credentials"
-                                    | "credentials"
-                                    | "credentials.toml"
-                            )
-                            || name.starts_with("id_rsa")
-                            || name.to_ascii_lowercase().ends_with(".pem")
-                            || name.to_ascii_lowercase().ends_with(".key"));
+                    || (name == ".elefante"
+                        || name == ".ssh"
+                        || name == ".env"
+                        || name.starts_with(".env.")
+                        || matches!(
+                            name.as_ref(),
+                            ".netrc"
+                                | ".npmrc"
+                                | ".git-credentials"
+                                | "credentials"
+                                | "credentials.toml"
+                        )
+                        || name.starts_with("id_rsa")
+                        || name.to_ascii_lowercase().ends_with(".pem")
+                        || name.to_ascii_lowercase().ends_with(".key"));
                 if secret {
                     policy.hidden.push(HiddenPath {
                         path: path.clone(),
@@ -577,10 +576,11 @@ impl SessionSandbox {
                         },
                     });
                 }
+                // Cargo hard-links thousands of build files, so these trees skip the link check.
                 if kind.is_dir() {
                     queue.push((
                         path,
-                        secret_pruned || matches!(name.as_ref(), "target" | "node_modules"),
+                        skip_links || matches!(name.as_ref(), "target" | "node_modules"),
                     ));
                 }
             }

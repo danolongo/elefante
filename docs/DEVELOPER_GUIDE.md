@@ -1113,7 +1113,7 @@ it rescans the root and refreshes `read_only` and `hidden`.
 | `readable` | Exact system paths: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/System/Library`, `/Library/Apple`, the Command Line Tools, `/private/etc`, `/private/var/db/dyld`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, and the resolver files `/etc/resolv.conf`, `/etc/nsswitch.conf` and `/etc/hosts`. Also `/dev/null`, `/dev/random` and `/dev/urandom`; the directories of the resolved `bash` and `git`; the Cargo and Bun `bin` directories; the Cargo registry; and the selected rustup toolchain with its settings file. Only paths that exist enter the list. |
 | `writable` | Empty. Only `root` and `temp` are writable. |
 | `read_only` | Every `.git` entry in the root, in any case, from an unpruned walk; the validated `gitdir` and `commondir` targets; and any in-root `core.hooksPath` or include target, including one that an enclosing repository's config names. A `gitdir` or `commondir` that points outside the root and the session's initial repository makes the command fail. |
-| `hidden` | Names the scan finds under the root: `.elefante`, `.ssh`, `.env`, `.env.*`, `.netrc`, `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem` and `*.key`, plus every hard-linked regular file outside `.git`. The secret scan skips `target/` and `node_modules/`. |
+| `hidden` | Names the scan finds under the root: `.elefante`, `.ssh`, `.env`, `.env.*`, `.netrc`, `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem` and `*.key`, plus every hard-linked regular file outside `.git`, `target/` and `node_modules/`. |
 | `protected` | The socket and token paths: `~/.elefante/run/{elefante.sock,token}`, `$XDG_RUNTIME_DIR/{elefante.sock,token}`, and `ELEFANTE_SOCKET` with the `token` beside it. Never readable. |
 | `network` | `Off`, or `Approved` for one call. |
 
@@ -1193,7 +1193,7 @@ then `$XDG_CONFIG_HOME/git/config`, through `guard::git::hardened`.
   network. Linux uses the PID namespace instead.
 - **`web_search` queries leave without per-call approval**, up to the cap. The executor scrubs them
   and refuses URLs, but each query remains an outbound channel.
-- **The secret scan is name-based**, and it skips `target/` and `node_modules/`.
+- **The secret scan is name-based.** Its hard-link check skips `target/` and `node_modules/`.
 - **`ELEFANTE_SANDBOX=0`** removes the OS boundary. An approved command then runs with the user's
   full access, including the daemon's token.
 - **Kernel exploits.** The opt-in microVM backends of M4.2 and M4.3 address them.

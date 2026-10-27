@@ -4,6 +4,10 @@ import { displaySafe, type Approval } from "../protocol";
 import { BORDER, PLACEHOLDER, WARNING } from "./theme";
 export type ApprovalProps = { kind: "approval"; approval: Approval; onDecision: (decision: "allow" | "deny") => void };
 const CHOICES = [["Yes", "allow"], ["No", "deny"]] as const;
+const HEADINGS: Record<string, string> = {
+  "web-search-first": "Allow web searches? Approving lets up to 29 more run without asking.",
+  "web-search-cap": "Allow this web search?",
+};
 /// The frame shared by the questions that take the prompt bar's place.
 export function PromptPanel(props: { id: string; children: ReactNode }) {
   return <box id={props.id} border borderColor={BORDER} paddingX={1} flexDirection="column">{props.children}</box>;
@@ -23,7 +27,7 @@ export function ApprovalPrompt(props: ApprovalProps) {
     else if (key.name === "return") decide(CHOICES[index][1]);
   });
   return <PromptPanel id="approval-prompt">
-    <text>Allow this command? · {props.approval.rule}</text>
+    <text>{HEADINGS[props.approval.rule] ?? "Allow this command?"} · {props.approval.rule}</text>
     {props.approval.network && <text id="network-badge" fg={WARNING}>[network] this command asks for internet access</text>}
     <text marginTop={1}>{displaySafe(props.approval.command)}</text>
     <box marginTop={1} flexDirection="column">

@@ -724,17 +724,205 @@ The docs landed in four separate `docs:` commits, from 9d89cc9 to the one that a
 
 ## Phase 5 — M4.1 (after M4 is green)
 
-**Baseline:**
-- Harness write git runs under a third profile: network off, nothing outside the root readable,
-  root writable, `.git` writable except `hooks/`, `config`, `info/` and any `hooksPath` target.
-- On Linux this is a bubblewrap profile with `.git` rw-bound and those paths ro-bound over it.
-- On macOS, Seatbelt allows `.git` writes except those paths.
-- The allowlist stays in place as the second line of defence.
+M4 is merged and green on `main` (`f5de663`). M4.1 adds three things: a sandbox for harness
+write git, approval for the first `web_search` of a session, and a search backend that answers.
 
-**Gate:**
-- A test-only build flag widens the allowlist (`--output=$HOME/x`, `--no-index ~/.ssh/f`,
-  `merge -s evil`), and each one still fails at the OS.
-- A commit and a rebase still work.
+### Starting point
+
+- `HarnessGit::execute` (`crates/core/src/harness_git.rs`) runs approved git writes on the host.
+  It clears the environment and uses `git::invocation`, but nothing confines the process. The
+  per-subcommand allowlist in `crates/guard/src/git.rs` is the only defence.
+- `ToolExecutor::bash` (`crates/core/src/tools.rs`) scans the root under the write lock before a
+  harness write, then throws the scanned `Policy` away.
+- `Gate::check_with_tools` (`crates/core/src/lib.rs`) lets the first 30 searches of a session run
+  without approval. The 31st and later escalate with rule `web-search-cap`.
+- A live check (credentialed run 40486394912) showed the backend in
+  `crates/elefante/src/daemon/search.rs` returned only a source list for a keyword query, with no
+  answer.
+
+### Decisions
+
+**The harness git profile.** It is built from the same scanned `Policy` as bash, with these
+changes:
+- Network is always `Off`. Readable: the root, the private temp, the system and toolchain paths
+  bash already reads, and an external common directory, which the scan already makes readable.
+- The session's own git directory, and its common directory when that differs, become writable.
+  This includes a linked worktree whose common directory sits outside the root. `scan_root`
+  already confines such a directory to the initial repository. The scan puts `root/.git`, the
+  git directory and the common directory in `read_only`; the git profile removes exactly those
+  entries, or its read-only rules would win over the writable ones. Validation accepts a
+  `git_writable` path in host temp the way it accepts an exact `read_only` entry, so the
+  gate's `/tmp` fixtures work.
+- No other git directory becomes writable. Nested repositories stay read-only. Inside a writable
+  common directory, `modules/` and every `worktrees/<name>/` other than the session's own git
+  directory are read-only: no allowlisted command writes them, and a sibling worktree's
+  `commondir` or a submodule's `hooks/` would otherwise be open to rewrite.
+- Read-only inside each writable git directory: `hooks/`, `config`, `config.worktree`, `info/`,
+  `commondir`, `gitdir` and `objects/info/alternates`. Every `include.path`, `includeIf.*.path`
+  and `core.hooksPath` target that lands in a writable directory is read-only too. A root `.git`
+  that is a gitfile stays read-only.
+- In-root files with secret names stay **readable** to harness git. On Linux a hidden file reads
+  as empty, so `git commit -a` would record a tracked `.env.example` as blank. Today's host git
+  reads them too, so this is no regression. Hard-linked files become read-only instead of
+  hidden, for the same reason. A known limitation follows: `switch`, `stash pop` or `merge`
+  fails if it must replace a hard-linked file, which host git could do in M4. `.elefante`, the
+  home directory, the daemon socket and its token stay hidden.
+- **Protected names that do not exist yet.** A normal clone has no `config.worktree`,
+  `commondir`, `gitdir` or `objects/info/alternates`, and bubblewrap cannot mount over a missing
+  path without creating it. On macOS a deny on a missing path blocks only that exact spelling,
+  so `.git/HOOKS` could appear on a case-insensitive volume. So on both systems, before each
+  run, harness git records which protected names are absent. After the run it checks them again,
+  ignoring case. Any that appeared is quarantined, as `quarantine_new_git` does, and the call
+  returns an error. Existing protected paths are mounted read-only or denied as above.
+- **Renames on macOS.** An allow on `subpath <gitdir>` also allows renaming the directory
+  itself, so `mv .git g2`, an edit of `g2/config`, and `mv g2 .git` would get past path-based
+  denies. The git profile denies writes to the literal path of the git directory, the common
+  directory, and every writable ancestor of a read-only entry (`objects`, `objects/info`,
+  `worktrees`). The spike checks that git can still create entries inside those directories.
+  Linux needs no rule: each of those paths is a mount point, and renaming one fails with
+  `EBUSY`.
+- **New repositories on Linux.** After a sandboxed git run, `quarantine_new_git` runs, as it does
+  after bash. On macOS `ROOT_DENIES` already refuses a new `.git` outside the writable git
+  directories.
+- The git process runs through the same launcher as bash: Seatbelt with `-D` parameters on
+  macOS, and bubblewrap with both seccomp programs on Linux. The environment is the hardened git
+  environment plus `TMPDIR` set to the private temp.
+- **The sandboxed write uses the git that bash's `PATH` finds**: the Command Line Tools git on
+  macOS, `/usr/bin/git` on Linux. `binary("git")` prefers Homebrew, whose libraries under
+  `/opt/homebrew/opt` are not readable in the sandbox; Homebrew git fails to load there
+  (reviewer's experiment: `dyld: Library not loaded … libpcre2-8.0.dylib`). The preflight reads
+  keep using `binary("git")` on the host.
+- `git::hardened` adds `gc.auto=0` and `maintenance.auto=false`, so no background git process
+  outlives the call. If the spike shows switching to a remote-tracking name writes upstream
+  config, it adds `branch.autoSetupMerge=false` as well.
+- The allowlist stays in place as the second line of defence.
+- **`ELEFANTE_SANDBOX=0`** (`Sandbox::Disabled`): harness git runs on the host as in M4, and the
+  sandbox status line already reports the opt-out. `Sandbox::Unavailable` refuses, as bash does.
+- The preflight reads (`ls-files`, `show`, `config --file -`) stay on the host. They are fixed
+  commands with hooks, drivers, attributes and pagers off.
+- **Residual: rebase and sequencer state.** `rebase-merge/`, `rebase-apply/` and `sequencer/`
+  must stay writable for the allowlisted `rebase` and `cherry-pick`. A git that gets past the
+  allowlist can leave `exec` lines or a strategy name there, and the user's own
+  `git rebase --continue` on the host acts on them. § 9 records this as a residual risk.
+
+**Renderer changes in `crates/guard/src/sandbox.rs`.**
+- `Policy` gains `git_writable: Vec<PathBuf>`. `validate` accepts these paths only when they are
+  absolute, normalized and free of protected locations. They are exempt from the "no `.git`
+  component in a writable path" rule that keeps bash out of `.git`.
+- `seatbelt_profile` emits `allow file-write*` for each `git_writable` path after
+  `ROOT_DENIES` and before the `RO` and `HIDDEN` denies. Seatbelt applies the last match, so
+  `config` and `hooks/` stay denied. A git-profile flag leaves out the in-root secret read deny.
+- `bwrap_args` emits `--bind` for each `git_writable` path after the root, then the `--ro-bind`
+  entries over them.
+- `LaunchSpec` carries `program` and `args` instead of a fixed `bash -c <command>`, so the same
+  renderer starts git.
+
+**`web_search` approval.**
+- While no search in the session has been approved, `Gate::check_with_tools` escalates every
+  search with rule `web-search-first`, **without reserving a cap slot**. If a turn starts
+  several searches at once, each one asks, so none runs before an approval.
+- When the user approves a search, `execute_one` calls one new `ToolExecutor` method before
+  running it. That method records the approval and takes a cap slot, so the approved search
+  counts toward the 30. A denied search takes no slot and approves nothing. The gate cannot do
+  this itself: `execute_approved(…, false)` looks the same for an approved search and an
+  automatically allowed one.
+- After one approval, searches reserve a slot and run without a prompt up to the cap of 30.
+  Later searches escalate with `web-search-cap`, as today.
+- The approval and the counter live on the session's `ToolExecutor`. A daemon restart or a
+  session resume resets both, so the next search asks again.
+- For `web-search-first` the TUI prompt reads "Allow web searches? Approving lets up to 29 more
+  run without asking." For `web-search-cap` it reads "Allow this web search?" Other rules keep
+  "Allow this command?". The query shows where the command shows today.
+- A run with a prompt still denies every approval, so a headless run cannot search. The README
+  says so.
+
+**The search answer.** `SYSTEM` in `search.rs` asks for an answer of one to three sentences
+first, then the numbered source URLs. The ignored live test asserts the answer part, not only a
+URL.
+
+**Threat model.** `DEVELOPER_GUIDE.md` § 9 states the channel. Each query can carry up to 300
+characters out. After the first approval, 29 more need none: about 8.7 KB per `ToolExecutor`,
+which a daemon restart or session resume starts over. The residual risk entry for `web_search`
+changes to match.
+
+### Spike (inside track A, before its code)
+
+Run on macOS locally and on Linux in CI, in scratch repositories only:
+1. With `config`, `config.worktree`, `hooks/` and `info/` write-denied, do all allowlisted writes
+   work? (macOS, 2026-10-27: `branch`, `switch -c`, `checkout -b`, `branch -d`, `tag`,
+   `tag -a`, `commit`, `rebase`, `merge --no-ff` and `stash push`/`pop` all worked. A direct
+   `git config` write was refused as a control.)
+2. A commit from a linked worktree whose common directory is outside the root.
+3. Does switching to a name that only exists as a remote-tracking branch write upstream config?
+4. Does the Command Line Tools git run under the git profile with the hardened environment and
+   only the private temp as `TMPDIR`?
+5. With literal write denies on the git directory, `objects`, `objects/info` and `worktrees`,
+   can git still create entries inside them, and is `mv .git g2` refused?
+
+Results go into this section before track A writes code. A result that breaks a decision
+changes this plan first.
+
+### Tracks
+
+Two Sonnet workers run in parallel in their own Orca worktrees, each on its own branch from
+`m4.1-hardening`. The coordinator merges them into `m4.1-hardening`, then does track C.
+
+**Track A — harness git sandbox** (`guard`, `core`):
+- The renderer changes and their unit tests in `crates/guard/src/sandbox.rs`.
+- `SessionSandbox` builds the git profile from a scan and runs a program under it. The scan
+  that `ToolExecutor::bash` already does under the write lock feeds it.
+- `HarnessGit::execute` uses it. `Disabled` keeps the host path.
+- `git::hardened` settings from the decisions above.
+- A `test-support` feature on `elefante-guard` adds `GitWrite::unchecked(args)`. Only the
+  dev-dependencies of `elefante-core` enable it. With `resolver = "2"`, dev-dependency features
+  stay out of `cargo build`. `cargo test --workspace` compiles it into test builds, which is
+  harmless: it is only a constructor.
+- Gate tests in a new `crates/core/tests/harness_git_sandbox.rs`.
+
+**Track B — `web_search`** (`core`, `elefante`, `tui`, docs):
+- `web-search-first` in `Gate::check_with_tools`, and the approval-and-slot method that
+  `execute_one` calls after an approved search.
+- The search `SYSTEM` prompt, and the live test assertion.
+- The TUI heading, with a test.
+- README, the `web_search` row and threat model in `DEVELOPER_GUIDE.md`.
+
+**Track C — closing** (coordinator, after A and B merge):
+- Lasting decisions move into `PLAN.md` and `DEVELOPER_GUIDE.md`. That includes the harness git
+  profile, the S9 results, and two § 9 entries: the rebase and sequencer residual, and the
+  hard-link limitation. Then this file is deleted.
+- The PR into `main`. The credentialed workflow runs at the end only with the maintainer's
+  approval.
+
+### Gate
+
+Hermetic, on both macOS and Linux CI:
+- `GitWrite::unchecked` runs three commands the router refuses. Each fails at the OS, and each
+  has a positive control:
+  - `diff --output=<outside>/x`: no file appears outside the root. Control: the same output
+    path inside the root is written.
+  - `diff --no-index <outside>/secret <root>/file`: the outside fixture cannot be read.
+    Control: two in-root files diff.
+  - `--exec-path=<root>/bin merge -s evil <branch>`: an in-root `git-merge-evil` script runs.
+    The fixture's branches have diverged, because git fast-forwards or reports "Already up to
+    date" without calling a custom strategy otherwise. The script tries to write outside the
+    root, write `.git/hooks/x`, write `.git/config`, create `.git/commondir`, rename `.git`, and
+    open a network connection. Each attempt fails. Control: it writes a marker file inside the
+    root.
+  - Fixtures live in temp directories. No test reads or writes the real home.
+- A commit, a rebase, a merge and a stash round trip through the router succeed under the
+  sandbox. A commit from a linked worktree succeeds.
+- A protected name created during a run (`.git/commondir`, and `.git/HOOKS` on macOS) is
+  quarantined and the call fails. On Linux a new `sub/.git` is quarantined.
+- In a linked worktree, a sibling worktree's admin directory stays read-only.
+- The first `web_search` escalates with `web-search-first` and shows its query. After an
+  approval, the second runs without a prompt, and the approved search counted toward the cap. A
+  denied first search takes no slot and leaves the next one asking. Two searches in one batch
+  both ask.
+- The TUI shows each search heading for its rule.
+- M0–M4 gates, MSRV, TUI checks and the macOS host job stay green.
+
+Credentialed, at the end, with the maintainer's approval: the `all` checks of the credentialed
+workflow, including the web search answer.
 
 **Record.** The closing pull request deletes this file and states what the gate proved.
 

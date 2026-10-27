@@ -35,13 +35,15 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/store.ts` | 28 | The external store `main.tsx` publishes into and `Root` subscribes to. |
 | `src/commands.ts` | 11 | Pure: `parseCommand` — only exactly `/memory` and `/forget <integer>` (spaces or tabs between) are commands; `//x` sends `/x`; anything else is a prompt. |
 | `src/memoryView.ts` | 18 | Pure: provenance in words (`you asked`, `you said`, `assistant — unconfirmed`) and the one line saying why learning is paused or failing. |
-| `src/main.tsx` | 144 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop, the consent question, and the `/memory` and `/forget` actions. |
+| `src/main.tsx` | 161 | Entrypoint — argument parsing, connect, renderer construction, reconnect loop, the consent question, approval answers (hidden as soon as the user answers), and the `/memory` and `/forget` actions. |
 | `src/ui/Root.tsx` | 10 | Mounted once; reads the store so listeners register once, not once per update. |
 | `src/ui/Transcript.tsx` | 66 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/toolView.ts` | 72 | Pure: a tool call as a header subject (`✓ bash \`ls\` (12 ms)`) and at most three body lines indented four spaces. A `read` is just its path, never the file. |
-| `src/ui/Modal.tsx` | 43 | Approval, first-run key, memory-consent and `/memory` modals. The approval modal shows the command through `displaySafe` and a `[network]` badge when the command asks for internet access. |
+| `src/ui/Modal.tsx` | 21 | The first-run key modal, and the `ModalProps` union of every question and panel. |
+| `src/ui/ApprovalPrompt.tsx` | 34 | The approval prompt, drawn in place of the prompt bar, and the `PromptPanel` frame it shares with the consent question. It shows the command through `displaySafe`, the rule, and a `[network]` badge when the command asks for internet access. Only the first decision counts. |
+| `src/ui/ConsentPrompt.tsx` | 22 | The memory-consent question, drawn in place of the prompt bar. |
 | `src/ui/MemoryPanel.tsx` | 58 | The `/memory` panel: list, scroll, forget with a Y/N confirmation, close. |
-| `src/ui/App.tsx` | 48 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
+| `src/ui/App.tsx` | 55 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
 | `src/ui/markdown.ts` | 17 | The `SyntaxStyle` the answer's markdown is drawn with. |
 | `src/ui/copy.ts` | 22 | Where selected text goes: OSC52, plus `pbcopy` on macOS. |
 | `src/ui/Mascot.tsx` | 57 | `useMascot` decides which stage the elephant is on; `TopMascot` (with the wordmark) and `PerchMascot` place it. |
@@ -52,7 +54,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/elephant/paint.ts` | 47 | Composes a frame into pixels and paints it as half-block cells. |
 | `src/ui/elephant/phase.ts` | 21 | The `intro → perch` transition, as pure functions. |
 | `src/ui/Status.tsx` | 16 | Thinking indicator, elapsed time, usage, the memory suffix when memory is not healthy, and `sandbox: off` or `sandbox: unavailable` in the warning colour. |
-| `src/ui/Input.tsx` | 13 | Prompt entry; routes `/memory` and `/forget <id>` through `parseCommand`. |
+| `src/ui/Input.tsx` | 20 | Prompt entry; wraps long text and grows up to 16 rows, then scrolls; routes `/memory` and `/forget <id>` through `parseCommand`. |
 | `src/ui/theme.ts` | 6 | The blue behind the prompt border and its two neighbouring tints. |
 
 `session.ts` is short but dense — single-line functions, not a stub.
@@ -64,9 +66,11 @@ and `--max-tokens` configure a new one. `ELEFANTE_SOCKET` selects an isolated da
 effort, and limits also read `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`, `ELEFANTE_MAX_ROUNDS`, and
 `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.
 
-Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
-the model's reasoning (hidden at start; the "Thinking" line stays either way). Approval
-modals accept Y/N, and Esc there means *deny* — it does not also interrupt the turn.
+Enter submits and Ctrl+J starts a new line. A long prompt wraps, and the prompt bar grows up to 16
+rows before it scrolls. **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
+the model's reasoning (hidden at start; the "Thinking" line stays either way). An approval
+replaces the prompt bar with a Yes / No choice: Y allows, N denies, `↑↓` and Enter pick, and Esc
+means *deny* — it does not also interrupt the turn.
 
 The answer is rendered as markdown (headings, lists, bold, italic, inline and fenced code).
 **Copying:** the terminal's own selection is blocked while the mouse is captured, so drag to select
@@ -96,7 +100,7 @@ All of it is driven by the daemon's `memory` result field and `memory.*` events
 (`../docs/DEVELOPER_GUIDE.md` §5, **Memory wire**); a daemon that sends none gets none of it.
 
 - **Consent.** When the create or attach result says `consent: "unset"` with a non-null extractor,
-  a modal names the extractor (and says so when it is the session's own model) and takes only `Y`
+  a question in place of the prompt bar names the extractor (and says so when it is the session's own model) and takes only `Y`
   (learn), `N` (don't) or `Esc` (ask again next launch). It owns typing and Esc, so nothing reaches
   the prompt and Esc does not interrupt a turn. The answer is `memory.consent` and applies to every
   session.

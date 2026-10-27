@@ -178,16 +178,19 @@ fn rejected_searches_do_not_consume_the_session_cap() {
     let root = tempfile::tempdir().unwrap();
     let tools = approved_tools(root.path());
     let gate = ToolGate::default();
+    let unapproved = ToolExecutor::new(root.path()).unwrap();
     for _ in 0..40 {
         for input in [
             json!({"query":""}),
             json!({"query":"https://example.org"}),
             json!({"query":"SECRET_TOKEN=synthetic"}),
         ] {
-            assert_eq!(
-                gate.check_with_tools("web_search", &input, &tools),
-                GateDecision::Allow
-            );
+            for executor in [&tools, &unapproved] {
+                assert_eq!(
+                    gate.check_with_tools("web_search", &input, executor),
+                    GateDecision::Allow
+                );
+            }
         }
     }
     for _ in 0..29 {

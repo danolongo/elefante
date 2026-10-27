@@ -158,7 +158,8 @@ impl ToolExecutor {
         self.web_search_approved.load(Ordering::Acquire)
     }
 
-    /// Records the user's approval of a search and counts that search toward the cap.
+    /// Records the user's approval of a search. The approved search takes a slot, so the count can pass
+    /// 30 after a cap approval.
     pub fn approve_web_search(&self) {
         self.web_search_approved.store(true, Ordering::Release);
         self.web_search_count.fetch_add(1, Ordering::AcqRel);

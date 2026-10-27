@@ -1003,3 +1003,41 @@ async fn a_denied_search_takes_no_slot_and_approves_nothing() {
     }
     assert!(!executor.reserve_web_search());
 }
+
+#[tokio::test]
+async fn a_cancelled_search_approval_runs_nothing_and_the_next_search_asks_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let repo = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountedSearch::default());
+    let executor = ToolExecutor::new(repo.path())
+        .unwrap()
+        .with_web_search(backend.clone());
+    let provider = Script::new(vec![
+        searches(&["a"]),
+        end("one"),
+        searches(&["b"]),
+        end("two"),
+    ]);
+    let approvals = Arc::new(CountedApproval {
+        asked: 0.into(),
+        outcome: ApprovalOutcome::Cancelled,
+    });
+    let gate = ToolGate::new(approvals.clone());
+    let mut session = Session::new(RunConfig::new("test"));
+    for prompt in ["first", "second"] {
+        session
+            .prompt(
+                &provider,
+                &executor,
+                &gate,
+                prompt,
+                CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(approvals.asked.load(SeqCst), 2);
+    assert_eq!(backend.0.load(SeqCst), 0);
+    assert!(!executor.web_search_approved());
+}

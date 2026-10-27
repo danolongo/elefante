@@ -348,7 +348,7 @@ impl SessionSandbox {
     fn discover_git(&mut self, root: &Path) {
         let initial = initial_git_directory(root).and_then(|directory| {
             self.main_git = directory;
-            self.walk()
+            walk_root(self.policy.clone(), self.main_git.as_deref())
         });
         match initial {
             Ok((_, repositories)) => {
@@ -421,156 +421,12 @@ impl SessionSandbox {
     /// Fails closed for an unreadable directory, unsupported git indirection, Git metadata absent at
     /// session start, and an in-root config target that is missing or reached through a symlink.
     pub fn scan(&self) -> Result<Policy, String> {
-        let (mut policy, repositories) = self.walk()?;
-        if let Some((entry, _)) = repositories
-            .iter()
-            .find(|(entry, _)| !self.initial_git.contains(entry))
-        {
-            return Err(format!(
-                "new Git metadata at {} blocks bash and harness git until it is removed",
-                entry.display()
-            ));
-        }
-        let mut worktrees = repositories
-            .iter()
-            .map(|(entry, gitdir)| {
-                let worktree = entry.parent().ok_or("Git metadata has no parent")?;
-                Ok((worktree.to_owned(), gitdir.clone()))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        // A root inside a repository: that repository's config can still name targets in the root.
-        if !policy.root.join(".git").exists()
-            && let Some(enclosing) = policy
-                .root
-                .ancestors()
-                .skip(1)
-                .find(|ancestor| ancestor.join(".git").exists())
-        {
-            let entry = enclosing.join(".git");
-            let gitdir = if entry.is_dir() {
-                entry
-            } else {
-                git_reference(&entry, true)?
-            };
-            worktrees.push((enclosing.to_owned(), gitdir));
-        }
-        for (worktree, gitdir) in &worktrees {
-            let config =
-                crate::harness_git::repo_config(&self.git, worktree, gitdir, Some(&policy.home))?;
-            for target in config.targets {
-                let protected = if target.path.starts_with(&policy.root) {
-                    match &target.canonical {
-                        None => {
-                            return Err(format!(
-                                "Git config {} target {} is missing; create it or remove the setting",
-                                target.key,
-                                target.path.display()
-                            ));
-                        }
-                        Some(canonical) if *canonical != target.path => {
-                            return Err(format!(
-                                "Git config {} target {} goes through a symlink inside the root",
-                                target.key,
-                                target.path.display()
-                            ));
-                        }
-                        Some(_) => target.path,
-                    }
-                } else {
-                    // The sandbox already refuses writes outside the root.
-                    match target.canonical {
-                        Some(canonical) if canonical.starts_with(&policy.root) => canonical,
-                        _ => continue,
-                    }
-                };
-                if !policy.read_only.contains(&protected) {
-                    policy.read_only.push(protected);
-                }
-            }
-        }
-        policy.validate().map_err(|error| error.to_string())?;
-        Ok(policy)
-    }
-
-    /// Walks the root for `.git` entries, their validated targets and secret names. Returns each
-    /// `.git` entry with the git directory it names.
-    fn walk(&self) -> Result<(Policy, Vec<(PathBuf, PathBuf)>), String> {
-        use std::os::unix::fs::MetadataExt;
-        let mut policy = self.policy.clone();
-        let mut repositories = Vec::new();
-        let mut queue = vec![(policy.root.clone(), false)];
-        while let Some((directory, skip_links)) = queue.pop() {
-            for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let path = entry.path();
-                let kind = entry.file_type().map_err(|error| error.to_string())?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.eq_ignore_ascii_case(".git") {
-                    policy.read_only.push(path.clone());
-                    if kind.is_symlink() {
-                        return Err("symlink Git metadata is refused".into());
-                    }
-                    let gitdir = if kind.is_dir() {
-                        path.clone()
-                    } else {
-                        git_reference(&path, true)?
-                    };
-                    repositories.push((path.clone(), gitdir.clone()));
-                    let mut targets = vec![gitdir.clone()];
-                    if gitdir.join("commondir").exists() {
-                        targets.push(git_reference(&gitdir.join("commondir"), false)?);
-                    }
-                    for target in targets {
-                        if !target.starts_with(&policy.root)
-                            && !self
-                                .main_git
-                                .as_ref()
-                                .is_some_and(|main| target.starts_with(main))
-                        {
-                            return Err(
-                                "Git metadata points outside the root and its initial repository"
-                                    .into(),
-                            );
-                        }
-                        if !target.starts_with(&policy.root) {
-                            policy.readable.push(target.clone());
-                        }
-                        if !policy.read_only.contains(&target) {
-                            policy.read_only.push(target);
-                        }
-                    }
-                }
-                let in_git_metadata = path.components().any(|component| {
-                    component
-                        .as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(".git")
-                });
-                let hard_link = kind.is_file()
-                    && !in_git_metadata
-                    && !skip_links
-                    && entry.metadata().map_err(|error| error.to_string())?.nlink() > 1;
-                if hard_link || PathPolicy::is_secret_path(Path::new(name.as_ref())) {
-                    policy.hidden.push(HiddenPath {
-                        path: path.clone(),
-                        kind: if kind.is_dir() {
-                            HiddenKind::Directory
-                        } else {
-                            HiddenKind::File
-                        },
-                    });
-                }
-                // Cargo hard-links thousands of build files, so these trees skip the link check.
-                if kind.is_dir() {
-                    queue.push((
-                        path,
-                        skip_links || matches!(name.as_ref(), "target" | "node_modules"),
-                    ));
-                }
-            }
-        }
-        Ok((policy, repositories))
+        scan_root(
+            self.policy.clone(),
+            self.main_git.as_deref(),
+            &self.initial_git,
+            &self.git,
+        )
     }
 
     /// Executes a shell command under the scanned policy.
@@ -608,7 +464,18 @@ impl SessionSandbox {
         let mut policy = if matches!(self.state, Sandbox::Disabled) {
             self.policy.clone()
         } else {
-            self.scan()?
+            // The walk and the git config reads block, so they leave the async worker.
+            let (policy, main_git, initial_git, git) = (
+                self.policy.clone(),
+                self.main_git.clone(),
+                self.initial_git.clone(),
+                self.git.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                scan_root(policy, main_git.as_deref(), &initial_git, &git)
+            })
+            .await
+            .map_err(|error| error.to_string())??
         };
         policy.network = network;
         let sandboxed = !matches!(self.state, Sandbox::Disabled);
@@ -806,6 +673,168 @@ fn launcher(bash: &Path, script: &str) -> Command {
     let mut command = Command::new(bash);
     command.args(["-c", script]);
     command
+}
+
+/// Rescans the root before each command: git metadata and repository config feed `read_only`,
+/// and secret names feed `hidden`. Secret contents are never read.
+///
+/// # Errors
+/// Fails closed for an unreadable directory, unsupported git indirection, Git metadata absent at
+/// session start, and an in-root config target that is missing or reached through a symlink.
+fn scan_root(
+    policy: Policy,
+    main_git: Option<&Path>,
+    initial_git: &BTreeSet<PathBuf>,
+    git: &Path,
+) -> Result<Policy, String> {
+    let (mut policy, repositories) = walk_root(policy, main_git)?;
+    if let Some((entry, _)) = repositories
+        .iter()
+        .find(|(entry, _)| !initial_git.contains(entry))
+    {
+        return Err(format!(
+            "new Git metadata at {} blocks bash and harness git until it is removed",
+            entry.display()
+        ));
+    }
+    let mut worktrees = repositories
+        .iter()
+        .map(|(entry, gitdir)| {
+            let worktree = entry.parent().ok_or("Git metadata has no parent")?;
+            Ok((worktree.to_owned(), gitdir.clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // A root inside a repository: that repository's config can still name targets in the root.
+    if !policy.root.join(".git").exists()
+        && let Some(enclosing) = policy
+            .root
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| ancestor.join(".git").exists())
+    {
+        let entry = enclosing.join(".git");
+        let gitdir = if entry.is_dir() {
+            entry
+        } else {
+            git_reference(&entry, true)?
+        };
+        worktrees.push((enclosing.to_owned(), gitdir));
+    }
+    for (worktree, gitdir) in &worktrees {
+        let config = crate::harness_git::repo_config(git, worktree, gitdir, Some(&policy.home))?;
+        for target in config.targets {
+            let protected = if target.path.starts_with(&policy.root) {
+                match &target.canonical {
+                    None => {
+                        return Err(format!(
+                            "Git config {} target {} is missing; create it or remove the setting",
+                            target.key,
+                            target.path.display()
+                        ));
+                    }
+                    Some(canonical) if *canonical != target.path => {
+                        return Err(format!(
+                            "Git config {} target {} goes through a symlink inside the root",
+                            target.key,
+                            target.path.display()
+                        ));
+                    }
+                    Some(_) => target.path,
+                }
+            } else {
+                // The sandbox already refuses writes outside the root.
+                match target.canonical {
+                    Some(canonical) if canonical.starts_with(&policy.root) => canonical,
+                    _ => continue,
+                }
+            };
+            if !policy.read_only.contains(&protected) {
+                policy.read_only.push(protected);
+            }
+        }
+    }
+    policy.validate().map_err(|error| error.to_string())?;
+    Ok(policy)
+}
+
+/// Walks the root for `.git` entries, their validated targets and secret names. Returns each
+/// `.git` entry with the git directory it names.
+fn walk_root(
+    mut policy: Policy,
+    main_git: Option<&Path>,
+) -> Result<(Policy, Vec<(PathBuf, PathBuf)>), String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut repositories = Vec::new();
+    let mut queue = vec![(policy.root.clone(), false)];
+    while let Some((directory, skip_links)) = queue.pop() {
+        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.eq_ignore_ascii_case(".git") {
+                policy.read_only.push(path.clone());
+                if kind.is_symlink() {
+                    return Err("symlink Git metadata is refused".into());
+                }
+                let gitdir = if kind.is_dir() {
+                    path.clone()
+                } else {
+                    git_reference(&path, true)?
+                };
+                repositories.push((path.clone(), gitdir.clone()));
+                let mut targets = vec![gitdir.clone()];
+                if gitdir.join("commondir").exists() {
+                    targets.push(git_reference(&gitdir.join("commondir"), false)?);
+                }
+                for target in targets {
+                    if !target.starts_with(&policy.root)
+                        && !main_git.is_some_and(|main| target.starts_with(main))
+                    {
+                        return Err(
+                            "Git metadata points outside the root and its initial repository"
+                                .into(),
+                        );
+                    }
+                    if !target.starts_with(&policy.root) {
+                        policy.readable.push(target.clone());
+                    }
+                    if !policy.read_only.contains(&target) {
+                        policy.read_only.push(target);
+                    }
+                }
+            }
+            let in_git_metadata = path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(".git")
+            });
+            let hard_link = kind.is_file()
+                && !in_git_metadata
+                && !skip_links
+                && entry.metadata().map_err(|error| error.to_string())?.nlink() > 1;
+            if hard_link || PathPolicy::is_secret_path(Path::new(name.as_ref())) {
+                policy.hidden.push(HiddenPath {
+                    path: path.clone(),
+                    kind: if kind.is_dir() {
+                        HiddenKind::Directory
+                    } else {
+                        HiddenKind::File
+                    },
+                });
+            }
+            // Cargo hard-links thousands of build files, so these trees skip the link check.
+            if kind.is_dir() {
+                queue.push((
+                    path,
+                    skip_links || matches!(name.as_ref(), "target" | "node_modules"),
+                ));
+            }
+        }
+    }
+    Ok((policy, repositories))
 }
 
 fn git_reference(path: &Path, gitfile: bool) -> Result<PathBuf, String> {

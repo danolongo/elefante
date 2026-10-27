@@ -1,6 +1,6 @@
 //! Fail-closed shell launch and bounded process output.
-use elefante_guard::PathPolicy;
 use elefante_guard::sandbox::{self, HiddenKind, HiddenPath, Network, Policy};
+use elefante_guard::{PathPolicy, git};
 use std::{collections::VecDeque, ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -235,6 +235,7 @@ fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Polic
         readable: Vec::new(),
         writable: Vec::new(),
         read_only: Vec::new(),
+        git_writable: Vec::new(),
         hidden: Vec::new(),
         network: Network::Off,
         runtime_dir: runtime_dir.filter(|directory| directory.is_absolute()),
@@ -478,28 +479,84 @@ impl SessionSandbox {
             .map_err(|error| error.to_string())??
         };
         policy.network = network;
-        let sandboxed = !matches!(self.state, Sandbox::Disabled);
-        let env_source = self
-            .rustup_home
-            .as_ref()
-            .map(|path| ("RUSTUP_HOME".into(), path.as_os_str().to_owned()));
-        let environment = if sandboxed {
+        let environment = if matches!(self.state, Sandbox::Disabled) {
+            self.disabled_environment()?
+        } else {
+            let env_source = self
+                .rustup_home
+                .as_ref()
+                .map(|path| ("RUSTUP_HOME".into(), path.as_os_str().to_owned()));
             policy
                 .environment(env_source, &self.tool_dirs)
                 .map_err(|error| error.to_string())?
-        } else {
-            self.disabled_environment()?
         };
+        let args = vec!["-c".into(), source.into()];
+        let (command, _filters) = self.command(&policy, &self.bash, args, environment)?;
+        let result = run_process(command, command_timeout()).await;
         #[cfg(target_os = "linux")]
-        let filters = if sandboxed {
-            seccomp_filters(network)?
-        } else {
+        if !matches!(self.state, Sandbox::Disabled) {
+            self.quarantine_new_git()?;
+        }
+        result
+    }
+
+    /// Runs a harness git write under the git profile, built from the scan the caller made under
+    /// the root's write lock. Network is off. A protected name that appears during the run is
+    /// quarantined and the call fails.
+    ///
+    /// # Errors
+    /// Fails closed for unavailable isolation, policy errors, or failed process launch.
+    pub async fn run_git(
+        &self,
+        scanned: Policy,
+        invocation: git::Invocation,
+    ) -> Result<ProcessOutput, String> {
+        if let Sandbox::Unavailable(reason) = &self.state {
+            return Err(unavailable(reason));
+        }
+        // The caller holds the write lock, so no probe runs here: the daemon probed at start.
+        let policy = git_policy(scanned)?;
+        let mut environment: Vec<_> = invocation.environment.into_iter().collect();
+        environment.push(("TMPDIR".into(), policy.temp.clone().into_os_string()));
+        let (command, _filters) =
+            self.command(&policy, &invocation.program, invocation.args, environment)?;
+        let before = protected_entries(&policy.git_writable);
+        let result = run_process(command, command_timeout()).await;
+        // Both quarantines run, so a failure of one never leaves the other's entries in place.
+        #[cfg(target_os = "linux")]
+        let new_git = self.quarantine_new_git();
+        #[cfg(not(target_os = "linux"))]
+        let new_git = Ok(());
+        let appeared: Vec<_> = protected_entries(&policy.git_writable)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let names = self.quarantine(&appeared);
+        new_git.and(names)?;
+        result
+    }
+
+    /// Builds the launch command for `program` under `policy`. The returned descriptors hold the
+    /// seccomp programs, so the caller keeps them alive until the process has started.
+    fn command(
+        &self,
+        policy: &Policy,
+        program: &Path,
+        args: Vec<OsString>,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<(Command, Vec<fs::File>), String> {
+        #[cfg(target_os = "linux")]
+        let filters = if matches!(self.state, Sandbox::Disabled) {
             Vec::new()
+        } else {
+            seccomp_filters(policy.network)?
         };
+        #[cfg(not(target_os = "linux"))]
+        let filters = Vec::new();
         let mut command = match &self.state {
             Sandbox::Seatbelt => {
                 let (profile, params) =
-                    sandbox::seatbelt_profile(&policy).map_err(|error| error.to_string())?;
+                    sandbox::seatbelt_profile(policy).map_err(|error| error.to_string())?;
                 let mut command = launcher(&self.bash, &format!("{CLOSE_INHERITED}{EXEC}"));
                 command.arg("/usr/bin/sandbox-exec").args(["-p", &profile]);
                 for (key, value) in params {
@@ -507,12 +564,12 @@ impl SessionSandbox {
                         .arg("-D")
                         .arg(format!("{key}={}", value.to_string_lossy()));
                 }
-                command.arg(&self.bash).args(["-c", source]);
+                command.arg(program).args(args);
                 command
             }
             Sandbox::Disabled => {
                 let mut command = launcher(&self.bash, &format!("{CLOSE_INHERITED}{EXEC}"));
-                command.arg(&self.bash).args(["-c", source]);
+                command.arg(program).args(args);
                 command
             }
             Sandbox::Bubblewrap { bwrap } => {
@@ -520,12 +577,12 @@ impl SessionSandbox {
                 {
                     use std::os::fd::AsRawFd;
                     let spec = sandbox::LaunchSpec {
-                        bash: self.bash.clone(),
-                        command: source.into(),
+                        program: program.into(),
+                        args,
                         environment: environment.clone(),
                     };
                     let args =
-                        sandbox::bwrap_args(&policy, &spec).map_err(|error| error.to_string())?;
+                        sandbox::bwrap_args(policy, &spec).map_err(|error| error.to_string())?;
                     let mut command =
                         launcher(&self.bash, &format!("{CLOSE_INHERITED}{SECCOMP_EXEC}"));
                     command.arg(bwrap);
@@ -551,12 +608,7 @@ impl SessionSandbox {
             .env_clear()
             .envs(environment)
             .current_dir(&policy.root);
-        let result = run_process(command, command_timeout()).await;
-        #[cfg(target_os = "linux")]
-        if sandboxed {
-            self.quarantine_new_git()?;
-        }
-        result
+        Ok((command, filters))
     }
 
     /// The `Disabled` environment: the same allowlist, the host's `HOME`, `CARGO_HOME` and
@@ -603,6 +655,11 @@ impl SessionSandbox {
                 }
             }
         }
+        self.quarantine(&found)
+    }
+
+    /// Moves `found` into the session's quarantine directory and fails the call.
+    fn quarantine(&self, found: &[PathBuf]) -> Result<(), String> {
         if found.is_empty() {
             return Ok(());
         }
@@ -613,7 +670,7 @@ impl SessionSandbox {
             .ok_or("missing session identifier")?;
         let quarantine = self.policy.harness_dir.join("quarantine").join(session);
         fs::create_dir_all(&quarantine).map_err(|error| error.to_string())?;
-        for path in &found {
+        for path in found {
             let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             fs::rename(path, quarantine.join(id.to_string())).map_err(|error| {
                 format!(
@@ -673,6 +730,98 @@ fn launcher(bash: &Path, script: &str) -> Command {
     let mut command = Command::new(bash);
     command.args(["-c", script]);
     command
+}
+
+/// The git that bash's `PATH` finds. `binary("git")` prefers Homebrew, whose libraries the
+/// sandbox cannot read.
+pub const SANDBOX_GIT: &str = if cfg!(target_os = "macos") {
+    "/Library/Developer/CommandLineTools/usr/bin/git"
+} else {
+    "/usr/bin/git"
+};
+
+/// Names inside a writable git directory that stay read-only, or checked when absent.
+const PROTECTED_NAMES: [&str; 7] = [
+    "hooks",
+    "config",
+    "config.worktree",
+    "info",
+    "commondir",
+    "gitdir",
+    "objects/info/alternates",
+];
+
+/// Turns a scan into the git profile: the session's git directory and its common directory become
+/// writable, and everything that could run code stays read-only.
+fn git_policy(mut policy: Policy) -> Result<Policy, String> {
+    use std::os::unix::fs::MetadataExt;
+    let gitdir = git_directory(&policy.root)?.ok_or("harness git requires a repository")?;
+    let common = common_directory(&gitdir)?;
+    let mut writable = vec![gitdir.clone()];
+    if common != gitdir {
+        writable.push(common.clone());
+    }
+    policy.read_only.retain(|path| !writable.contains(path));
+    // A missing path cannot be mounted, and no allowlisted command creates these.
+    let mut protected: Vec<PathBuf> = writable
+        .iter()
+        .flat_map(|directory| PROTECTED_NAMES.map(|name| directory.join(name)))
+        .collect();
+    protected.push(common.join("modules"));
+    for entry in fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.path() != gitdir {
+            protected.push(entry.path());
+        }
+    }
+    policy.read_only.extend(
+        protected
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok()),
+    );
+    // Secret names stay readable: hiding a tracked file would record it as blank or deleted.
+    // Hard-linked files become read-only, and `.elefante` stays hidden.
+    for item in std::mem::take(&mut policy.hidden) {
+        if item
+            .path
+            .file_name()
+            .is_some_and(|name| name == ".elefante")
+        {
+            policy.hidden.push(item);
+        } else if item.kind == HiddenKind::File
+            && fs::symlink_metadata(&item.path)
+                .map_err(|error| error.to_string())?
+                .nlink()
+                > 1
+        {
+            policy.read_only.push(item.path);
+        }
+    }
+    policy.network = Network::Off;
+    policy.git_writable = writable;
+    Ok(policy)
+}
+
+/// The entries in `directories` whose names match a protected name, ignoring case.
+fn protected_entries(directories: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut found = BTreeSet::new();
+    for directory in directories {
+        for name in PROTECTED_NAMES {
+            let path = directory.join(name);
+            let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+                continue;
+            };
+            for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
+                if entry.file_name().eq_ignore_ascii_case(leaf) {
+                    found.insert(entry.path());
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Rescans the root before each command: git metadata and repository config feed `read_only`,
@@ -742,9 +891,15 @@ fn scan_root(
                     Some(_) => target.path,
                 }
             } else {
-                // The sandbox already refuses writes outside the root.
+                // Outside the root, only the initial repository's own files matter: harness git
+                // writes there, and bash already reads it as read-only.
                 match target.canonical {
-                    Some(canonical) if canonical.starts_with(&policy.root) => canonical,
+                    Some(canonical)
+                        if canonical.starts_with(&policy.root)
+                            || main_git.is_some_and(|main| canonical.starts_with(main)) =>
+                    {
+                        canonical
+                    }
                     _ => continue,
                 }
             };

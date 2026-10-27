@@ -883,12 +883,16 @@ changes this plan first.
    exist blocks `mkdir .git/worktrees`. No allowlisted command creates it, so the profile denies
    only an existing `worktrees`.
 
-Two findings change the gate wording, not the design:
-- Seatbelt matched the denied names case-insensitively on APFS: writes to `.git/COMMONDIR`,
-  `.git/Config.Worktree` and `.git/CONFIG` all failed. A protected name cannot appear on macOS
-  through the sandbox, so the macOS gate proves the OS refusal. The before-and-after check is the
-  backstop for Linux (bubblewrap cannot mount a missing path) and for volumes that match case.
-- The after-run check has a unit test that creates the name between the two checks.
+Three findings change the gate wording, not the design:
+- Seatbelt matched denied names case-insensitively on APFS: writes to `.git/COMMONDIR`,
+  `.git/Config.Worktree` and `.git/CONFIG` all failed. The spike profile denied the absent names
+  too. The git profile does not, as decided above, so the before-and-after check is what catches a
+  new protected name on both systems.
+- `--exec-path=<root>/bin merge -s evil` does not run `git-merge-evil` on git 2.54: git finds a
+  custom strategy through `PATH`, and the sandbox fixes `PATH`. The gate runs its escape script
+  through `-c alias.evil=!<script> evil` instead. That is also a command the router refuses.
+- `diff.external=` in `git::hardened` makes `git diff` fail with `cannot run`. The two `diff`
+  attacks pass `--no-ext-diff`.
 
 Linux results come from the CI run of the track A pull request.
 

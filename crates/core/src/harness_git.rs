@@ -1,4 +1,4 @@
-//! The host Git exception: preflight every approved literal write before launching it.
+//! Harness git: preflight every approved literal write before running it in the git sandbox.
 use elefante_guard::git::{self, GitWrite, Identity};
 use elefante_guard::sandbox::Policy;
 use std::{

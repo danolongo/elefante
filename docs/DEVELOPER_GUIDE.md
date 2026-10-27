@@ -1234,7 +1234,8 @@ severe result:
 - unknown or potentially mutating commands escalate;
 - destructive, privileged, environment-disclosing, secret-reading, or secret-writing forms
   are denied; and
-- write-capable shell redirections escalate, even when attached to `echo` or `printf`.
+- write-capable shell redirections escalate, even when attached to `echo` or `printf`. A
+  redirection to exactly `/dev/null` writes nothing and does not escalate.
 
 `Escalate` suspends the tool call and emits `approval.requested`; the decision arrives as
 `session.resolve_approval`. A `Deny` never reaches that channel at all — it is terminal, and a

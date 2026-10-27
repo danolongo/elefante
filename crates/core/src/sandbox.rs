@@ -741,7 +741,7 @@ pub const SANDBOX_GIT: &str = if cfg!(target_os = "macos") {
 };
 
 /// Names inside a writable git directory that stay read-only, or checked when absent.
-const PROTECTED_NAMES: [&str; 7] = [
+const PROTECTED_NAMES: [&str; 8] = [
     "hooks",
     "config",
     "config.worktree",
@@ -749,6 +749,7 @@ const PROTECTED_NAMES: [&str; 7] = [
     "commondir",
     "gitdir",
     "objects/info/alternates",
+    "modules",
 ];
 
 /// Turns a scan into the git profile: the session's git directory and its common directory become
@@ -767,7 +768,6 @@ fn git_policy(mut policy: Policy) -> Result<Policy, String> {
         .iter()
         .flat_map(|directory| PROTECTED_NAMES.map(|name| directory.join(name)))
         .collect();
-    protected.push(common.join("modules"));
     for entry in fs::read_dir(common.join("worktrees"))
         .into_iter()
         .flatten()

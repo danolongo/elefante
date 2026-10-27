@@ -236,7 +236,7 @@ async fn protected_names_and_new_repositories_are_quarantined() {
     fs::remove_dir_all(root.join(".git/hooks")).expect("remove hooks");
     let attack = script(
         &root,
-        "echo x > .git/commondir; mkdir .git/HOOKS; mkdir -p sub/.git; exit 2\n",
+        "echo x > .git/commondir; mkdir .git/HOOKS; mkdir -p .git/modules/x/hooks sub/.git; exit 2\n",
     );
     let error = unchecked(&root, &attack).await.expect_err("the call fails");
     assert!(error.contains("quarantined"), "{error}");
@@ -244,7 +244,7 @@ async fn protected_names_and_new_repositories_are_quarantined() {
         .expect(".git")
         .map(|entry| entry.expect("entry").file_name())
         .collect();
-    for name in ["commondir", "HOOKS"] {
+    for name in ["commondir", "HOOKS", "modules"] {
         assert!(
             !names.iter().any(|n| n.eq_ignore_ascii_case(name)),
             "{name} stayed: {names:?}"
@@ -260,7 +260,7 @@ async fn protected_names_and_new_repositories_are_quarantined() {
                 .count()
         })
         .sum();
-    assert_eq!(quarantined, if cfg!(target_os = "linux") { 3 } else { 2 });
+    assert_eq!(quarantined, if cfg!(target_os = "linux") { 4 } else { 3 });
 }
 
 async fn bash(tools: &ToolExecutor, command: &str) -> String {

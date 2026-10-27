@@ -163,6 +163,9 @@ async fn two_clients_receive_identical_gapless_turns_and_reconnect_resumes() {
         serde_json::from_value::<elefante::wire::Notification>(note.clone()).unwrap();
     }
     let mut seq = one.last().unwrap()["seq"].as_u64().unwrap();
+    // The daemon reports memory status just after the turn ends. Waiting for it here keeps a
+    // fast reconnect from replaying before the event exists.
+    assert_eq!(first.next().await["method"], "memory.status");
     drop(first);
     let mut first = daemon.client().await;
     let attached = first

@@ -205,4 +205,36 @@ mod tests {
             ModelId::from("s/m")
         );
     }
+
+    /// One billable search through the real backend. With `OPENROUTER_API_KEY` exported:
+    /// `cargo test -p elefante --lib live_web_search -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires OpenRouter credentials, network, and one billable Exa search"]
+    async fn live_web_search_returns_cited_text_and_its_cost() {
+        let key = std::env::var("OPENROUTER_API_KEY").expect("export OPENROUTER_API_KEY");
+        let provider: Arc<dyn Provider> = Arc::new(elefante_provider::OpenRouterProvider::new(key));
+        let model = search_model(&ModelId::from("openai/gpt-4.1-mini"), &|name| {
+            std::env::var(name).ok()
+        });
+        let total = Arc::new(Mutex::new(Usage::default()));
+        let search = ProviderSearch::new(
+            move || Some(Arc::clone(&provider)),
+            model.clone(),
+            Arc::clone(&total),
+        );
+        let text = search
+            .search(WebSearchRequest {
+                query: "Rust 1.90.0 release announcement date".into(),
+                max_results: 3,
+            })
+            .await
+            .expect("live search failed");
+        let total = *total.lock().unwrap();
+        println!("model: {model}\ncost: {:?}\n{text}", total.cost);
+        assert!(text.contains("https://"), "no plain-text source URL");
+        assert!(
+            total.cost.is_some_and(|cost| cost > 0.0),
+            "no cost reported"
+        );
+    }
 }

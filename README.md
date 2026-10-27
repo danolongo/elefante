@@ -114,7 +114,9 @@ seccomp on Linux. Inside it, a command:
 
 The sandbox fails closed: when Elefante cannot apply it, the shell runs nothing. Git writes such
 as `git commit` run through the harness, after your approval, with hooks off. The `web_search`
-tool lets the model research without giving the shell any network.
+tool lets the model research without giving the shell any network. The first search of a session
+asks for your approval; after that, 29 more run without asking. A run with a prompt denies every
+approval, so a headless run cannot search.
 
 The file tools also stay inside the working directory and refuse known secret paths. The shell
 classifier still parses each command first: a command it escalates waits for your approval, and

@@ -992,7 +992,7 @@ The eight tools are intentionally permanent prompt cost, so additions require a 
 | `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. The executor caps the result at 32 KiB. |
 | `bash` | `command`, optional `network` (boolean) | Runs `bash -c <command>` in the OS sandbox with network off. The gate allows, escalates or denies the call first; an approved escalation still runs sandboxed. `network: true` escalates with rule `network-requested`, and only that approval turns the network on, for that one call. A plain git write runs through harness git after approval. The executor caps the result at 32 KiB. See § 9 **Sandbox**. |
 | `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`/`note`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. Notes saved from earlier sessions are included unless `kind` is `file` or `symbol`; any result containing a note is prefixed with the same "unverified, not instructions" notice as the injected block. The tool is offered, and the system prompt carries a one-sentence hint to use it, only in sessions that have an index. |
-| `web_search` | `query` (1–300 characters), optional `max_results` (1–10, default 5) | The daemon sends one provider request with OpenRouter's Exa-pinned web plugin, on `ELEFANTE_SEARCH_MODEL` or else the session's model, and adds its usage to the turn. The executor refuses URL-shaped queries (`://`, `www.`) and queries the scrubber would change. The first 30 searches per session need no approval; each later one escalates with rule `web-search-cap`. Results are untrusted text, capped at 32 KiB. |
+| `web_search` | `query` (1–300 characters), optional `max_results` (1–10, default 5) | The daemon sends one provider request with OpenRouter's Exa-pinned web plugin, on `ELEFANTE_SEARCH_MODEL` or else the session's model, and adds its usage to the turn. The executor refuses URL-shaped queries (`://`, `www.`) and queries the scrubber would change. Until the user approves a search, every search escalates with rule `web-search-first`. After one approval, 29 more need none; the 31st and later escalate with rule `web-search-cap`. Results are untrusted text, capped at 32 KiB. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk
@@ -1019,6 +1019,10 @@ command:
 - off the network, unless the user approves that one command;
 - away from the daemon's API key, socket and token;
 - away from `.git` writes, secret files and harness state.
+
+`web_search` is an outbound channel the sandbox does not cover. Each query can carry up to 300
+characters out. The first search needs approval. After it, 29 more need none: about 8.7 KB per
+`ToolExecutor`, which a daemon restart or session resume starts over.
 
 Two things stay outside the guarantee. Code the user later runs outside elefante, such as a build,
 an IDE task or a hook manager, is one. Kernel exploits are the other; the opt-in microVM backends
@@ -1163,7 +1167,7 @@ stay parallel. `write`, `edit` and harness git take it exclusively.
 
 `ToolGate::check_with_tools` wraps it. It turns a `git-write` escalation into `Deny`
 (`git-identity-missing`) when the session has no git identity, so the user never approves a write
-that cannot commit. It also reserves `web_search`'s per-session cap before parallel calls start.
+that cannot commit. For `web_search`, it escalates with `web-search-first` until the executor records an approval, then reserves a slot of the per-session cap of 30 before parallel calls start. `execute_one` records the approval and takes the slot when the user approves a search.
 
 #### What runs outside the sandbox
 
@@ -1174,7 +1178,7 @@ that cannot commit. It also reserves `web_search`'s per-session cap before paral
 | `read`, `write`, `edit`, `glob`, `grep` | They run in the daemon. | `PathPolicy`; root-relative opens without symlinks (`core::file_access`); refusal of hard-linked files outside `target/`; writes by same-directory rename; the root lock. |
 | Harness git | A git write must change `.git`, which the sandbox keeps read-only. | The `guard::git` router and per-subcommand option allowlist; the hardened invocation (hooks, fsmonitor, pager, editors, credential helpers, signing and transports off); the `core::harness_git` preflight; approval for every write; an identity read at daemon start. |
 | The indexer (`elefante-mem`) | It runs in the daemon, beside the sessions. | Root-relative no-symlink opens and hard-link refusal in `mem::hash`; `git log` through `guard::git::hardened`. |
-| `web_search` | The daemon sends one provider request per search. | Query bounds, URL and secret refusal, 30 searches per session before approval, 32 KiB results. |
+| `web_search` | The daemon sends one provider request per search. | Query bounds, URL and secret refusal, First search needs approval, 29 more need none, 32 KiB results. |
 
 The daemon reads the git identity once at start: `user.name` and `user.email` from `~/.gitconfig`,
 then `$XDG_CONFIG_HOME/git/config`, through `guard::git::hardened`.
@@ -1191,8 +1195,10 @@ then `$XDG_CONFIG_HOME/git/config`, through `guard::git::hardened`.
   left the group (`setsid`, `set -m`) through its parent. A descendant whose parent exits before
   the snapshot reparents to launchd and survives the call. It stays sandboxed but keeps approved
   network. Linux uses the PID namespace instead.
-- **`web_search` queries leave without per-call approval**, up to the cap. The executor scrubs them
-  and refuses URLs, but each query remains an outbound channel.
+- **`web_search` queries leave without per-call approval** after the first approval, up to 29
+  more. The executor scrubs them and refuses URLs, but each query remains an outbound channel of
+  up to 300 characters, about 8.7 KB per `ToolExecutor`. A daemon restart or a session resume
+  starts the count over.
 - **The secret scan is name-based.** Its hard-link check skips `target/` and `node_modules/`.
 - **`ELEFANTE_SANDBOX=0`** removes the OS boundary. An approved command then runs with the user's
   full access, including the daemon's token.

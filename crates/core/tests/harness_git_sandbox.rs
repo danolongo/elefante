@@ -113,7 +113,8 @@ async fn diff_output_cannot_write_outside_the_root() {
     fs::write(root.join("main"), "changed").expect("change");
     let inside = root.join("out");
     let outside = base.join("out");
-    unchecked(
+    // Bubblewrap may let git write into its private tmpfs, so only the host path matters.
+    let _ = unchecked(
         &root,
         &[
             "diff",
@@ -121,8 +122,7 @@ async fn diff_output_cannot_write_outside_the_root() {
             &format!("--output={}", outside.display()),
         ],
     )
-    .await
-    .expect_err("the output file cannot be created");
+    .await;
     assert!(!outside.exists());
     // Control: the same output path inside the root is written.
     let _ = unchecked(

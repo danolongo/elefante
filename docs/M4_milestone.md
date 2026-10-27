@@ -639,7 +639,7 @@ CLI prints one warning line.
 - The daemon keeps the token beside its socket: `~/.elefante/run/token` by default,
   `$XDG_RUNTIME_DIR/token` when that sets the socket, or beside an explicit `ELEFANTE_SOCKET`
   (tests).
-- 128 random bits from `/dev/urandom` (as `server.rs:418`), mode 0600, written atomically (temp
+- 128 random bits from the OS generator through `getrandom`, mode 0600, written atomically (temp
   file, then rename) **before** `listen`. Only the starter that holds the socket directory's lock
   writes it, so a losing starter never replaces a live daemon's token.
 - The first request must be `auth { token }`, compared in constant time; otherwise the daemon

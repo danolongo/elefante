@@ -476,7 +476,7 @@ This decides whether the whole subsystem works. LLM memory fails by accumulating
 
 ### Secret protection — four layers, none sufficient alone
 
-1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
+1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, a final `credentials` or `credentials.toml`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
 2. **Bash gate rules** for `cat .env`, `source .env`, `env`, `printenv`.
 3. **`Scrubber` on every tool result** — `sk-ant-` prefixes, AWS key shapes, PEM blocks, `TOKEN=`/`SECRET=`/`PASSWORD=` assignments. This is the layer that actually holds, because shell bypasses are unbounded (`cat .e''nv`) and cannot be enumerated.
 4. **The same `Scrubber` gates memory writes.** Without this, a leaked secret is persisted into the graph permanently — strictly worse than transient context exposure. Two call sites, one implementation, no drift.
@@ -590,7 +590,9 @@ that phase can pass its gate.
   sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
   harness state. Readable paths are the root, system directories and exact executable/toolchain
   directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
-  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Linux mounts exact
+  are read-only. The root scan hides `.elefante` and every name on the `PathPolicy` secret list,
+  inside `target/` and `node_modules/` too; the Seatbelt name rules repeat that list as a kernel
+  backstop, and a test checks that they cover it. Linux mounts exact
   resolver files, not all of `/etc`, so approved DNS can use libc. Hidden paths carry an explicit
   file/directory kind so rendering performs no filesystem lookup. The home,
   harness directory and exact socket/token paths let renderers reject overlapping readable
@@ -642,9 +644,11 @@ that phase can pass its gate.
   targets are read-only in the shell. The scan also reads the config of a repository that encloses
   the root.
 - **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
-  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
-  process that leaves the group can survive, but remains sandboxed; the output reader stops two
-  seconds after bash exits so a held pipe cannot stall the turn.
+  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. macOS has no
+  PID namespace, so the daemon also kills each descendant that one `ps` snapshot links to the
+  group, such as a `setsid` child. A descendant whose parent exits before that snapshot
+  reparents to launchd and can still survive, sandboxed. The output reader stops two seconds
+  after bash exits so a held pipe cannot stall the turn.
 - **The daemon's socket requires a token.** At start the daemon writes 128 random bits beside its
   socket (`~/.elefante/run/token` by default, `0600`); every connection presents it first, and the
   CLI and TUI read it there. The sandbox cannot read the token, so a command that reaches the
@@ -657,7 +661,8 @@ that phase can pass its gate.
   `switch`, `checkout`, `branch`, `stash`, `tag`, `merge`, `cherry-pick`, `rebase`) and validates
   paths and refs. `reset`, `clean`, `push`, `fetch`, `pull`, `config` writes and unknown options
   are refused, also behind wrappers such as `env`, `exec` or `xargs`. `checkout <ref>` runs as
-  `checkout <ref> --`, so git never reads the ref as a pathspec. Every other subcommand, such as
+  `checkout <ref> --`, so git never reads the ref as a pathspec, and a branch may share its
+  name with a file or directory. Every other subcommand, such as
   `grep`, `blame` or an alias, is a read and runs in the sandbox. Every routed write asks for approval; the disabled sandbox asks for every bash
   call. The harness uses an absolute git binary, a cleared environment and flags that disable
   hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
@@ -746,10 +751,18 @@ the root readable, the root writable, and `.git` writable except `hooks/`, `conf
 and any protected hooksPath target. Linux uses bubblewrap overlays; macOS uses Seatbelt. The
 exact per-subcommand allowlist remains as a second line of defence.
 
+**`web_search` egress.** M4 lets a session send up to 30 queries of 300 characters each with
+no approval. A prompt-injected model can therefore send about 9 KB of non-secret file content
+out through queries. The URL filter (`://`, `www.`) is a courtesy, not a control: a `[.]`
+spelling or base64 passes it. M4.1 closes the gap:
+- The first `web_search` of each session escalates. The approval prompt shows the query.
+- The threat model in `DEVELOPER_GUIDE.md` states the channel and its size bound.
+
 **Gate.** A test-only widening of the allowlist admits attempts such as
 `--output=$HOME/x`, `--no-index ~/.ssh/f` and `merge -s evil`; the OS still blocks them. A
-normal commit and rebase continue to work. M4 and earlier gates remain green on both operating
-systems before the milestone is recorded.
+normal commit and rebase continue to work. The first `web_search` in a session escalates and
+shows its query; a later one within the cap runs without a prompt. M4 and earlier gates remain
+green on both operating systems before the milestone is recorded.
 
 ### M4.2 — MicroVM backend on macOS
 

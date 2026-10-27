@@ -106,10 +106,11 @@ pub fn route(source: &str, root: &Path) -> GitRoute {
     if words.first().is_none_or(|word| word != "git") {
         return refuse_if(contains_write(source));
     }
-    if !source.trim_start_matches([' ', '\t']).starts_with("git ")
-        && !source.trim_start_matches([' ', '\t']).starts_with("git\t")
-        && source.trim() != "git"
-    {
+    let start = source.trim_start_matches([' ', '\t']);
+    let git_first = start
+        .strip_prefix("git")
+        .is_some_and(|rest| rest.starts_with([' ', '\t']));
+    if !git_first && source.trim() != "git" {
         return GitRoute::Refused(REFUSAL);
     }
     let rest = &words[1..];
@@ -268,11 +269,8 @@ fn valid_write(sub: &str, args: &[String], root: &Path) -> bool {
     match sub {
         "add" | "rm" | "mv" | "restore" => valid_paths(sub, args, root),
         "switch" => one_ref(args) || flag_ref(args, "-c"),
-        // A ref that names a file would read as a pathspec and discard that file's changes.
-        "checkout" => {
-            (one_ref(args) && root.join(&args[0]).symlink_metadata().is_err())
-                || flag_ref(args, "-b")
-        }
+        // `invocation` appends `--`, so git reads the ref as a tree-ish, never as a pathspec.
+        "checkout" => one_ref(args) || flag_ref(args, "-b"),
         "branch" => one_ref(args) || flag_ref(args, "-d"),
         "stash" => match args.first().map(String::as_str) {
             Some("pop" | "apply") => args.len() == 1,

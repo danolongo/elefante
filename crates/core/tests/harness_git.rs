@@ -256,7 +256,30 @@ async fn harness_git_uses_the_configured_command_timeout() {
         let temp = tempfile::tempdir().unwrap();
         git(temp.path(), &["init", "-q"]);
         fs::write(temp.path().join("file"), "hello").unwrap();
-        let error = add(temp.path(), &harness(temp.path()))
+        // A real `git add` can exit before the timeout is first checked, so this Git sleeps
+        // through `add` and the zero timeout always expires first.
+        let bin = tempfile::tempdir().unwrap();
+        let slow_git = bin.path().join("git");
+        fs::write(
+            &slow_git,
+            "#!/bin/sh\nfor a; do [ \"$a\" = add ] && exec sleep 5; done\nexec /usr/bin/git \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            &slow_git,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let runner = HarnessGit::new(
+            temp.path(),
+            &slow_git,
+            Identity {
+                name: "Test".into(),
+                email: "test@example.invalid".into(),
+            },
+        )
+        .unwrap();
+        let error = add(temp.path(), &runner)
             .await
             .expect_err("a zero timeout expires");
         assert!(error.starts_with("command timed out after 0 s"), "{error}");

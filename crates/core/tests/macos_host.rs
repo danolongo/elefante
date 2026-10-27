@@ -38,7 +38,7 @@ fn environment(session: &SessionSandbox) -> Vec<(OsString, OsString)> {
     session
         .scan()
         .expect("session policy")
-        .environment(std::iter::empty(), &[], true)
+        .environment(std::iter::empty(), &[])
         .expect("sandbox environment")
 }
 

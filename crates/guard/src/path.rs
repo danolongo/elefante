@@ -343,6 +343,11 @@ fn secret_rule(path: &Path, harness_state: bool) -> Option<&'static str> {
         if matches!(*component, ".netrc" | ".npmrc" | ".git-credentials") {
             return Some("credential-file");
         }
+        // Only the last component: files below a `credentials/` directory stay reachable.
+        if index + 1 == components.len() && matches!(*component, "credentials" | "credentials.toml")
+        {
+            return Some("credentials or credentials.toml");
+        }
         if component.starts_with("id_rsa") {
             return Some("id_rsa*");
         }

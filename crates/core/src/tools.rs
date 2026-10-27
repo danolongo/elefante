@@ -153,21 +153,11 @@ impl ToolExecutor {
     /// Reserves one search before concurrent tool calls start; returns false past the cap.
     #[must_use]
     pub fn reserve_web_search(&self) -> bool {
-        let mut count = self.web_search_count.load(Ordering::Acquire);
-        loop {
-            if count >= WEB_SEARCH_CAP {
-                return false;
-            }
-            match self.web_search_count.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => count = observed,
-            }
+        if self.web_search_count.fetch_add(1, Ordering::AcqRel) < WEB_SEARCH_CAP {
+            return true;
         }
+        self.web_search_count.fetch_sub(1, Ordering::AcqRel);
+        false
     }
 
     /// Whether `memory_search` has an index behind it.
@@ -502,8 +492,11 @@ impl ToolExecutor {
                     );
                 };
                 let _lock = self.sandbox.lock.write().await;
-                if let Err(error) = self.sandbox.scan() {
-                    return ToolResult::error(error);
+                let sandbox = Arc::clone(&self.sandbox);
+                match tokio::task::spawn_blocking(move || sandbox.scan()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => return ToolResult::error(error),
+                    Err(error) => return ToolResult::error(format!("scan failed: {error}")),
                 }
                 return match git.execute(&write).await {
                     Ok(content) => ToolResult::success(content),
@@ -520,11 +513,7 @@ impl ToolExecutor {
         match self.sandbox.run_shell(&input.command, network).await {
             Ok(output) => {
                 let mut content = output.content;
-                if !output.success
-                    && input.command.to_ascii_lowercase().contains(".git")
-                    && (content.contains("Read-only file system")
-                        || content.contains("Operation not permitted"))
-                {
+                if !output.success && refuses_git_path(&content) {
                     content.push_str("\n.git is read-only in the shell; run git write commands on their own through the harness");
                 }
                 ToolResult {
@@ -667,6 +656,17 @@ pub(crate) fn clip_middle(value: &str, limit: usize, original: usize) -> String 
         tail_start += 1;
     }
     format!("{}{}{}", &value[..head_end], marker, &value[tail_start..])
+}
+
+/// Whether a line of shell output reports a refused write to a path with a `.git` component.
+fn refuses_git_path(output: &str) -> bool {
+    output.lines().any(|line| {
+        (line.contains("Read-only file system") || line.contains("Operation not permitted"))
+            && line
+                .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ':'))
+                .flat_map(|word| word.split('/'))
+                .any(|component| component.eq_ignore_ascii_case(".git"))
+    })
 }
 
 fn contains_glob_meta(pattern: &str) -> bool {

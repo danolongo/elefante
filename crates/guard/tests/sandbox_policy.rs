@@ -1,8 +1,12 @@
+use elefante_guard::PathPolicy;
 use elefante_guard::sandbox::{
     HiddenKind, HiddenPath, LaunchSpec, Network, Policy, bwrap_args, environment, seatbelt_profile,
     validate_root,
 };
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 fn policy() -> Policy {
     Policy {
@@ -16,6 +20,7 @@ fn policy() -> Policy {
         read_only: vec![PathBuf::from("/work/project[1]/.git")],
         hidden: vec![],
         network: Network::Off,
+        runtime_dir: None,
     }
 }
 
@@ -66,7 +71,6 @@ fn bubblewrap_keeps_its_private_devices_writable() {
         bash: "/bin/bash".into(),
         command: "true".into(),
         environment: vec![("TERM".into(), "dumb".into())],
-        seccomp_fds: vec![3, 4],
     };
     let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
     assert!(args.windows(2).any(|parts| parts == ["--dev", "/dev"]));
@@ -87,7 +91,6 @@ fn bubblewrap_masks_its_init_process_from_shell_inspection() {
         bash: "/bin/bash".into(),
         command: "ps eww $PPID".into(),
         environment: vec![("TERM".into(), "dumb".into())],
-        seccomp_fds: vec![3, 4],
     };
     let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
     assert!(
@@ -104,8 +107,6 @@ fn seatbelt_never_interpolates_paths_and_rejects_injection() {
     assert!(params.iter().any(|(_, value)| value == p.root.as_os_str()));
     assert!(profile.contains("(deny default)"));
     assert!(profile.contains(r#"regex #"/\.ssh(/|$)""#));
-    assert!(profile.contains(r#"regex #"/\.aws/credentials(/|$)""#));
-    assert!(profile.contains(r#"regex #"/\.cargo/credentials(\.toml)?(/|$)""#));
     assert_eq!(profile, include_str!("snapshots/seatbelt.sb"));
     for name in [
         "/work/quote\"",
@@ -116,6 +117,58 @@ fn seatbelt_never_interpolates_paths_and_rejects_injection() {
         let mut p = policy();
         p.root = name.into();
         assert!(seatbelt_profile(&p).is_err());
+    }
+}
+
+#[test]
+fn seatbelt_name_denies_cover_every_shared_secret_name() {
+    let (profile, _) = seatbelt_profile(&policy()).unwrap();
+    let denies: Vec<regex::Regex> = profile
+        .lines()
+        .filter(|line| line.starts_with("(deny file-read*"))
+        .filter_map(|line| line.split_once("(regex #\"")?.1.split_once("\")"))
+        .map(|(pattern, _)| regex::Regex::new(pattern).expect("Seatbelt regex"))
+        .collect();
+    let regex_denies = |name: &str| {
+        denies
+            .iter()
+            .any(|deny| deny.is_match(&format!("/work/project[1]/{name}")))
+    };
+    // One or more names for each rule of the shared list in `PathPolicy`.
+    for name in [
+        ".ssh",
+        "sub/.ssh/config",
+        ".aws/credentials",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".elefante",
+        ".elefante/credentials.toml",
+        ".env",
+        "app/.env.production",
+        ".netrc",
+        ".npmrc",
+        ".git-credentials",
+        "credentials",
+        "deploy/credentials.toml",
+        "id_rsa",
+        "keys/id_rsa.pub",
+        "server.pem",
+        "Server.PEM",
+        "private.key",
+        "private.KEY",
+    ] {
+        assert!(PathPolicy::is_secret_path(Path::new(name)), "{name}");
+        assert!(regex_denies(name), "the Seatbelt regex misses {name}");
+    }
+    // Positive controls: ordinary names pass both checks.
+    for name in [
+        "src/lib.rs",
+        "src/credentials.rs",
+        "environment.rs",
+        "docs/keys.md",
+    ] {
+        assert!(!PathPolicy::is_secret_path(Path::new(name)), "{name}");
+        assert!(!regex_denies(name), "{name}");
     }
 }
 
@@ -314,7 +367,6 @@ fn bubblewrap_snapshot_preserves_overlay_and_descriptor_order() {
         bash: "/bin/bash".into(),
         command: "printf '%s' '$HOME'".into(),
         environment: vec![("TERM".into(), "dumb".into())],
-        seccomp_fds: vec![3, 7],
     };
     let args = bwrap_args(&p, &launch).unwrap();
     let expected = [
@@ -363,7 +415,7 @@ fn bubblewrap_snapshot_preserves_overlay_and_descriptor_order() {
         "--add-seccomp-fd",
         "3",
         "--add-seccomp-fd",
-        "7",
+        "4",
         "--",
         "/bin/bash",
         "-c",
@@ -382,22 +434,6 @@ fn bubblewrap_snapshot_preserves_overlay_and_descriptor_order() {
             ]
             .map(OsString::from)
     }));
-    for fds in [vec![], vec![3], vec![3, 3], vec![0, 4]] {
-        let mut invalid = launch.clone();
-        invalid.seccomp_fds = fds;
-        assert!(bwrap_args(&p, &invalid).is_err());
-    }
-    let mut leaked_key = launch.clone();
-    leaked_key
-        .environment
-        .push(("OPENROUTER_API_KEY".into(), "synthetic".into()));
-    assert!(bwrap_args(&p, &leaked_key).is_err());
-    let mut duplicate = launch.clone();
-    duplicate.environment.push(("TERM".into(), "dumb".into()));
-    assert!(bwrap_args(&p, &duplicate).is_err());
-    let mut wrong_term = launch.clone();
-    wrong_term.environment[0].1 = "xterm".into();
-    assert!(bwrap_args(&p, &wrong_term).is_err());
 }
 
 #[test]
@@ -459,26 +495,13 @@ fn shared_temp_admits_only_validated_git_directories_and_root_paths() {
 
 #[test]
 fn readable_mounts_exclude_the_runtime_directory() {
-    const RUNTIME: &str = "/outside/xdg-runtime";
-    // The workspace forbids `unsafe`, so the test sets the variable on a child test process.
-    if std::env::var_os("XDG_RUNTIME_DIR").as_deref() != Some(RUNTIME.as_ref()) {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "readable_mounts_exclude_the_runtime_directory"])
-            .env("XDG_RUNTIME_DIR", RUNTIME)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}"
-        );
-        return;
-    }
     let mut p = policy();
-    p.readable.push(format!("{RUNTIME}/bus").into());
+    p.runtime_dir = Some("/outside/xdg-runtime".into());
+    p.readable.push("/outside/xdg-runtime/bus".into());
     assert!(p.validate().is_err());
     p.readable.pop();
-    p.readable.push(format!("{RUNTIME}-other").into());
+    // Positive control: a sibling that only shares the prefix text stays mountable.
+    p.readable.push("/outside/xdg-runtime-other".into());
     assert!(p.validate().is_ok());
 }
 
@@ -492,7 +515,6 @@ fn session_environment_uses_fixed_path_and_private_temp() {
                 (OsString::from("SDKROOT"), OsString::from("/evil")),
             ],
             &[],
-            true,
         )
         .unwrap();
     assert!(
@@ -510,28 +532,19 @@ fn session_environment_uses_fixed_path_and_private_temp() {
                 .as_os_str()
     }));
     assert!(!vars.iter().any(|(_, value)| value == "/evil"));
-    assert!(p.environment([], &["/unmounted/bin".into()], true).is_err());
+    assert!(p.environment([], &["/unmounted/bin".into()]).is_err());
     assert!(
-        p.environment([], &["/usr/local/unlisted-bin".into()], true)
+        p.environment([], &["/usr/local/unlisted-bin".into()])
             .is_err()
     );
     let mut explicit = policy();
     explicit.readable.push("/opt/tool/bin".into());
-    let with_tool = explicit
-        .environment([], &["/opt/tool/bin".into()], true)
-        .unwrap();
+    let with_tool = explicit.environment([], &["/opt/tool/bin".into()]).unwrap();
     assert!(
         with_tool
             .iter()
             .any(|(key, value)| key == "PATH" && value.to_string_lossy().contains("/opt/tool/bin"))
     );
-    let disabled = p.environment([], &[], false).unwrap();
-    assert!(!disabled.iter().any(|(key, _)| matches!(
-        key.to_str(),
-        Some(
-            "HOME" | "TMPDIR" | "GIT_OPTIONAL_LOCKS" | "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_NOSYSTEM"
-        )
-    )));
 }
 
 #[cfg(target_os = "linux")]

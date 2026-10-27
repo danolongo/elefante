@@ -140,15 +140,19 @@ fn collect_decisions(
 }
 
 fn classify_file_redirect(node: Node<'_>, source: &[u8], root: &Path) -> Option<BashDecision> {
-    if node
+    let destination = node
         .child_by_field_name("destination")
         .and_then(|destination| destination.utf8_text(source).ok())
-        .is_some_and(|value| looks_like_secret_path(value.trim_matches(['\'', '"']), root))
-    {
+        .map(|value| value.trim_matches(['\'', '"']));
+    if destination.is_some_and(|value| looks_like_secret_path(value, root)) {
         return Some(BashDecision {
             verdict: Verdict::Deny,
             rule: "secret-path-redirect",
         });
+    }
+    // Discarding output writes nothing.
+    if destination == Some("/dev/null") {
+        return None;
     }
 
     let mut cursor = node.walk();

@@ -277,26 +277,23 @@ impl ToolGate {
             GitRoute::NotHarness => {}
         }
         let decision = self.classifier.classify_in(command, root);
-        if decision.verdict == Verdict::Deny {
-            return GateDecision::Deny {
-                rule: decision.rule,
-            };
-        }
-        if input.get("network").and_then(Value::as_bool) == Some(true) {
-            return GateDecision::Escalate {
-                rule: "network-requested",
-                command: command.to_owned(),
-                network: true,
-            };
-        }
         match decision.verdict {
+            Verdict::Deny => GateDecision::Deny {
+                rule: decision.rule,
+            },
+            _ if input.get("network").and_then(Value::as_bool) == Some(true) => {
+                GateDecision::Escalate {
+                    rule: "network-requested",
+                    command: command.to_owned(),
+                    network: true,
+                }
+            }
             Verdict::Allow => GateDecision::Allow,
             Verdict::Escalate => GateDecision::Escalate {
                 rule: decision.rule,
                 command: command.to_owned(),
                 network: false,
             },
-            Verdict::Deny => unreachable!("denials returned above"),
         }
     }
 }

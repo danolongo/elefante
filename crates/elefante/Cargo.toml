@@ -13,6 +13,7 @@ elefante-guard = { path = "../guard" }
 elefante-mem = { path = "../mem" }
 elefante-provider = { path = "../provider" }
 futures-util.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -6,6 +6,7 @@ import { Status } from "./Status";
 import { Input } from "./Input";
 import { Modal, type ModalProps } from "./Modal";
 import { ApprovalPrompt } from "./ApprovalPrompt";
+import { ConsentPrompt } from "./ConsentPrompt";
 import { MemoryPanel } from "./MemoryPanel";
 import type { Command } from "../commands";
 import { PerchMascot, TopMascot, useMascot } from "./Mascot";
@@ -16,6 +17,7 @@ export function App(props: AppProps) {
   const mascot = useMascot(props.state, props.resumed);
   const renderer = useRenderer();
   const approval = props.modal?.kind === "approval" ? props.modal : null;
+  const consent = props.modal?.kind === "consent" ? props.modal : null;
   // Reasoning can run to pages, so it starts hidden; Ctrl+R shows and hides it.
   const [showReasoning, setShowReasoning] = useState(false);
   // The mouse is captured, which blocks the terminal's own selection, so selecting is done here and
@@ -41,12 +43,13 @@ export function App(props: AppProps) {
         {props.notice && <text fg="#777777">{props.notice}</text>}
         {!props.connected && <text>Reconnecting… the turn continues in the daemon.</text>}
         {approval && <ApprovalPrompt key={approval.approval.approval_id} {...approval} />}
-        {/* Hidden, not unmounted, so a draft in the prompt bar survives the approval. */}
-        <box visible={!approval}><Input disabled={!props.connected || !!props.submitting || !!props.state.active_turn || !!props.modal} onSubmit={props.onSubmit} onCommand={props.onCommand} /></box>
+        {consent && <ConsentPrompt {...consent} />}
+        {/* Hidden, not unmounted, so a draft in the prompt bar survives the question. */}
+        <box visible={!approval && !consent}><Input disabled={!props.connected || !!props.submitting || !!props.state.active_turn || !!props.modal} onSubmit={props.onSubmit} onCommand={props.onCommand} /></box>
       </box>
       <PerchMascot view={mascot} animate={props.animateMascot} />
     </box>
     {props.modal?.kind === "memory" ? <MemoryPanel {...props.modal} />
-      : props.modal && props.modal.kind !== "approval" && <Modal key={props.modal.kind} {...props.modal} />}
+      : props.modal?.kind === "key" && <Modal {...props.modal} />}
   </box>;
 }

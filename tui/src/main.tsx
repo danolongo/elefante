@@ -40,6 +40,7 @@ let retryPrompt = "";
 let stopped = false;
 let reconnecting = false;
 let consentPrompt: MemorySeed | null = null;
+const answered = new Set<string>();   // approvals the user answered, hidden before the daemon confirms
 let panel: { rows: MemoryRow[] | null; error: string | null; busy: boolean } | null = null;
 let notice: string | null = null;
 let timer: ReturnType<typeof setInterval>;
@@ -85,7 +86,7 @@ async function command(c: Exclude<Command, { kind: "prompt" }>) {
 }
 function draw() {
   if (stopped) return;
-  const approval = state.active_turn?.pending_approvals[0];
+  const approval = state.active_turn?.pending_approvals.find(a => !answered.has(a.approval_id));
   let modal: ModalProps | null = null;
   if (panel) modal = { kind: "memory", cwd: state.cwd, rows: panel.rows, error: panel.error, learning: learningLine(state.memory), extractor: state.memory?.extractor ?? null, busy: panel.busy, onForget: id => void forgetNote(id), onClose: () => { panel = null; draw(); } };
   else if (consentPrompt) modal = { kind: "consent", extractor: consentPrompt.extractor!, sameModel: consentPrompt.extractor === state.model, busy, onDecision: async decision => {
@@ -103,11 +104,14 @@ function draw() {
     catch (error) { fail(error); }
     finally { busy = false; draw(); }
   } };
-  else if (approval) modal = { kind: "approval", approval, busy, onDecision: async decision => {
-    busy = true; draw();
+  else if (approval) modal = { kind: "approval", approval, onDecision: async decision => {
+    // Hide the question now. The daemon's approval.resolved arrives after the reply.
+    answered.add(approval.approval_id); message = null; draw();
     try { await rpc.request("session.resolve_approval", { session_id: state.session_id, approval_id: approval.approval_id, decision }); }
-    catch (error) { fail(error); }
-    finally { busy = false; draw(); }
+    catch (error) {
+      // -32005: someone already resolved it, so there is nothing left to answer.
+      if (!(error instanceof RpcError && error.code === -32005)) { answered.delete(approval.approval_id); fail(error); }
+    }
   } };
   // Publish, never re-render: `root.render()` remounts the tree on every call, so calling it
   // per update leaked one keypress listener each time — four a second, unbounded.

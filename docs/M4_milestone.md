@@ -107,9 +107,9 @@ code is written.
 
 These are observations from scratch probes, not implementation-gate results. Linux evidence is
 from successful `ubuntu-24.04` Actions runs [39584938893](https://github.com/danolongo/elefante/actions/runs/39584938893)
-and [39586238156](https://github.com/danolongo/elefante/actions/runs/39586238156). S9's live
-result is deliberately deferred until the end of M4.1 at the maintainer's request; its probe
-lives in `crates/provider/tests/s9_web_plugin.rs` and must not be run by the agent.
+and [39586238156](https://github.com/danolongo/elefante/actions/runs/39586238156). S9 ran live at the
+maintainer's request in credentialed run [40486394912](https://github.com/danolongo/elefante/actions/runs/40486394912);
+its probe lives in `crates/provider/tests/s9_web_plugin.rs`.
 
 | Question | Observed result | Decision or follow-up |
 |---|---|---|
@@ -122,7 +122,7 @@ lives in `crates/provider/tests/s9_web_plugin.rs` and must not be run by the age
 | S7, Linux | `rustix` 1.1.5 and `seccompiler` 0.5.0 built with Rust 1.90. `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` opened a normal file and rejected symlink and parent traversal. | Use root-descriptor-relative `openat2` with both resolve flags. |
 | S7, macOS | On arm64 macOS 15.7.9 with Rust 1.90, locked `rustix` 1.1.4 fails to compile `OFlags::NOFOLLOW_ANY`; 1.1.5 builds offline. A dirfd-relative open of an ordinary file succeeds and intermediate/final symlinks fail with `ELOOP`. `openat(rootfd, "../outside", NOFOLLOW_ANY)` succeeds. | Require `rustix` 1.1.5 or later compatible release. Reject absolute and parent components separately; `NOFOLLOW_ANY` alone does not enforce containment. |
 | S8, this checkout | Metadata-only unpruned `.git` walk: 4,343 directories and 130,997 entries, one `.git`, median 232 ms over five warm runs; first cold run about 1.2 s. Name-only secret scan pruning `target/` and `node_modules/`: 319 directories and 7,315 entries, median 18 ms. No secret contents were opened. | Keep the unpruned `.git` scan before each command for correctness, and prune only the secret-name scan. The per-command latency is a measured cost; the production Rust walk must be checked later. |
-| S9, provisional | The ignored test compiles and checks the documented Exa-pinned plugin request. The maintainer has deferred the billable call; stream shape, citations and actual cost are **not run**. | Implement against the documented shape with a stub backend; do not claim live compatibility. Revisit backend and cost after the end-of-M4.1 probe. |
+| S9, live | With `anthropic/claude-sonnet-5` and three results, the documented plugin request streamed 15 events and `[DONE]`. Citations arrive as `delta.annotations[].url_citation` (url, title, content, indexes) and as plain Markdown links in the text. `usage.cost` was $0.0090 for the raw probe and $0.0096 through the daemon's backend; no separate web-search cost field came back. The backend's answer listed the three sources but did not state the asked date. | The documented shape holds and the text-only backend keeps working. Whether `usage.cost` includes the Exa fee is checked in OpenRouter Activity before choosing a cheaper search default. |
 | S10, Linux | Ubuntu runner Git 2.55.0 accepted exact `--porcelain` and refused abbreviated `--porc` with `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` (exit 128). | Keep the environment guard alongside the exact option allowlist. |
 | S10, macOS | Apple Git 2.50.1 accepts `status --porc` without `GIT_TEST_DISALLOW_ABBREVIATED_OPTIONS=1` but exits 128 with it; exact `--porcelain` succeeds either way. | Keep the variable as a supplemental guard. The exact option allowlist remains primary. |
 

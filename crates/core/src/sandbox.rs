@@ -761,7 +761,7 @@ const PROTECTED_NAMES: [&str; 8] = [
     "info",
     "commondir",
     "gitdir",
-    "objects/info/alternates",
+    "objects/info",
     "modules",
 ];
 

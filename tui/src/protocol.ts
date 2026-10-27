@@ -1,13 +1,18 @@
+import { readFile } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
+import { dirname, join } from "node:path";
 
 export const MAX_LINE_BYTES = 8 * 1024 * 1024;
 export type Usage = { input_tokens: number; output_tokens: number; reasoning_tokens: number; cached_input_tokens: number; cache_write_tokens: number; cost: number | null };
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "stop_sequence" | "interrupted" | { other: string };
-export type Approval = { approval_id: string; command: string; rule: string };
+/** `command` is model-chosen text: render it through `displaySafe`. `network` asks for internet access. */
+export type Approval = { approval_id: string; command: string; rule: string; network?: boolean };
+/** Whether the session's shell runs under an OS sandbox; absent from an older daemon. */
+export type SandboxStatus = { state: "on" | "off" | "unavailable"; detail: string };
 export type Tool = { tool_call_id: string; name: string; state: "running" | "ok" | "error" | "cancelled"; is_error: boolean; input_preview?: string; output_preview?: string; duration_ms?: number };
 export type CompletedTurn = { turn_id: string; prompt: string; text: string; reasoning?: string; tools: Tool[]; stop_reason: StopReason; usage: Usage; memory_note_ids?: number[] };
 export type ActiveTurn = { turn_id: string; text_so_far: string; reasoning_so_far: string; tools: Tool[]; pending_approval: Approval | null; memory_note_ids?: number[] };
-export type Snapshot = { session_id: string; seq: number; cwd: string; model: string; turns: CompletedTurn[]; active_turn: ActiveTurn | null };
+export type Snapshot = { session_id: string; seq: number; cwd: string; model: string; turns: CompletedTurn[]; active_turn: ActiveTurn | null; sandbox?: SandboxStatus };
 export type Consent = "unset" | "granted" | "declined" | "off";
 export type MemorySeed = { consent: Consent; extractor: string | null };
 export type MemoryStatus = MemorySeed & {
@@ -21,7 +26,7 @@ export type MemoryStatus = MemorySeed & {
 export type MemoryInfo = MemorySeed | MemoryStatus;
 export type MemoryNote = { id: number; kind: string; status: string; statement: string; origin: string };
 export type MemoryChange = "added" | "promoted" | "superseded" | "revived";
-export type CreateResult = { session_id: string; seq: number; memory?: MemoryInfo };
+export type CreateResult = { session_id: string; seq: number; memory?: MemoryInfo; sandbox?: SandboxStatus };
 type EventParams = {
   "turn.started": Record<string, never>;
   "reasoning.delta": { text: string };
@@ -37,15 +42,42 @@ type EventParams = {
   "memory.context": { notes: MemoryNote[] };
 };
 export type Notification = { [K in keyof EventParams]: { session_id: string; turn_id: string | null; method: K; params: EventParams[K] } & ({ seq: number; seq_from?: never; seq_to?: never } | { seq?: never; seq_from: number; seq_to: number }) }[keyof EventParams];
-export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemoryInfo };
+export type AttachResult = ({ kind: "resumed"; from: number; events: Notification[] } | { kind: "snapshot"; seq: number; snapshot: Snapshot }) & { memory?: MemoryInfo; sandbox?: SandboxStatus };
 export class ProtocolError extends Error {}
 export class RpcError extends Error { constructor(public code: number, message: string) { super(message); } }
+export const OLDER_DAEMON = "the running daemon is from an older build of elefante; stop it (`pkill -f elefante-srv` or `pkill -f 'elefante daemon'`) and try again";
+/** A daemon that answers `auth` with "unknown method" predates the socket token. */
+export class OlderDaemonError extends Error { constructor() { super(OLDER_DAEMON); } }
+/** The daemon writes its token beside its socket. */
+export const tokenPath = (socketPath: string) => join(dirname(socketPath), "token");
+/**
+ * Reads the daemon's token, waiting briefly while a starting daemon has yet to write it. A daemon
+ * that never writes one predates the token; the client then sends an empty token, so that daemon
+ * answers `auth` with "unknown method" and the person learns to restart it.
+ */
+export async function readToken(path: string): Promise<string> {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try { return (await readFile(path, "utf8")).trim(); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (Date.now() >= deadline) return "";
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+}
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const strings = (v: Record<string, unknown>, ...keys: string[]) => keys.every(k => typeof v[k] === "string");
 const usage = (v: unknown): v is Usage => object(v) && ["input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens", "cache_write_tokens"].every(k => integer(v[k])) && (v.cost === null || typeof v.cost === "number" && Number.isFinite(v.cost) && v.cost >= 0);
 const stopReason = (v: unknown): v is StopReason => typeof v === "string" ? ["end_turn", "tool_use", "max_tokens", "refusal", "stop_sequence", "interrupted"].includes(v) : object(v) && typeof v.other === "string";
 const consents: Consent[] = ["unset", "granted", "declined", "off"];
+const approval = (v: unknown): v is Approval => object(v) && strings(v, "approval_id", "command", "rule") && (v.network === undefined || typeof v.network === "boolean");
+function parseSandbox(value: unknown): SandboxStatus | undefined {
+  if (value === undefined) return undefined;
+  if (!object(value) || !["on", "off", "unavailable"].includes(value.state as string) || typeof value.detail !== "string") throw new ProtocolError("Invalid sandbox state");
+  return { state: value.state as SandboxStatus["state"], detail: value.detail };
+}
 export function displaySafe(text: string): string {
   return text.replace(/[\t\n]/g, " ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "").split(/\s+/u).filter(Boolean).join(" ");
 }
@@ -81,7 +113,8 @@ export const isMemoryStatus = (memory: MemoryInfo | undefined): memory is Memory
 export function parseCreate(value: unknown): CreateResult {
   if (!object(value) || !strings(value, "session_id") || !integer(value.seq)) throw new ProtocolError("Invalid create response");
   const memory = parseMemory(value.memory);
-  return { session_id: value.session_id as string, seq: value.seq, ...(memory ? { memory } : {}) };
+  const sandbox = parseSandbox(value.sandbox);
+  return { session_id: value.session_id as string, seq: value.seq, ...(memory ? { memory } : {}), ...(sandbox ? { sandbox } : {}) };
 }
 export function parseConsentResult(value: unknown): { consent: Consent } {
   if (!object(value) || !consents.includes(value.consent as Consent)) throw new ProtocolError("Invalid consent response");
@@ -101,7 +134,7 @@ export function parseNotification(value: unknown): Notification {
     case "reasoning.delta": case "text.delta": valid = strings(p, "text"); break;
     case "tool.started": valid = strings(p, "tool_call_id", "name", "input_preview"); break;
     case "tool.finished": valid = strings(p, "tool_call_id", "output_preview") && typeof p.is_error === "boolean" && integer(p.duration_ms); break;
-    case "approval.requested": valid = strings(p, "approval_id", "command", "rule"); break;
+    case "approval.requested": valid = approval(p); break;
     case "approval.resolved": valid = strings(p, "approval_id") && typeof p.approved === "boolean"; break;
     case "turn.finished": valid = stopReason(p.stop_reason) && usage(p.usage); break;
     case "session.error": valid = strings(p, "message"); break;
@@ -118,16 +151,19 @@ function parseSnapshot(value: unknown): Snapshot {
   const ids = (v: unknown) => v === undefined || Array.isArray(v) && v.every(integer);
   for (const turn of value.turns) if (!object(turn) || !strings(turn, "turn_id", "prompt", "text") || !tools(turn.tools) || !stopReason(turn.stop_reason) || !usage(turn.usage) || !ids(turn.memory_note_ids)) throw new ProtocolError("Invalid completed turn");
   const a = value.active_turn;
-  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !ids(a.memory_note_ids) || !(a.pending_approval === null || object(a.pending_approval) && strings(a.pending_approval, "approval_id", "command", "rule")))) throw new ProtocolError("Invalid active turn");
+  if (a !== null && (!object(a) || !strings(a, "turn_id", "text_so_far", "reasoning_so_far") || !tools(a.tools) || !ids(a.memory_note_ids) || !(a.pending_approval === null || approval(a.pending_approval)))) throw new ProtocolError("Invalid active turn");
+  parseSandbox(value.sandbox);
   return value as Snapshot;
 }
 export function parseAttach(value: unknown, sessionId: string, since?: number): AttachResult {
   if (!object(value)) throw new ProtocolError("Invalid attach response");
   const memory = parseMemory(value.memory);
+  const sandbox = parseSandbox(value.sandbox);
+  const extra = { ...(memory ? { memory } : {}), ...(sandbox ? { sandbox } : {}) };
   if (value.kind === "snapshot") {
     const snapshot = parseSnapshot(value.snapshot);
     if (snapshot.session_id !== sessionId || snapshot.seq !== value.seq) throw new ProtocolError("Snapshot cursor mismatch");
-    return { kind: "snapshot", seq: snapshot.seq, snapshot, ...(memory ? { memory } : {}) };
+    return { kind: "snapshot", seq: snapshot.seq, snapshot, ...extra };
   }
   if (value.kind !== "resumed" || since === undefined || value.from !== since + 1 || !Array.isArray(value.events)) throw new ProtocolError("Invalid resume response");
   const events = value.events.map(parseNotification);
@@ -135,7 +171,7 @@ export function parseAttach(value: unknown, sessionId: string, since?: number): 
   for (const note of events) {
     if (note.session_id !== sessionId || note.seq !== next++) throw new ProtocolError("Resume events are not contiguous ring entries");
   }
-  return { kind: "resumed", from: value.from as number, events, ...(memory ? { memory } : {}) };
+  return { kind: "resumed", from: value.from as number, events, ...extra };
 }
 
 /** Byte framing preserves UTF-8 when socket chunks split inside a codepoint. */
@@ -215,6 +251,13 @@ export class RpcClient {
       this.onDisconnect(failure);
     });
     await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+    try { await this.request("auth", { token: await readToken(tokenPath(path)) }); }
+    catch (error) {
+      // Detach first, so a refused handshake is not reported as a disconnect.
+      this.socket = null;
+      socket.destroy();
+      throw error instanceof RpcError && error.code === -32601 ? new OlderDaemonError() : error;
+    }
   }
   request<T = unknown>(method: string, params: unknown): Promise<T> {
     if (!this.socket || this.socket.destroyed) return Promise.reject(new Error("Disconnected"));
@@ -304,6 +347,8 @@ export async function connectOrExplain(rpc: RpcClient, socketPath: string): Prom
     return null;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    // A daemon answered but refused the handshake: say so, not that none is listening.
+    if (error instanceof OlderDaemonError || error instanceof RpcError) return `elefante: ${detail}`;
     return `elefante: no daemon listening at ${socketPath}\n`
       + "Run `elefante` to start one; this client does not spawn it.\n"
       + `(${detail})`;

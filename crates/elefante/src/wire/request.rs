@@ -9,6 +9,7 @@ pub const NO_API_KEY: i32 = -32004;
 pub const UNKNOWN_APPROVAL: i32 = -32005;
 pub const UNKNOWN_NOTE: i32 = -32006;
 pub const MEMORY_OFF: i32 = -32007;
+pub const UNAUTHORIZED: i32 = -32008;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
@@ -247,6 +248,25 @@ pub struct CreateResult {
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxStatus>,
+}
+
+/// Whether the session's shell commands run under an OS sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxState {
+    On,
+    /// `ELEFANTE_SANDBOX=0`: every shell command needs approval.
+    Off,
+    /// Every shell command fails; `detail` says why and how to fix it.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxStatus {
+    pub state: SandboxState,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

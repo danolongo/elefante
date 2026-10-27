@@ -18,15 +18,27 @@ env:
   # Pinned deliberately. Unpinned tooling is how a green run stops meaning what it meant last
   # week — the same reasoning that gives this repo exactly one lockfile. The Rust pin lives in
   # the `rust` job below rather than here, because `uses:` takes no expressions.
-  # See docs/LOCKFILE.md.
+  # See tui/README.md.
   BUN_VERSION: 1.4.2
 
 jobs:
+  # Both legs run the sandbox gate: bubblewrap on Linux, Seatbelt on macOS.
   rust:
-    name: rust
-    runs-on: ubuntu-latest
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap sqlite3
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-user --unshare-all --disable-userns --die-with-parent --ro-bind / / true
       # Pinned, not `stable`. With clippy::pedantic at warn and -D warnings, a floating
       # toolchain turns CI red on someone else's PR whenever Rust ships a new lint — which
       # happened on this workflow's very first run, on code that had not changed. This tag is
@@ -39,11 +51,15 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The runner hands each step an inheritable descriptor: a pipe on Linux, a socket on macOS.
+      # The step closes it so the host-side fd controls start as clean as a developer's shell.
       - name: test
-        run: cargo test --workspace --no-fail-fast
-      # Catches a ninth crate added without one. It cannot catch a stale README — that needs
-      # the rustdoc include_str! wiring noted in docs/DEVELOPER_GUIDE.md §13.
+        run: |
+          for f in /dev/fd/*; do n=${f##*/}; if [ "$n" -gt 2 ] && [ -e "$f" ]; then eval "exec $n<&-"; fi; done
+          cargo test --workspace --no-fail-fast
+      # Catches a crate added without a README. It cannot catch a stale README.
       - name: crate readmes exist
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           missing=0
@@ -51,6 +67,22 @@ jobs:
             [ -f "$c/README.md" ] || { echo "missing: $c/README.md"; missing=1; }
           done
           exit $missing
+
+  macos-host-services:
+    name: macos host services
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-host-services
+      # These controls may touch the clipboard, GUI and launchd. Run only on the disposable
+      # CI machine; never in the ordinary local cargo test suite.
+      - name: sandbox host-service controls
+        env:
+          ELEFANTE_MAC_HOST_GATE: "1"
+        run: cargo test -p elefante-core --test macos_host -- --ignored --nocapture --test-threads=1
 
   # Advisory only. Pinning above buys reproducibility at the cost of never hearing about a new
   # lint until someone bumps the pin; this job pays that back by reporting what current stable
@@ -100,7 +132,7 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       # Verifies against tui/bun.lock, the one committed lockfile. This is only meaningful
       # because package-lock.json was removed — with both present, bun and npm each report a
-      # successful frozen install while producing different trees. See docs/LOCKFILE.md.
+      # successful frozen install while producing different trees. See tui/README.md.
       - name: install
         working-directory: tui
         run: bun install --frozen-lockfile
@@ -131,7 +163,7 @@ jobs:
       - name: install
         working-directory: tui
         run: bun install --frozen-lockfile
-      # Keeps the vendored-binary option open (see MILESTONES.md) at ~0.4s per
+      # Keeps the vendored-binary option open (see tui/README.md) at ~0.4s per
       # run. The client must stay compile-able: no runtime node_modules lookups, no dynamic
       # imports of paths absent at bundle time. Retrofitting that after M2-M5 accumulate
       # client code is the expensive version of this check.

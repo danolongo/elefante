@@ -1,4 +1,4 @@
-use super::{MemoryStatus, Notification, StopReason, Usage};
+use super::{MemoryStatus, Notification, SandboxStatus, StopReason, Usage, notification::is_false};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -9,12 +9,16 @@ pub enum AttachResult {
         events: Vec<Notification>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory: Option<MemoryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<SandboxStatus>,
     },
     Snapshot {
         seq: u64,
         snapshot: Box<SessionSnapshot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory: Option<MemoryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<SandboxStatus>,
     },
 }
 
@@ -26,6 +30,8 @@ pub struct SessionSnapshot {
     pub model: String,
     pub turns: Vec<CompletedTurn>,
     pub active_turn: Option<ActiveTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +62,9 @@ pub struct PendingApproval {
     pub approval_id: String,
     pub command: String,
     pub rule: String,
+    /// The command asked for network access; a reattached client shows the same badge.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub network: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

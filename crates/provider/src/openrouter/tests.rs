@@ -20,6 +20,47 @@ use super::*;
 use crate::Effort;
 
 #[test]
+fn web_search_is_opt_in_and_pins_exa_with_the_requested_result_count() {
+    let provider = OpenRouterProvider::new("test-key");
+    let mut request = Request::new(
+        "some-vendor/model",
+        256,
+        vec![Message::text(Role::User, "rust release")],
+    );
+    let original = serde_json::to_vec(&provider.request_body(&request)).unwrap();
+    assert_eq!(original, br#"{"max_tokens":256,"messages":[{"content":"rust release","role":"user"}],"model":"some-vendor/model","stream":true,"usage":{"include":true}}"#);
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("web_search")
+            .is_none()
+    );
+    let legacy = serde_json::to_value(&request).unwrap();
+    let decoded: Request = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.web_search, None);
+
+    for max_results in [1, 3, 10] {
+        request.web_search = Some(crate::WebSearch { max_results });
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["web_search"], json!({ "max_results": max_results }));
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        let mut body = provider.request_body(&request);
+        assert_eq!(
+            body.as_object_mut().unwrap().remove("plugins"),
+            Some(json!([
+                { "id": "web", "engine": "exa", "max_results": max_results }
+            ]))
+        );
+        assert_eq!(serde_json::to_vec(&body).unwrap(), original);
+    }
+    request.web_search = None;
+    assert_eq!(
+        serde_json::to_vec(&provider.request_body(&request)).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn request_is_cached_sorted_and_carries_reasoning_effort() {
     let provider = OpenRouterProvider::new("test-key");
     let request = Request {
@@ -33,6 +74,7 @@ fn request_is_cached_sorted_and_carries_reasoning_effort() {
         messages: vec![Message::text(Role::User, "hello")],
         effort: Some(Effort::XHigh),
         response_schema: None,
+        web_search: None,
     };
     let body = provider.request_body(&request);
 
@@ -91,6 +133,7 @@ fn auto_router_gets_reasoning_but_not_caching_and_covers_the_beta_slug() {
         messages: vec![Message::text(Role::User, "hello")],
         effort: Some(Effort::High),
         response_schema: None,
+        web_search: None,
     };
     let body = provider.request_body(&request);
 
@@ -156,6 +199,7 @@ fn require_parameters_is_sent_only_alongside_tools() {
         messages: vec![Message::text(Role::User, "hello")],
         effort: None,
         response_schema: None,
+        web_search: None,
     };
 
     assert!(
@@ -176,6 +220,7 @@ fn schema_request(model: &str) -> Request {
             name: "memories".to_owned(),
             schema: json!({ "type": "object", "properties": {} }),
         }),
+        web_search: None,
     }
 }
 

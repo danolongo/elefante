@@ -163,3 +163,12 @@ test("a turn restored from a snapshot leads with its saved-notes marker", () => 
   const restored = restoreSnapshot({ ...snapshot(), active_turn: { turn_id: "t", text_so_far: "hi", reasoning_so_far: "", tools: [], pending_approval: null, memory_note_ids: [1, 2, 3] } });
   expect(restored.active_turn?.segments).toEqual([{ kind: "memory_used", count: 3 }, { kind: "text", text: "hi" }]);
 });
+test("a snapshot restores the sandbox state and the network flag of a pending approval", () => {
+  expect(initialSession("s").sandbox).toBeNull();
+  const pending = { approval_id: "a", command: "curl example.com", rule: "network-requested", network: true };
+  const sandbox = { state: "off" as const, detail: "ELEFANTE_SANDBOX=0" };
+  const state = restoreSnapshot({ ...snapshot(), sandbox, active_turn: { turn_id: "t", text_so_far: "", reasoning_so_far: "", tools: [], pending_approval: pending } });
+  expect(state.sandbox).toEqual(sandbox);
+  expect(state.active_turn?.pending_approvals).toEqual([pending]);
+  expect(restoreSnapshot(snapshot()).sandbox).toBeNull();
+});

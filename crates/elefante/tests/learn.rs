@@ -30,10 +30,14 @@ struct Client {
 impl Client {
     async fn connect(path: &Path) -> Self {
         let (read, write) = UnixStream::connect(path).await.unwrap().into_split();
-        Self {
+        let mut client = Self {
             read: BufReader::new(read),
             write,
-        }
+        };
+        let token = std::fs::read_to_string(elefante::daemon::token_path(path)).unwrap();
+        let reply = client.rpc(0, "auth", json!({"token":token})).await;
+        assert_eq!(reply["result"], json!({}), "{reply}");
+        client
     }
 
     async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {

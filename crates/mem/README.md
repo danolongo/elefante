@@ -21,12 +21,12 @@ the graph.
 | `src/actor.rs` | 111 | `Actor` — a thread that owns a connection and serialises access to it. |
 | `src/walk.rs` | 141 | The repository walk and its filter rules. |
 | `src/diff.rs` | 67 | Decides which files must be read (stat shortcut, racy-timestamp rule). |
-| `src/hash.rs` | 52 | Reading and `blake3`-hashing files on a bounded thread pool. |
+| `src/hash.rs` | 136 | Reading and `blake3`-hashing files on a bounded thread pool, through root-descriptor-relative opens that follow no symlink (`open_root`, `open_beneath`, `check_regular`; `core::file_access` reuses them). |
 | `src/state.rs` | 82 | `file_state` rows: what the cache remembers about each file. |
 | `src/extract/` | 1,020 | Symbols and imports per language, and the content-addressed cache. |
 | `src/graph.rs` | 699 | Every write to the graph, stable ids, edge derivation, co-change storage. |
 | `src/resolve.rs` | 215 | Import specs → file paths, for Rust and TypeScript. |
-| `src/cochange.rs` | 332 | `git log` parsing, rename aliasing, pair counting, the bounded runner. |
+| `src/cochange.rs` | 326 | `git log` parsing, rename aliasing, pair counting, the bounded runner; git runs through `guard::git::hardened`. |
 | `src/indexer.rs` | 547 | `refresh_blocking`, and `Indexer`: single-flight background refreshes. |
 | `src/retrieve.rs` | 897 | Query processing, seeds, expansion, packing, rendering, `Retriever`. |
 | `src/brief.rs` | 259 | The repository brief and its Merkle-root cache. |
@@ -212,9 +212,19 @@ file that did not change. `meta.edges_dirty` is set in the same transaction as t
 makes edges stale, so a crash cannot leave them stale with nothing to say so.
 
 **Git runs without a shell, under a timeout and a size cap, and never trusts the repository.**
-`-c core.fsmonitor=false`, `--no-ext-diff`, `--no-textconv`, `GIT_CEILING_DIRECTORIES` so a plain
-directory is not mistaken for the repository above it. It runs only when `HEAD` has moved, and the
-head is stored in the same transaction as the edges it produced.
+`cochange.rs` runs `/usr/bin/git` with the base invocation of `elefante_guard::git::hardened`.
+That invocation turns off hooks, fsmonitor, the pager, editors, credential helpers, signing,
+external diff and transports, and clears the environment. `GIT_CEILING_DIRECTORIES` stops git
+from taking a plain directory for the repository above it. `git log` adds `--no-ext-diff` and
+`--no-textconv`. Git runs only when `HEAD` has moved, and the indexer stores the head in the same
+transaction as the edges it produced.
+
+**Hashing opens files without following links.** `hash_files` opens the repository root once
+(`openat2` with `RESOLVE_NO_SYMLINKS` on Linux, `O_NOFOLLOW_ANY` on macOS). It then opens each
+file relative to that descriptor, refusing absolute and parent components and every symlink on
+the way. It refuses a regular file with more than one hard link, except under `target/`, and it
+checks the opened descriptor, never a separately resolved path. The indexer runs in the daemon,
+outside the shell sandbox, so these checks are its own.
 
 **Heavy work never holds a database.** Walking, hashing and parsing happen on worker threads; a
 write transaction is as long as the rows it changes. A reader thread with its own read-only
@@ -242,12 +252,14 @@ ELEFANTE_DOGFOOD=/path/to/a/copy cargo test -p elefante-mem --test dogfood -- --
 The `dogfood` test indexes a real repository and prints edges, symbols and counts so a human can
 judge whether they are plausible; it is not part of the gate. `tests/common/` holds a hermetic git
 fixture (empty global config, throwaway `HOME`, fixed identities and dates) and a `Tree`/`Live`
-harness — the same discipline that `MILESTONES.md` records learning three times: a test that
-passes only because the developer's machine supplied something is a test that fails in CI.
+harness. `tests/hardened_hash.rs` (3) checks that hashing refuses links, swapped directories and
+parent paths, while hard links under `target/` stay readable. A test that passes only because the developer's machine supplied something fails in
+CI.
 
 ## Boundaries
 
-`elefante-mem` depends on `elefante-guard` and nothing above it. `tools` does not depend on this
-crate: `memory_search` is a trait defined in `tools` and implemented in `core` over this crate.
+`elefante-mem` depends on `elefante-guard` and nothing above it. `core::tools` never touches the
+store: `memory_search` is a trait defined in `core::tools` and implemented in `core::memory` over
+this crate. `core::file_access` reuses this crate's hardened opens from `hash.rs`.
 Retrieval results are placed in a request by `core`, as an ephemeral `user` message — never
 `system` — and never stored in history.

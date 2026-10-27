@@ -12,6 +12,21 @@ fn executor() -> (tempfile::TempDir, ToolExecutor) {
     (temp, executor)
 }
 
+/// A sandboxed executor and one with the sandbox switched off, for bash tests that must hold in
+/// both modes.
+fn bash_executors() -> [(&'static str, tempfile::TempDir, ToolExecutor); 2] {
+    let (sandboxed_root, sandboxed) = executor();
+    let (disabled_root, disabled) = executor();
+    [
+        ("sandboxed", sandboxed_root, sandboxed),
+        (
+            "disabled",
+            disabled_root,
+            disabled.with_sandbox_disabled().unwrap(),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn credential_file_is_never_read_or_returned_by_search() {
     let (temp, executor) = executor();
@@ -43,21 +58,22 @@ async fn credential_file_is_never_read_or_returned_by_search() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelling_executing_bash_kills_descendants_before_delayed_write() {
-    let (temp, executor) = executor();
-    let running = tokio::spawn(async move {
-        executor.execute("bash", json!({"command": "(printf ready > ready; sleep 0.5; printf leaked > delayed) & wait"})).await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !temp.path().join("ready").exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    running.abort();
-    assert!(running.await.unwrap_err().is_cancelled());
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(!temp.path().join("delayed").exists());
+    for (mode, temp, executor) in bash_executors() {
+        let running = tokio::spawn(async move {
+            executor.execute("bash", json!({"command": "(printf ready > ready; sleep 0.5; printf leaked > delayed) & wait"})).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !temp.path().join("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{mode}: command never started"));
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled(), "{mode}");
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(!temp.path().join("delayed").exists(), "{mode}");
+    }
 }
 
 #[test]
@@ -78,6 +94,7 @@ fn definitions_are_stable_sorted_and_strict() {
             "grep",
             "memory_search",
             "read",
+            "web_search",
             "write"
         ]
     );
@@ -86,6 +103,13 @@ fn definitions_are_stable_sorted_and_strict() {
             .iter()
             .all(|definition| definition.input_schema["additionalProperties"] == false)
     );
+    let bash = &first[0];
+    assert_eq!(
+        bash.input_schema["properties"]["network"]["type"],
+        "boolean"
+    );
+    assert_eq!(bash.input_schema["required"], json!(["command"]));
+    assert!(bash.description.contains("`network`"));
 }
 
 #[tokio::test]
@@ -233,30 +257,146 @@ async fn write_does_not_follow_dangling_symlink_outside_workspace() {
 }
 
 #[tokio::test]
+async fn file_tools_refuse_hardlinks_while_ordinary_files_work() {
+    let outside = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("payload.txt");
+    fs::write(&outside_file, "marker outside").unwrap();
+    fs::hard_link(&outside_file, root.path().join("linked.txt")).unwrap();
+    fs::write(root.path().join("ordinary.txt"), "marker inside").unwrap();
+    let tools = ToolExecutor::new(root.path()).unwrap();
+
+    assert!(
+        tools
+            .execute("read", json!({"path":"linked.txt"}))
+            .await
+            .is_error
+    );
+    assert_eq!(
+        tools
+            .execute("read", json!({"path":"ordinary.txt"}))
+            .await
+            .content,
+        "marker inside"
+    );
+    assert!(
+        tools
+            .execute("write", json!({"path":"linked.txt","content":"changed"}))
+            .await
+            .is_error
+    );
+    assert!(
+        !tools
+            .execute(
+                "write",
+                json!({"path":"ordinary.txt","content":"marker new"})
+            )
+            .await
+            .is_error
+    );
+    assert!(
+        tools
+            .execute(
+                "edit",
+                json!({"path":"linked.txt","old_string":"marker","new_string":"changed"})
+            )
+            .await
+            .is_error
+    );
+    assert!(
+        !tools
+            .execute(
+                "edit",
+                json!({"path":"ordinary.txt","old_string":"new","new_string":"inside"})
+            )
+            .await
+            .is_error
+    );
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "marker outside");
+
+    let glob = tools.execute("glob", json!({"pattern":"*.txt"})).await;
+    assert!(glob.content.contains("ordinary.txt"));
+    assert!(!glob.content.contains("linked.txt"));
+    let grep = tools.execute("grep", json!({"pattern":"marker"})).await;
+    assert!(grep.content.contains("ordinary.txt"));
+    assert!(!grep.content.contains("linked.txt"));
+}
+
+#[tokio::test]
+async fn read_and_grep_keep_head_tail_and_state_original_size() {
+    let (root, tools) = executor();
+    let long_line = format!("HEAD{}TAIL", "x".repeat(200_000));
+    fs::write(root.path().join("large.txt"), &long_line).unwrap();
+    for (name, input, cap, original_size) in [
+        ("read", json!({"path":"large.txt"}), 128 * 1024, 200_008),
+        (
+            "grep",
+            json!({"pattern":"HEAD","path":"large.txt"}),
+            32 * 1024,
+            200_020,
+        ),
+    ] {
+        let result = tools.execute(name, input).await;
+        assert!(!result.is_error, "{name}: {}", result.content);
+        assert!(result.content.len() <= cap, "{name} exceeded {cap} bytes");
+        assert!(result.content.contains("HEAD"), "{name} lost the head");
+        assert!(result.content.contains("TAIL"), "{name} lost the tail");
+        assert!(
+            result.content.contains(&format!("{original_size} bytes")),
+            "{name} hid original size"
+        );
+    }
+}
+
+#[tokio::test]
 async fn bash_executor_runs_commands_without_classifying() {
-    let (temp, executor) = executor();
-    let result = executor
-        .execute("bash", json!({"command": "touch marker"}))
-        .await;
-    assert!(!result.is_error);
-    assert!(temp.path().join("marker").exists());
+    for (mode, temp, executor) in bash_executors() {
+        let result = executor
+            .execute("bash", json!({"command": "touch marker"}))
+            .await;
+        assert!(!result.is_error, "{mode}: {}", result.content);
+        assert!(temp.path().join("marker").exists(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn bash_result_fits_its_cap_and_states_each_stream_size() {
+    for (mode, _temp, executor) in bash_executors() {
+        let result = executor
+            .execute(
+                "bash",
+                json!({"command": "yes o | head -c 100000; yes e | head -c 200000 >&2; exit 3"}),
+            )
+            .await;
+        assert!(result.is_error, "{mode}");
+        assert!(result.content.len() <= 32 * 1024, "{mode}");
+        assert!(
+            result.content.contains("(original 100000 bytes)")
+                && result.content.contains("(original 200000 bytes)"),
+            "{mode}: {}",
+            &result.content[..result.content.len().min(300)]
+        );
+        assert_eq!(result.content.matches("capped output").count(), 2, "{mode}");
+    }
 }
 
 #[tokio::test]
 async fn scrubber_runs_on_success_and_error_results() {
-    let (_temp, executor) = executor();
-    let result = executor
-        .execute(
-            "bash",
-            json!({
-                "command": "printf 'sk-ant-api03_abcdefghijklmnopqrstuvwxyz'"
-            }),
-        )
-        .await;
-    assert!(!result.is_error);
-    assert!(!result.content.contains("sk-ant-"));
-    assert!(result.content.contains("[REDACTED]"));
+    for (mode, _temp, executor) in bash_executors() {
+        let result = executor
+            .execute(
+                "bash",
+                json!({
+                    "command": "printf 'sk-ant-api03_abcdefghijklmnopqrstuvwxyz'"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{mode}: {}", result.content);
+        assert!(!result.content.contains("sk-ant-"), "{mode}");
+        assert!(result.content.contains("[REDACTED]"), "{mode}");
+    }
 
+    let (_temp, executor) = executor();
     let error = executor
         .execute(
             "unknown",
@@ -513,4 +653,101 @@ async fn memory_search_accepts_note_and_a_bad_kind_names_every_valid_one() {
         1,
         "the bad request never reached the index"
     );
+}
+
+#[tokio::test]
+async fn new_git_metadata_refuses_bash_and_harness_git_until_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("/usr/bin/git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Git fixture: {args:?}");
+    };
+    git(&["init", "-q"]);
+    let executor = ToolExecutor::new(&root)
+        .unwrap()
+        .with_git_identity(elefante_guard::git::Identity {
+            name: "Test".into(),
+            email: "test@example.invalid".into(),
+        })
+        .unwrap();
+    let run = |command: &'static str| executor.execute("bash", json!({ "command": command }));
+    for command in ["printf before > first", "git add first"] {
+        let control = run(command).await;
+        assert!(!control.is_error, "control {command}: {}", control.content);
+    }
+
+    git(&["init", "-q", "sub"]);
+    let entry = root.join("sub/.git").display().to_string();
+    for command in ["printf after > second", "git add first"] {
+        let refused = run(command).await;
+        assert!(
+            refused.is_error
+                && refused.content.contains("new Git metadata")
+                && refused.content.contains(&entry),
+            "{command}: {}",
+            refused.content
+        );
+    }
+    assert!(!root.join("second").exists());
+
+    fs::remove_dir_all(root.join("sub/.git")).unwrap();
+    for command in ["printf after > second", "git add second"] {
+        let control = run(command).await;
+        assert!(
+            !control.is_error,
+            "after removal {command}: {}",
+            control.content
+        );
+    }
+    let staged = std::process::Command::new("/usr/bin/git")
+        .current_dir(&root)
+        .args(["ls-files"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "first\nsecond\n");
+}
+
+#[tokio::test]
+async fn git_hint_needs_a_refused_git_path_in_the_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let status = std::process::Command::new("/usr/bin/git")
+        .current_dir(&root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "Git fixture");
+    let executor = ToolExecutor::new(&root).unwrap();
+    let hint = "run git write commands on their own";
+
+    let metadata = executor
+        .execute("bash", json!({"command": "printf x > .git/blocked"}))
+        .await;
+    assert!(
+        metadata.is_error && metadata.content.contains(hint),
+        "{}",
+        metadata.content
+    );
+
+    // The command names `.gitignore` and hits a refused write, but the refused path is not `.git`.
+    let outside = executor
+        .execute(
+            "bash",
+            json!({"command": "printf x > .gitignore && printf x > /usr/.gitignore"}),
+        )
+        .await;
+    assert!(root.join(".gitignore").exists(), "{}", outside.content);
+    assert!(
+        outside.is_error
+            && (outside.content.contains("Read-only file system")
+                || outside.content.contains("Operation not permitted")),
+        "{}",
+        outside.content
+    );
+    assert!(!outside.content.contains(hint), "{}", outside.content);
 }

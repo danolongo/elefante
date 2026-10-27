@@ -9,8 +9,10 @@ import type { AppProps } from "../src/ui/App";
 import { emptyUsage, initialSession, reduceSession } from "../src/session";
 import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
-import { Input } from "../src/ui/Input";
+import { Input, MAX_PROMPT_ROWS } from "../src/ui/Input";
 import { Modal } from "../src/ui/Modal";
+import { ApprovalPrompt } from "../src/ui/ApprovalPrompt";
+import { ConsentPrompt } from "../src/ui/ConsentPrompt";
 import { MemoryPanel, type MemoryPanelProps } from "../src/ui/MemoryPanel";
 import type { Command } from "../src/commands";
 import type { MemoryRow } from "../src/protocol";
@@ -27,6 +29,8 @@ const answered = (text: string, reasoning = "") => [
   note(1, "turn.started"), ...(reasoning ? [note(2, "reasoning.delta", { text: reasoning })] : []),
   note(3, "text.delta", { text }), note(4, "turn.finished", { stop_reason: "end_turn", usage: emptyUsage() }),
 ].reduce((s, n) => reduceSession(s, n), initialSession("s"));
+/// Drops borders and whitespace, so a check on wrapped prose does not depend on where lines break.
+const squash = (text: string) => text.replace(/[│┌┐└┘─\s]/g, "");
 const pressEscape = async (setup: { mockInput: { pressEscape(): void } }) => {
   await act(async () => setup.mockInput.pressEscape());
   await new Promise(resolve => setTimeout(resolve, 60));
@@ -168,6 +172,23 @@ test("memory spend joins the single total and only exceptional memory state adds
   expect(await render(memoryStatus({ enabled: false, learning: "paused", problem: "the memory key is unavailable" }))).toContain("memory: unavailable");
   expect(await render(memoryStatus({ consent: "declined", learning: "paused" }))).not.toContain("memory:");
 });
+test("the prompt bar wraps long text downward, stops growing at 16 rows, and Enter sends the whole text", async () => {
+  const sent: string[] = [];
+  const setup = await testRender(<box flexDirection="column" height="100%"><box flexGrow={1} /><Input disabled={false} onSubmit={text => sent.push(text)} onCommand={() => {}} /></box>, { width: 60, height: 30 });
+  // Rows between the prompt bar's top and bottom borders.
+  const rows = async () => { await setup.renderOnce(); const frame = setup.captureCharFrame().split("\n"); return frame.findIndex(r => r.includes("└")) - frame.findIndex(r => r.includes("┌")) - 1; };
+  try {
+    expect(await rows()).toBe(1);
+    await act(async () => { await setup.mockInput.typeText("first " + "word ".repeat(20)); });
+    expect(await rows()).toBeGreaterThan(1);
+    expect(setup.captureCharFrame()).toContain("first");   // a bar that scrolled sideways would hide it
+    await act(async () => { await setup.mockInput.typeText("more ".repeat(200)); });
+    expect(await rows()).toBe(MAX_PROMPT_ROWS);
+    await act(async () => setup.mockInput.pressEnter());
+    expect(sent).toEqual(["first " + "word ".repeat(20) + "more ".repeat(200)]);
+    expect(await rows()).toBe(1);
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
 test("the status line, prompt border and placeholder are tints of one blue: light, rgb(78, 126, 163), darker", async () => {
   const setup = await testRender(<box flexDirection="column"><Status state={initialSession("s")} now={0} /><Input disabled={false} onSubmit={() => {}} onCommand={() => {}} /></box>, { width: 60, height: 6 });
   try {
@@ -179,11 +200,79 @@ test("the status line, prompt border and placeholder are tints of one blue: ligh
     expect(fg("Ctrl+R show reasoning")).toEqual([0x5f, 0x80, 0x9b]);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
-test("approval modal emits a decision and key modal masks typed and pasted secrets", async () => {
+const approvalSetup = async (decisions: string[]) =>
+  testRender(<ApprovalPrompt kind="approval" approval={{ approval_id: "a", command: "ls", rule: "ask" }} onDecision={d => decisions.push(d)} />, { width: 80, height: 12 });
+test("the approval prompt sends allow on y and deny on n or Esc, and only the first decision counts", async () => {
+  const decide = async (keys: (setup: Awaited<ReturnType<typeof testRender>>) => Promise<void>) => {
+    const decisions: string[] = [];
+    const setup = await approvalSetup(decisions);
+    try { await keys(setup); return decisions; }
+    finally { await act(async () => setup.renderer.destroy()); }
+  };
+  expect(await decide(async s => act(async () => s.mockInput.pressKey("y")))).toEqual(["allow"]);
+  expect(await decide(async s => act(async () => s.mockInput.pressKey("n")))).toEqual(["deny"]);
+  expect(await decide(pressEscape)).toEqual(["deny"]);
+  // The daemon rejects a second answer, so a second key must not send one.
+  expect(await decide(async s => { await act(async () => s.mockInput.pressKey("y")); await act(async () => s.mockInput.pressEnter()); await act(async () => s.mockInput.pressKey("n")); })).toEqual(["allow"]);
+});
+test("the approval prompt highlights No first and Enter sends the highlighted choice", async () => {
   const decisions: string[] = [];
-  const approval = await testRender(<Modal kind="approval" approval={{ approval_id: "a", command: "ls", rule: "ask" }} busy={false} onDecision={d => decisions.push(d)} />, { width: 80, height: 15 });
-  try { await act(async () => approval.mockInput.pressKey("y")); expect(decisions).toEqual(["allow"]); }
-  finally { await act(async () => approval.renderer.destroy()); }
+  const setup = await approvalSetup(decisions);
+  const highlighted = async () => { await setup.renderOnce(); return setup.captureCharFrame().split("\n").find(row => row.includes("▸"))?.trim(); };
+  try {
+    expect(await highlighted()).toContain("▸ No");
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(await highlighted()).toContain("▸ Yes");
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(await highlighted()).toContain("▸ Yes");
+    await act(async () => setup.mockInput.pressArrow("down"));
+    await act(async () => setup.mockInput.pressArrow("down"));
+    expect(await highlighted()).toContain("▸ No");
+    await act(async () => setup.mockInput.pressArrow("up"));
+    await act(async () => setup.mockInput.pressEnter());
+    expect(decisions).toEqual(["allow"]);
+  } finally { await act(async () => setup.renderer.destroy()); }
+  const stray: string[] = [];
+  const fresh = await approvalSetup(stray);
+  try { await act(async () => fresh.mockInput.pressEnter()); expect(stray).toEqual(["deny"]); }
+  finally { await act(async () => fresh.renderer.destroy()); }
+});
+test("a blank row separates the question, the command and the choices", async () => {
+  const setup = await approvalSetup([]);
+  try {
+    await setup.renderOnce();
+    const rows = setup.captureCharFrame().split("\n").map(row => row.replace(/[│┌┐└┘─]/g, "").trim());
+    const at = (text: string) => rows.findIndex(row => row.startsWith(text));
+    expect(at("ls")).toBe(at("Allow this command?") + 2);
+    expect(at("Yes")).toBe(at("ls") + 2);
+    expect(rows[at("ls") - 1]).toBe(""); expect(rows[at("Yes") - 1]).toBe("");
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("a pending approval replaces the prompt bar, and the prompt bar returns with its draft afterwards", async () => {
+  const approval = { kind: "approval" as const, approval: { approval_id: "a", command: "ls", rule: "ask" }, onDecision: () => {} };
+  let setModal: (modal: typeof approval | null) => void = () => {};
+  const Harness = () => {
+    const [modal, set] = useState<typeof approval | null>(null); setModal = set;
+    return <App state={initialSession("s")} now={0} connected message={null} modal={modal} animateMascot={false} onSubmit={() => {}} onCommand={() => {}} onInterrupt={() => {}} onExit={() => {}} />;
+  };
+  const setup = await testRender(<Harness />, { width: 100, height: 24 });
+  const frame = async () => { await setup.renderOnce(); return setup.captureCharFrame(); };
+  try {
+    await act(async () => { await setup.mockInput.typeText("draft"); });
+    expect(await frame()).toContain("draft");
+    await act(async () => setModal(approval));
+    const asking = await frame();
+    expect(asking).toContain("Allow this command? · ask");
+    expect(asking).not.toContain("draft");
+    expect(asking).not.toContain("Ctrl+R show reasoning");
+    expect(setup.renderer.root.findDescendantById("approval-prompt")).toBeDefined();
+    await act(async () => setModal(null));
+    const after = await frame();
+    expect(after).not.toContain("Allow this command?");
+    expect(after).toContain("draft");
+  } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("key modal masks typed and pasted secrets", async () => {
   const keys: string[] = [];
   const key = await testRender(<Modal kind="key" busy={false} onKey={k => keys.push(k)} />, { width: 80, height: 15 });
   try {
@@ -192,16 +281,13 @@ test("approval modal emits a decision and key modal masks typed and pasted secre
     await act(async () => key.mockInput.pressEnter()); expect(keys).toEqual(["sk-secret"]);
   } finally { await act(async () => key.renderer.destroy()); }
 });
-test("consent modal discloses the extractor and has only explicit Y, N, and Esc decisions", async () => {
+test("consent prompt discloses the extractor and has only explicit Y, N, and Esc decisions", async () => {
   const decisions: string[] = [];
-  const setup = await testRender(<Modal kind="consent" extractor="provider/private-extractor" sameModel={false} busy={false} onDecision={decision => decisions.push(decision)} />, { width: 100, height: 16 });
+  const setup = await testRender(<ConsentPrompt kind="consent" extractor="provider/private-extractor" sameModel={false} busy={false} onDecision={decision => decisions.push(decision)} />, { width: 100, height: 16 });
   try {
     await setup.renderOnce();
-    const frame = setup.captureCharFrame();
-    expect(frame).toContain("Remember things between sessions?");
-    expect(frame).toContain("provider/private-extractor");
-    expect(frame).toContain("not tool results");
-    expect(frame).toContain("saves short notes on this machine");
+    const frame = squash(setup.captureCharFrame());
+    for (const text of ["Remember things between sessions?", "provider/private-extractor", "not tool results", "saves short notes on this machine"]) expect(frame).toContain(squash(text));
     await act(async () => setup.mockInput.pressEnter());
     expect(decisions).toEqual([]);
     await act(async () => setup.mockInput.pressKey("y"));
@@ -210,15 +296,18 @@ test("consent modal discloses the extractor and has only explicit Y, N, and Esc 
     expect(decisions).toEqual(["learn", "off", "later"]);
   } finally { await act(async () => setup.renderer.destroy()); }
 
-  const same = await testRender(<Modal kind="consent" extractor="provider/chat-model" sameModel busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
-  try { await same.renderOnce(); expect(same.captureCharFrame()).toContain("the same model you're chatting with"); }
+  const same = await testRender(<ConsentPrompt kind="consent" extractor="provider/chat-model" sameModel busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
+  try { await same.renderOnce(); expect(squash(same.captureCharFrame())).toContain(squash("the same model you're chatting with")); }
   finally { await act(async () => same.renderer.destroy()); }
 });
-test("consent modal owns typing and Esc so neither reaches the prompt or interrupt handler", async () => {
+test("consent prompt replaces the prompt bar and owns typing and Esc so neither reaches the prompt or interrupt handler", async () => {
   const prompts: string[] = []; const decisions: string[] = []; let interrupts = 0;
   const modal = { kind: "consent" as const, extractor: "provider/model", sameModel: false, busy: false, onDecision: (decision: "learn" | "off" | "later") => decisions.push(decision) };
   const setup = await testRender(<App state={initialSession("s")} now={0} connected message={null} modal={modal} onSubmit={text => prompts.push(text)} onCommand={() => {}} onInterrupt={() => interrupts++} onExit={() => {}} />, { width: 100, height: 20 });
   try {
+    await setup.renderOnce();
+    expect(setup.renderer.root.findDescendantById("consent-prompt")).toBeDefined();
+    expect(setup.captureCharFrame()).not.toContain("Ctrl+R show reasoning");
     await act(async () => { await setup.mockInput.typeText("hello"); await setup.mockInput.pressEnter(); });
     expect(prompts).toEqual([]); expect(decisions).toEqual([]);
     await pressEscape(setup);
@@ -236,9 +325,9 @@ test("input submits, Esc interrupts without exiting, and Ctrl+C exits without in
     await act(async () => setup.mockInput.pressCtrlC()); expect(interrupts).toBe(1); expect(exits).toBe(1);
   } finally { await act(async () => setup.renderer.destroy()); }
 });
-test("Esc inside an approval modal denies the command and does not also interrupt the turn", async () => {
+test("Esc inside an approval prompt denies the command and does not also interrupt the turn", async () => {
   let interrupts = 0; const decisions: string[] = [];
-  const modal = { kind: "approval" as const, approval: { approval_id: "a", command: "ls", rule: "ask" }, busy: false, onDecision: (d: "allow" | "deny") => decisions.push(d) };
+  const modal = { kind: "approval" as const, approval: { approval_id: "a", command: "ls", rule: "ask" }, onDecision: (d: "allow" | "deny") => decisions.push(d) };
   const setup = await testRender(<App state={initialSession("s")} now={0} connected message={null} modal={modal} onSubmit={() => {}} onCommand={() => {}} onInterrupt={() => interrupts++} onExit={() => {}} />, { width: 100, height: 20 });
   try {
     await pressEscape(setup);
@@ -455,11 +544,11 @@ test("the extractor and cwd are drawn without control characters in the panel an
     expect(frame).toContain("sent to provider/[31mextractor");
     expect(frame).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/);
   } finally { await act(async () => panel.renderer.destroy()); }
-  const consent = await testRender(<Modal kind="consent" extractor={hostile("provider/<ex>tractor")} sameModel={false} busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
+  const consent = await testRender(<ConsentPrompt kind="consent" extractor={hostile("provider/<ex>tractor")} sameModel={false} busy={false} onDecision={() => {}} />, { width: 100, height: 16 });
   try {
     await consent.renderOnce();
     const frame = consent.captureCharFrame();
-    expect(frame).toContain("provider/[31mextractor");
+    expect(squash(frame)).toContain("provider/[31mextractor");
     expect(frame).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/);
   } finally { await act(async () => consent.renderer.destroy()); }
 });
@@ -473,4 +562,49 @@ test("Esc in the open memory panel closes it and does not interrupt another clie
     await escape(setup);
     expect(interrupts).toBe(0); expect(closed).toBe(1);
   } finally { await act(async () => setup.renderer.destroy()); }
+});
+test("the status line names an off or unavailable sandbox in the warning colour and says nothing when it is on", async () => {
+  const render = async (sandbox: ReturnType<typeof initialSession>["sandbox"]) => {
+    const setup = await testRender(<Status state={{ ...initialSession("s"), sandbox }} now={0} />, { width: 120, height: 5 });
+    try {
+      await setup.renderOnce();
+      const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+      const warning = spans.find(span => span.text.includes("sandbox:"));
+      return { frame: setup.captureCharFrame(), fg: warning?.fg.toInts().slice(0, 3) };
+    } finally { await act(async () => setup.renderer.destroy()); }
+  };
+  for (const state of ["off", "unavailable"] as const) {
+    const { frame, fg } = await render({ state, detail: "why" });
+    expect(frame).toContain(`sandbox: ${state}`);
+    expect(fg).toEqual([0xe5, 0xc0, 0x7b]);
+  }
+  for (const sandbox of [{ state: "on" as const, detail: "seatbelt" }, null]) {
+    const { frame, fg } = await render(sandbox);
+    expect(frame).not.toContain("sandbox");
+    expect(fg).toBeUndefined();
+  }
+});
+test("the approval prompt escapes the command and shows a network badge only for a network request", async () => {
+  const render = async (network: boolean | undefined) => {
+    const approval = { approval_id: "a", command: "curl\x1b[2J example.com\n‮rm -rf ~", rule: "network-requested", ...(network === undefined ? {} : { network }) };
+    const setup = await testRender(<ApprovalPrompt kind="approval" approval={approval} onDecision={() => {}} />, { width: 80, height: 15 });
+    try {
+      await setup.renderOnce();
+      const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+      const badge = spans.find(span => span.text.includes("[network]"));
+      return { frame: setup.captureCharFrame(), fg: badge?.fg.toInts().slice(0, 3) };
+    } finally { await act(async () => setup.renderer.destroy()); }
+  };
+  const networked = await render(true);
+  expect(networked.frame).toContain("[network]");
+  expect(networked.fg).toEqual([0xe5, 0xc0, 0x7b]);
+  // displaySafe drops control and format characters and folds the newline into one line.
+  expect(networked.frame).toContain("curl[2J example.com rm -rf ~");
+  expect(networked.frame).not.toContain("\x1b");
+  expect(networked.frame).not.toContain("‮");
+  for (const network of [false, undefined]) {
+    const plain = await render(network);
+    expect(plain.frame).not.toContain("[network]");
+    expect(plain.frame).toContain("curl[2J example.com rm -rf ~");
+  }
 });

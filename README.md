@@ -2,23 +2,19 @@
 
 Elefante is a small, modifiable coding-agent harness. Its current implementation is a
 Rust command-line agent loop with a provider-neutral core, OpenRouter streaming transport,
-seven guarded tools, and policy enforced in code rather than in a long system prompt.
+eight guarded tools, and policy enforced in code rather than in a long system prompt. Every shell
+command runs in an operating-system sandbox.
 
-The daemon, the OpenTUI client, a per-repository index and learned memory have shipped. The index
-gives each turn relevant files and symbols and gives the model a `memory_search` tool. The project
-goes deep on four pillars — security, sandboxing, memory (including isolated subagents) and
-adversarial review — and what comes next is an OS sandbox, critics, and subagents that each work in
-their own git worktree, each behind a milestone gate. See [`docs/PLAN.md`](docs/PLAN.md).
+The project goes deep on four pillars: security, sandboxing, memory (including isolated
+subagents) and adversarial review.
 
 ## Project status
 
-M0, M1 and M2 are complete, with their gates green — 350 hermetic Rust tests and 24 TypeScript
-tests, plus three credentialed checks run against a live provider: a real prompt-cache hit through
-OpenRouter, a live edit in a scratch repository, and a real model using the repository index it is
-sent. See [`docs/MILESTONES.md`](docs/MILESTONES.md). CI runs the hermetic gates on every push and the
-credentialed tests on dispatch. M3 — learned memory — is complete with its gate green (486 Rust tests, 67 TypeScript tests) and its
-credentialed check, `live_learned_memory_is_extracted_stored_and_used`, passing against a live provider
-on its second run.
+The agent loop, the daemon, the TUI, the repository index and learned memory have shipped. The OS
+sandbox is in progress on the `sandboxing` branch. [`docs/PLAN.md`](docs/PLAN.md) lists the
+remaining milestones and their gates. Pull requests and `git log` record what each milestone
+shipped. CI runs the hermetic gates on every pull request and on pushes to `main`, and the
+credentialed tests on manual dispatch.
 
 ## Quick start
 
@@ -27,6 +23,20 @@ Requirements:
 - Rust 1.90 or newer
 - Bun, for the interactive TUI only — the headless CLI does not need it. See `tui/README.md`
 - An OpenRouter API key supplied through the process environment
+- macOS: nothing more. The shell sandbox uses the system's `/usr/bin/sandbox-exec`.
+- Linux: `bwrap` (bubblewrap) in `/usr/bin`, `/bin`, `/usr/local/bin` or `/opt/homebrew/bin`,
+  and unprivileged user namespaces. On Ubuntu 24.04, AppArmor restricts those namespaces until
+  you lift the restriction:
+
+  ```sh
+  sudo apt-get install -y bubblewrap
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  ```
+
+Without a working sandbox, every shell command fails with the reason and these steps.
+`ELEFANTE_SANDBOX=0` opts out: shell commands then run unsandboxed, and each one needs your
+approval. The daemon reads the switch when it starts, so stop a running daemon before you change
+it.
 
 Run the agent from the repository it should be allowed to modify:
 
@@ -40,6 +50,9 @@ When no prompt argument is supplied, Elefante reads the prompt from standard inp
 ```sh
 printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante
 ```
+
+A run with a prompt cannot ask you anything, so it denies every approval. In a terminal,
+`cargo run -p elefante` with no prompt opens the TUI, which asks before each escalated command.
 
 Useful options:
 
@@ -89,13 +102,26 @@ in `~/.elefante/credentials.toml` at mode `0600`, outside every working tree. An
 
 ## Safety model
 
-Filesystem tools are restricted to the current working directory, known secret paths are
-denied, shell commands are parsed before execution, and every tool result is scrubbed for
-common credential shapes. A command the classifier escalates suspends and waits for an
-explicit approval; one it denies never runs at all.
+Every shell command runs in an operating-system sandbox: Seatbelt on macOS, bubblewrap and
+seccomp on Linux. Inside it, a command:
 
-This is a safety gate, not an operating-system sandbox. Run Elefante in a repository and
-account whose filesystem and process permissions match the intended blast radius.
+- can write only to the working directory and a private temp directory;
+- can read system directories and your Cargo, Bun and rustup toolchains, but not the rest of your
+  home directory, secret files such as `.env` or `*.pem`, or Elefante's own state;
+- cannot write to `.git`;
+- has no network, unless you approve network for that one command;
+- never sees the API key, and cannot reach the daemon's socket.
+
+The sandbox fails closed: when Elefante cannot apply it, the shell runs nothing. Git writes such
+as `git commit` run through the harness, after your approval, with hooks off. The `web_search`
+tool lets the model research without giving the shell any network.
+
+The file tools also stay inside the working directory and refuse known secret paths. The shell
+classifier still parses each command first: a command it escalates waits for your approval, and
+one it denies never runs. Every tool result passes a scrubber for common credential shapes.
+
+Code you run yourself later, such as your own build or editor tasks, is outside this guarantee.
+`docs/DEVELOPER_GUIDE.md` § 9 lists the remaining risks.
 
 ## Development
 
@@ -111,8 +137,7 @@ environments may need to permit local socket binding.
 
 Start with the [developer guide](docs/DEVELOPER_GUIDE.md) for crate responsibilities,
 runtime data flow, the wire contract, data models, safety invariants, extension workflows, and
-testing. The [design of record](docs/PLAN.md) describes future milestones; the
-[milestone record](docs/MILESTONES.md) reports what has actually passed its gate.
+testing. The [design of record](docs/PLAN.md) describes the milestones still ahead.
 
 If you are about to edit one crate rather than understand the system, read that crate's own
 `README.md` — each carries its module map, entry points, invariants, and how to test it

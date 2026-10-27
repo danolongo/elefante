@@ -1,12 +1,14 @@
 # Elefante developer guide
 
 This guide explains the code that exists today, the contracts between crates, and the
-invariants a contributor must preserve. Read [`PLAN.md`](./PLAN.md) for the longer-term
-architecture and [`MILESTONES.md`](./MILESTONES.md) for delivery status.
+invariants a contributor must preserve. Read [`PLAN.md`](./PLAN.md) for the milestones still
+ahead.
 
 ## 1. Current scope
 
-The repository is at M3, plus M3.1 and the memory-facing parts of the pre-rescope M5, M6 and M7 (see `MILESTONES.md`); what comes next is in `PLAN.md` § Milestones: a provider-backed coding loop behind a daemon, driven by either a
+Every milestone through M3.1 has shipped, along with the five-crate consolidation. M4, the OS
+sandbox, is in progress; `PLAN.md` § Milestones lists what comes after it. The repository holds a
+provider-backed coding loop behind a daemon, driven by either a
 headless client or an OpenTUI terminal client, with a per-repository index that gives each turn
 relevant context and gives the model a search tool, and durable notes learned from conversations.
 The implemented vertical slice can:
@@ -17,6 +19,9 @@ The implemented vertical slice can:
 - execute model-requested tools concurrently, and cancel them mid-flight;
 - enforce path, shell, and output-scrubbing policy, suspending for approval when the shell
   classifier escalates;
+- run every shell command in an OS sandbox that fails closed (Seatbelt on macOS, bubblewrap and
+  seccomp on Linux);
+- route git writes and web research through the harness;
 - serve many clients per session and many sessions per client, with resume after disconnect;
 - index the repository in the background — files, symbols, imports, and files that change
   together — and keep that index current as turns edit it;
@@ -36,9 +41,9 @@ OpenRouter cache hit, the live repository edit, and `live_memory_context_reaches
 proves a real provider accepts the injected message shape and that a real model uses the index it is
 sent. M3's, `live_learned_memory_is_extracted_stored_and_used`, which proves a real provider accepts
 the extraction request, that a real model's reply passes the store's verification, and that the note
-reaches a later prompt, passes against a live provider (it failed once first; see `MILESTONES.md`). CI runs
-the hermetic gates on every push and the credentialed tests behind `workflow_dispatch`; see
-`.github/workflows/`.
+reaches a later prompt, passes against a live provider. CI runs
+the hermetic gates on every pull request and on pushes to `main`, and the credentialed tests
+behind `workflow_dispatch`; see `.github/workflows/`.
 
 ## 2. Design principles
 
@@ -68,7 +73,7 @@ elefante/
 ├── README.md                      contributor and user entry point
 ├── docs/
 │   ├── PLAN.md                    design of record and milestone gates
-│   ├── MILESTONES.md              completion record
+│   ├── M4_milestone.md            the current milestone's phases and gate tests
 │   └── DEVELOPER_GUIDE.md         this guide
 └── crates/                     every crate carries its own README.md
     ├── elefante/                  the binary: wire types, daemon, headless client
@@ -104,9 +109,10 @@ this; here it is as structure — which crate lives where, and what crosses each
   ── daemon ─────────────────────▼─────────────────────────────────────────────
 
    elefante daemon  (the same bin; daemon/)
-   ├─ server.rs        listener · session registry · ring 4096 · dispatch
+   ├─ server.rs        listener · token auth · session registry · ring 4096 · dispatch
    ├─ queue.rs         per-client queue 256; coalesces same-method deltas only
-   ├─ credentials.rs   0700 directories, 0600 key file
+   ├─ search.rs        web_search backend: one provider request per search
+   ├─ credentials.rs   0700 directories, 0600 key and token files
    └─ stub.rs          scripted Provider for tests (debug builds only)
              │
              ├──► wire/ ──► elefante-provider   re-exports StopReason, Usage
@@ -116,13 +122,15 @@ this; here it is as structure — which crate lives where, and what crosses each
                        │            owns history across turns
                        │
                        ├──► elefante-guard      PathPolicy · BashClassifier · Scrubber
+                       │                        sandbox Policy · git router
                        │                        decides; never performs
                        │
                        ├──► core::tools ──► elefante-guard
-                       │         │             7 schemas; every path through the
+                       │         │             8 schemas; every path through the
                        │         │             policy, every result scrubbed at
                        │         ▼             one exit point
-                       │    filesystem · bash -lc in its own process group
+                       │    filesystem (root-relative, no symlinks)
+                       │    bash -c under Seatbelt or bubblewrap · harness git
                        │
                        └──► elefante-provider   Provider trait · SSE decoder
                                  │              normalized Event stream
@@ -229,20 +237,27 @@ Guard decides whether an operation is acceptable. It does not execute commands o
 files. The crate exposes:
 
 - `PathPolicy` and `PolicyError`;
-- `BashClassifier`, `BashDecision`, and severity-ordered `Verdict`; and
-- `Scrubber`.
+- `BashClassifier`, `BashDecision`, and severity-ordered `Verdict`;
+- `Scrubber`;
+- `sandbox`: the per-session `Policy`, its Seatbelt and bubblewrap renderers, the seccomp
+  programs and the cleared environment; and
+- `git`: the write-git router (`route`), the harness invocation (`invocation`) and the hardened
+  read invocation (`hardened`).
 
 Keeping decisions separate from syscalls makes security behavior directly unit-testable.
 
 ### `core::tools`
 
 The syscall boundary, a module of `elefante-core` (it was the `elefante-tools` crate). It owns the
-seven permanent tool schemas and a cloneable `ToolExecutor`. Every filesystem operation resolves through `PathPolicy`; bash must pass the
-classifier; every success and error result passes through `Scrubber`.
+eight permanent tool schemas and a cloneable `ToolExecutor`. Every filesystem operation resolves
+through `PathPolicy` and then opens root-relative without following symlinks (`core::file_access`).
+`ToolGate` decides each bash call before the executor sees it. The executor runs the command in
+the session's OS sandbox (`core::sandbox`), or hands a routed git write to `core::harness_git`.
+Every success and error result passes through `Scrubber`.
 
-`memory_search` is a trait (`MemorySearch`) defined here and implemented in `core::memory`, so the
-executor itself never touches a store. Without an implementation attached it returns one fixed
-refusal.
+`memory_search` and `web_search` are traits (`MemorySearch`, `WebSearch`) defined here. `core::memory`
+implements the first; the daemon implements the second. The executor itself never touches a store
+or a provider. Without an implementation attached, each tool returns one fixed refusal.
 
 Do not add an alternate read, write, process, glob, or search path that bypasses this module's
 policy calls.
@@ -276,6 +291,10 @@ and TypeScript/TSX, a heading scan for Markdown) → batched graph writes → im
 stored raw imports and the set of paths → co-change edges from `git log`, only when `HEAD` has
 moved. Edge derivation is flagged by a persistent `meta.edges_dirty`, written in the same
 transaction as the change that makes edges stale.
+
+The indexer runs in the daemon, outside the shell sandbox. `mem::hash` opens each file relative to
+a root descriptor without following symlinks, and refuses a hard-linked file outside `target/`.
+`mem::cochange` runs `/usr/bin/git` through `guard::git::hardened`.
 
 **What is stored.** Names, signatures cut off before any body or initializer with string literals
 elided, one doc sentence, line numbers. Never source. Everything passes `Scrubber`.
@@ -387,6 +406,17 @@ Unix domain socket at `$XDG_RUNTIME_DIR/elefante.sock`, falling back to
 `~/.elefante/run/elefante.sock`. `ELEFANTE_SOCKET` overrides the path, and test isolation
 depends on it.
 
+**Every connection authenticates first.** At start the daemon draws 128 random bits and writes
+them as 32 hex characters to `token` beside its socket: `~/.elefante/run/token` by default. The
+file is `0600`, and the daemon writes it with a temp file and a rename, before it binds the
+socket. Only the starter that holds the socket directory's lock writes it, so a losing starter
+never replaces a live daemon's token.
+The first request on a connection must be `auth { token }`. The daemon compares the token in
+constant time. On a mismatch it answers `UNAUTHORIZED` (`-32008`) and closes the connection.
+The CLI and the TUI read the token before `auth`, retrying for up to 2 s while a starting daemon
+writes it. When the file never appears, they send an empty token. The sandbox policy marks the
+socket and token paths as protected, so no sandboxed command can read them.
+
 **Access is enforced by a `0700` parent directory, created before the socket.**
 `UnixListener::bind` applies the process umask and there is no safe API to bind with an
 explicit mode; the umask route needs `libc::umask`, which is `unsafe`, and the workspace sets
@@ -428,7 +458,8 @@ Client → server:
 
 | Method | Params | Result |
 |---|---|---|
-| `session.create` | `{ cwd, model?, effort?, max_rounds?, max_tokens? }` | `{ session_id, seq, memory? }` |
+| `auth` | `{ token }` | `{}` — must be the connection's first request |
+| `session.create` | `{ cwd, model?, effort?, max_rounds?, max_tokens? }` | `{ session_id, seq, memory?, sandbox? }` |
 | `session.prompt` | `{ session_id, text }` | `{ turn_id }` — notifications follow |
 | `session.interrupt` | `{ session_id }` | `{}` |
 | `session.attach` | `{ session_id, since?: number }` | see **Attach and resume** |
@@ -458,7 +489,7 @@ Server → client notifications:
 | `text.delta` | `{ text }` |
 | `tool.started` | `{ tool_call_id, name, input_preview }` |
 | `tool.finished` | `{ tool_call_id, is_error, output_preview, duration_ms }` |
-| `approval.requested` | `{ approval_id, command, rule }` |
+| `approval.requested` | `{ approval_id, command, rule, network? }` |
 | `approval.resolved` | `{ approval_id, approved }` |
 | `turn.finished` | `{ stop_reason, usage }` |
 | `session.error` | `{ message }` — turn ended abnormally, always followed by `turn.finished` |
@@ -468,6 +499,23 @@ Server → client notifications:
 
 `approval.requested` carries **no `reason`**: `BashDecision` has `verdict` and `rule` only, and
 a prose reason is the M5 triage-critic verdict.
+
+`network` is `true` when the command asked for network access (rule `network-requested`). The
+daemon omits the field when it is `false`, so a client reads an absent `network` as `false`. The
+command never carries a network prefix; the TUI shows the flag as a separate badge.
+
+**`sandbox` reports the session's shell isolation.** The `session.create` result, both
+`session.attach` result kinds and the snapshot carry `sandbox: { state, detail }`:
+
+| `state` | `detail` | Meaning |
+|---|---|---|
+| `on` | `seatbelt` or `bubblewrap` | Every bash call runs in the OS sandbox. |
+| `off` | `ELEFANTE_SANDBOX=0` | The operator opted out. Every bash call needs approval. |
+| `unavailable` | the reason, with setup advice | Every bash call fails. |
+
+A daemon that predates the field omits it; a client then shows nothing. The TUI status line shows
+`off` and `unavailable` in the warning colour, and the headless CLI prints one warning line to
+stderr.
 
 `approval.resolved` is required by fanout — with several clients attached, one resolves the
 prompt and the rest must dismiss their modal.
@@ -529,10 +577,13 @@ mark discards 413 and 414 as already-seen. **Client-side dedupe is therefore a s
 the resume window, not a watermark** — a watermark cannot distinguish "already applied" from
 "arrived out of order."
 
-Both `resumed` and `snapshot` results also carry the optional `memory` object (see **Memory wire**).
+Both `resumed` and `snapshot` results also carry the optional `memory` object (see **Memory wire**)
+and the optional `sandbox` object.
 
 The snapshot is materialised state, not an event log: `session_id`, `seq`, `cwd`, `model`,
-completed `turns[]`, and `active_turn` (null when idle). Tool entries use **one shape
+completed `turns[]`, `active_turn` (null when idle) and `sandbox`. An active turn's
+`pending_approval` is `{ approval_id, command, rule, network? }`, so a client that reattaches
+still shows the network badge. Tool entries use **one shape
 everywhere** — `{ tool_call_id, name, state, is_error }` — in both, so the reducer never
 branches on where it found the value. `state` is `"running" | "ok" | "error" | "cancelled"`.
 
@@ -605,6 +656,7 @@ Standard JSON-RPC error objects, application codes in the `-32000` range:
 | `-32005` | Unknown approval id, or approval already resolved |
 | `-32006` | `UNKNOWN_NOTE`: `memory.forget` or `memory.approve` named a note that is absent, is not a learned note, or (for approve) is not pending |
 | `-32007` | `MEMORY_OFF`: a `memory.list`, `forget`, `approve`, `clear` or `status` for a `cwd` whose repository has no usable store — `ELEFANTE_MEMORY=0`, no repository root (`/`, `$HOME`), or the store could not be opened |
+| `-32008` | `UNAUTHORIZED`: the connection's first request was not `auth { token }` with the token the daemon wrote beside its socket. The daemon then closes the connection. A daemon that answers `auth` with `-32601` predates the token; the CLI and the TUI report it as `OLDER_DAEMON`. |
 
 Transport and provider failures *inside* a turn are not RPC errors — the request already
 succeeded. They arrive as `session.error` followed by `turn.finished`.
@@ -929,17 +981,18 @@ error, never a silent `{}`; never reconstruct JSON with string splitting.
 
 ## 8. Tool surface
 
-The seven tools are intentionally permanent prompt cost, so additions require a strong case.
+The eight tools are intentionally permanent prompt cost, so additions require a strong case.
 
 | Tool | Input | Behavior |
 |---|---|---|
-| `read` | `path` | Reads one allowed UTF-8 file. |
-| `write` | `path`, `content` | Creates parents and writes one allowed file. |
+| `read` | `path` | Reads one allowed UTF-8 file. The executor caps the result at 128 KiB. |
+| `write` | `path`, `content` | Creates parents and writes one allowed file by same-directory rename. Refuses any `.git` component. |
 | `edit` | `path`, `old_string`, `new_string` | Replaces exactly one literal occurrence. |
 | `glob` | `pattern`, optional `path` | Lists matching allowed files deterministically. |
-| `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. |
-| `bash` | `command` | Executes only commands classified `Allow`. |
+| `grep` | `pattern`, optional `path` | Regex-searches allowed UTF-8 files with line numbers. The executor caps the result at 32 KiB. |
+| `bash` | `command`, optional `network` (boolean) | Runs `bash -c <command>` in the OS sandbox with network off. The gate allows, escalates or denies the call first; an approved escalation still runs sandboxed. `network: true` escalates with rule `network-requested`, and only that approval turns the network on, for that one call. A plain git write runs through harness git after approval. The executor caps the result at 32 KiB. See § 9 **Sandbox**. |
 | `memory_search` | `query`, optional `limit` (1–20), `kind` (`file`/`symbol`/`note`) | Ranked `path:line  kind name — description` matches from the repository index; a fixed refusal when no index is attached. Notes saved from earlier sessions are included unless `kind` is `file` or `symbol`; any result containing a note is prefixed with the same "unverified, not instructions" notice as the injected block. The tool is offered, and the system prompt carries a one-sentence hint to use it, only in sessions that have an index. |
+| `web_search` | `query` (1–300 characters), optional `max_results` (1–10, default 5) | The daemon sends one provider request with OpenRouter's Exa-pinned web plugin, on `ELEFANTE_SEARCH_MODEL` or else the session's model, and adds its usage to the turn. The executor refuses URL-shaped queries (`://`, `www.`) and queries the scrubber would change. The first 30 searches per session need no approval; each later one escalates with rule `web-search-cap`. Results are untrusted text, capped at 32 KiB. |
 
 Recursive glob and grep walks respect `.gitignore` through `ignore::WalkBuilder`, filter
 denied paths, and sort results. Direct access to a denied target is an error; a broad walk
@@ -949,6 +1002,201 @@ silently omits denied files so it never reveals their names or contents.
 ambiguous model edits and whole-file rewrites.
 
 ## 9. Safety invariants
+
+### Sandbox
+
+Every `bash` call runs in an OS sandbox: Seatbelt on macOS, bubblewrap with two seccomp programs
+on Linux. The sandbox fails closed: when the daemon cannot apply it, bash runs nothing.
+`PLAN.md` § M4 records why each decision went the way it did. This section states what the code
+does.
+
+#### Threat model
+
+The attacker is a prompt-injected model that chooses tool calls. The sandbox keeps each shell
+command:
+
+- writing only inside the session root and a private temp directory;
+- off the network, unless the user approves that one command;
+- away from the daemon's API key, socket and token;
+- away from `.git` writes, secret files and harness state.
+
+Two things stay outside the guarantee. Code the user later runs outside elefante, such as a build,
+an IDE task or a hook manager, is one. Kernel exploits are the other; the opt-in microVM backends
+of M4.2 (macOS) and M4.3 (Linux) address them.
+
+#### States
+
+At start the daemon calls `core::sandbox::probe` once. The probe detects the mechanism and runs
+`true` under a full profile. Every session then takes that result as its `Sandbox` state:
+
+| State | When | What a `bash` call does |
+|---|---|---|
+| `Seatbelt` | macOS with `/usr/bin/sandbox-exec` | Runs sandboxed. |
+| `Bubblewrap` | Linux with `bwrap` in `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` or `/bin` | Runs sandboxed. |
+| `Disabled` | `ELEFANTE_SANDBOX=0` in the daemon's environment | Escalates with rule `sandbox-off`. An approved call runs unsandboxed, with the allowlisted environment plus the host `HOME`, the timeout and the output cap. |
+| `Unavailable` | The mechanism is missing, the probe failed, or `validate_root` refused the session root | Fails with the reason and setup advice. |
+
+`guard::sandbox::validate_root` refuses these session roots:
+
+- `/`, `$HOME`, or an ancestor of `$HOME`;
+- a path inside `~/.elefante`, or one that contains it;
+- a path with a `.git` component, in any case.
+
+A refused root makes that one session `Unavailable`. So does a resolved `bash`, `git` or `bwrap`
+inside the root. The wire reports the state as `sandbox: { state, detail }` (§ 5).
+
+#### Mechanism per OS
+
+Both mechanisms start the same way. `core::sandbox` runs the fixed `bash` binary with a short
+launcher script. The script closes every descriptor above stderr that the daemon inherited, then
+execs the sandbox program. The model's command runs as `bash -c <command>`, never a login shell. It
+gets `/dev/null` on stdin and its own process group.
+
+**macOS: Seatbelt.**
+
+- The launcher execs `/usr/bin/sandbox-exec -p <profile> -D KEY=path … <bash> -c <command>`.
+- `guard::sandbox::seatbelt_profile` renders a deny-default profile. Every path enters as a `-D`
+  parameter, so the profile text never contains a path. The renderer refuses a path with a quote,
+  a backslash or a control character.
+- Seatbelt applies the last matching rule. The profile therefore emits every allow before every
+  deny, so no later allow can cancel a `.git`, secret or hidden-path deny.
+- Name rules under the root deny `.git` writes in any case, and reads of `.env*`, `.netrc`,
+  `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem`, `*.key`,
+  `.ssh` and `.elefante`. These rules also cover files a command creates after the scan. A guard
+  test checks that the rules match every name of the `PathPolicy` secret list.
+- Network off allows no network at all, not even host loopback. Unix sockets work only under the
+  root and the session temp directory.
+- Approved network adds outbound TCP and UDP and the system mDNSResponder socket. Unix sockets
+  stay limited to the root and the temp directory.
+- The profile allows a short list of Mach services. Everything else stays denied, including other
+  processes' details, the keychain, the pasteboard, Apple Events and launchd submission.
+
+**Linux: bubblewrap and seccomp.**
+
+- `guard::sandbox::bwrap_args` renders the arguments. Bubblewrap unshares the user, PID, IPC, UTS
+  and cgroup namespaces, and the network namespace while network is off. `--disable-userns` stops
+  nested user namespaces. `--die-with-parent` and the PID namespace kill orphans, including
+  `setsid` ones.
+- Mount order: each readable path read-only, then the root and the temp directory writable, then
+  each `read_only` entry over the root, then a tmpfs over each hidden directory and `/dev/null`
+  over each hidden file. `/tmp` is a fresh tmpfs with `HOME=/tmp/home`, and a tmpfs masks
+  `/proc/1`.
+- Network off keeps a private loopback inside the namespace, which cannot reach host listeners.
+  Approved network shares the host namespace and binds `/run/systemd/resolve` for DNS.
+- `guard::sandbox::seccomp_programs` compiles two stacked programs, because `seccompiler` allows
+  one action per filter:
+  - **ENOSYS** for `clone3` and `io_uring_setup`, `io_uring_enter` and `io_uring_register`, so
+    runtimes fall back to `clone` and plain I/O;
+  - **EPERM** for `unshare`, `setns`, the mount family, `ptrace`, `process_vm_readv`,
+    `process_vm_writev`, `bpf`, `perf_event_open`, `userfaultfd`, the keyring calls, module
+    loading, `kexec_*` and `ioctl(TIOCSTI)`. It also refuses `socket()` for any family except
+    `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`. Under approved network it refuses `AF_UNIX`
+    too, so host abstract sockets stay out of reach.
+  - On x86_64 both programs reject x32 syscall numbers before anything else.
+- Delivery: the daemon writes each program into an anonymous memory file (`memfd_create`, with
+  close-on-exec set). The launcher reopens the two files from `/proc/<daemon>/fd/<n>` as
+  descriptors 3 and 4, then execs bubblewrap with `--add-seccomp-fd 3 --add-seccomp-fd 4`. A
+  failed reopen stops the `exec`, so no command runs unfiltered. No concurrent child inherits the
+  files.
+- After each command the daemon moves any new `.git` entry (any case) in the root to
+  `~/.elefante/quarantine/<session>/<n>/`, and the call reports an error.
+
+#### Policy
+
+`core::sandbox::SessionSandbox` builds one `guard::sandbox::Policy` per session. Before each command
+it rescans the root and refreshes `read_only` and `hidden`.
+
+| Field | Contents |
+|---|---|
+| `root` | The canonical session root. Readable and writable. |
+| `temp` | A private `elefante-sandbox-<pid>-<n>` directory in the system temp directory, mode `0700`. Readable and writable. The session removes it at close, and the daemon removes leftovers of dead processes at start. |
+| `readable` | Exact system paths: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/System/Library`, `/Library/Apple`, the Command Line Tools, `/private/etc`, `/private/var/db/dyld`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, and the resolver files `/etc/resolv.conf`, `/etc/nsswitch.conf` and `/etc/hosts`. Also `/dev/null`, `/dev/random` and `/dev/urandom`; the directories of the resolved `bash` and `git`; the Cargo and Bun `bin` directories; the Cargo registry; and the selected rustup toolchain with its settings file. Only paths that exist enter the list. |
+| `writable` | Empty. Only `root` and `temp` are writable. |
+| `read_only` | Every `.git` entry in the root, in any case, from an unpruned walk; the validated `gitdir` and `commondir` targets; and any in-root `core.hooksPath` or include target, including one that an enclosing repository's config names. A `gitdir` or `commondir` that points outside the root and the session's initial repository makes the command fail. |
+| `hidden` | Every entry under the root whose name `PathPolicy::is_secret_path` matches: `.elefante`, `.ssh`, `.env`, `.env.*`, `.netrc`, `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem` and `*.key`. Also every hard-linked regular file outside `.git`, `target/` and `node_modules/`. |
+| `protected` | The socket and token paths: `~/.elefante/run/{elefante.sock,token}`, `$XDG_RUNTIME_DIR/{elefante.sock,token}`, and `ELEFANTE_SOCKET` with the `token` beside it. Never readable. |
+| `network` | `Off`, or `Approved` for one call. |
+
+`Policy::validate` runs before either renderer. It refuses a readable path that would expose any
+of these:
+
+- `$HOME`, `~/.elefante`, or a protected or hidden path;
+- the host `/tmp`, `/var/run` or `$XDG_RUNTIME_DIR`;
+- `/run`, apart from the resolver directory;
+- `/dev`, apart from the three device nodes.
+
+It also refuses a path that is not absolute and normalized, because Seatbelt never matches `//`,
+`/./` or a trailing `/`.
+
+**Environment.** The launcher clears the environment, then sets only:
+
+- `PATH`: on macOS the Command Line Tools `usr/bin` first, then `/usr/bin`, `/bin` and the
+  toolchain directories;
+- `LANG=C.UTF-8` and `TERM=dumb`; on macOS, a fixed `SDKROOT`;
+- `CARGO_HOME` (a directory in `temp`, with the registry linked in) and `RUSTUP_HOME` (the host
+  rustup home when a default toolchain exists, else a directory in `temp`);
+- sandboxed only: `HOME` (`/tmp/home` on Linux, `temp/home` on macOS), `TMPDIR`,
+  `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`.
+
+`OPENROUTER_API_KEY` never enters this environment.
+
+**Limits.** `ELEFANTE_BASH_TIMEOUT_SECS` (default 120) bounds each bash call and each harness git
+write. On every exit path, expiry included, the process-group guard kills the group. On macOS it
+also kills each descendant that one `ps` snapshot links to the group. The output reader stops 2 s
+after bash exits, so a process that holds the pipe cannot stall the turn. Bash output fits one
+32 KiB budget: each stream keeps its head and tail, and a marker states its original size.
+
+**Locks.** Sessions on one root share a `RwLock`. Bash takes it shared, so parallel bash calls
+stay parallel. `write`, `edit` and harness git take it exclusively.
+
+#### The bash gate
+
+`ToolGate::check_in` decides a `bash` call in this order:
+
+1. `Disabled`: `Escalate` with rule `sandbox-off`.
+2. `Unavailable`: `Allow`, so the runner refuses with its reason.
+3. `guard::git::route`: a write in an unsupported shape is `Deny` (`git-write-refused`); a plain
+   git write is `Escalate` (`git-write`).
+4. The classifier: its `Deny` stays `Deny`.
+5. `network: true`: `Escalate` with rule `network-requested`.
+6. Otherwise the classifier's `Allow` or `Escalate`.
+
+`ToolGate::check_with_tools` wraps it. It turns a `git-write` escalation into `Deny`
+(`git-identity-missing`) when the session has no git identity, so the user never approves a write
+that cannot commit. It also reserves `web_search`'s per-session cap before parallel calls start.
+
+#### What runs outside the sandbox
+
+| Component | Why it runs outside | What confines it |
+|---|---|---|
+| The daemon | It holds the key, the socket, the token and every session. | Nothing beyond the user's own permissions. |
+| The API key | Only the daemon needs it, for provider requests. | The sandbox environment never carries it. |
+| `read`, `write`, `edit`, `glob`, `grep` | They run in the daemon. | `PathPolicy`; root-relative opens without symlinks (`core::file_access`); refusal of hard-linked files outside `target/`; writes by same-directory rename; the root lock. |
+| Harness git | A git write must change `.git`, which the sandbox keeps read-only. | The `guard::git` router and per-subcommand option allowlist; the hardened invocation (hooks, fsmonitor, pager, editors, credential helpers, signing and transports off); the `core::harness_git` preflight; approval for every write; an identity read at daemon start. |
+| The indexer (`elefante-mem`) | It runs in the daemon, beside the sessions. | Root-relative no-symlink opens and hard-link refusal in `mem::hash`; `git log` through `guard::git::hardened`. |
+| `web_search` | The daemon sends one provider request per search. | Query bounds, URL and secret refusal, 30 searches per session before approval, 32 KiB results. |
+
+The daemon reads the git identity once at start: `user.name` and `user.email` from `~/.gitconfig`,
+then `$XDG_CONFIG_HOME/git/config`, through `guard::git::hardened`.
+
+#### Residual risks
+
+- **Approved network.** One approved command reaches the whole internet and, on Linux, the host's
+  loopback services. A per-domain proxy is a proposal in `PLAN.md` § M4.
+- **Code the user later runs.** The guarantee ends with elefante's command. It does not cover the
+  user's build, their IDE's tasks, rust-analyzer's `build.rs`, hook managers' config files
+  (`.pre-commit-config.yaml`, `lefthook.yml`), or the dev-mode TUI source when the user develops
+  elefante itself.
+- **Leftover processes on macOS.** macOS has no PID namespace. The guard finds a descendant that
+  left the group (`setsid`, `set -m`) through its parent. A descendant whose parent exits before
+  the snapshot reparents to launchd and survives the call. It stays sandboxed but keeps approved
+  network. Linux uses the PID namespace instead.
+- **`web_search` queries leave without per-call approval**, up to the cap. The executor scrubs them
+  and refuses URLs, but each query remains an outbound channel.
+- **The secret scan is name-based.** Its hard-link check skips `target/` and `node_modules/`.
+- **`ELEFANTE_SANDBOX=0`** removes the OS boundary. An approved command then runs with the user's
+  full access, including the daemon's token.
+- **Kernel exploits.** The opt-in microVM backends of M4.2 and M4.3 address them.
 
 ### Path policy
 
@@ -966,8 +1214,15 @@ while `alias -> .env` must also be denied. New filesystem tools must call policy
 before the syscall and must not accept pre-resolved paths from untrusted input.
 
 Built-in protected paths include `.env`, `.env.*`, private-key extensions, `id_rsa*`, common
-credential files, `.aws/credentials`, and `.ssh/**`. Custom repository-relative globs can be
-added when constructing a policy.
+credential files, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, a final
+component named `credentials` or `credentials.toml`, and `.ssh/**`. A caller can add custom repository-relative globs when it constructs a policy.
+`resolve_for_write` also refuses any `.git` component, in any case.
+
+The daemon's file tools open the resolved path relative to a root descriptor, without following
+symlinks: `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, and `openat` with
+`O_NOFOLLOW_ANY` on macOS. They refuse a regular file with more than one hard link, outside
+`target/`. A write goes to a temp file in the same directory and then replaces the target by
+rename.
 
 ### Bash classifier
 
@@ -979,7 +1234,8 @@ severe result:
 - unknown or potentially mutating commands escalate;
 - destructive, privileged, environment-disclosing, secret-reading, or secret-writing forms
   are denied; and
-- write-capable shell redirections escalate, even when attached to `echo` or `printf`.
+- write-capable shell redirections escalate, even when attached to `echo` or `printf`. A
+  redirection to exactly `/dev/null` writes nothing and does not escalate.
 
 `Escalate` suspends the tool call and emits `approval.requested`; the decision arrives as
 `session.resolve_approval`. A `Deny` never reaches that channel at all — it is terminal, and a
@@ -988,7 +1244,11 @@ classifier result rather than bypass it.
 
 Static shell analysis cannot understand runtime aliases, generated program names, `eval`, or
 every interpreter payload. The classifier deliberately documents known-not-caught cases; do
-not describe it as a sandbox.
+not describe it as a sandbox. It judges intent. The OS sandbox enforces paths, so the classifier
+no longer scans arguments for globs or recursive readers that reach `.elefante/`.
+`BashClassifier::known_gaps()` marks those cases "enforced by the OS sandbox". The classifier
+still denies a literal secret path, destructive and privileged commands, and environment
+disclosure.
 
 ### Output scrubber
 
@@ -1032,6 +1292,9 @@ Configuration precedence and defaults:
 | Learning | — | `ELEFANTE_LEARN`: `1`/`on` consents, `0`/`off` disables | ask once (consent file) |
 | Idle flush | — | `ELEFANTE_LEARN_IDLE_SECS` | `300` |
 | Extraction log | — | `ELEFANTE_LEARN_LOG`: a file to append to | off |
+| Shell sandbox | — | `ELEFANTE_SANDBOX`: exactly `0` opts out | on (Seatbelt or bubblewrap) |
+| Command timeout | — | `ELEFANTE_BASH_TIMEOUT_SECS`: whole seconds, for bash and harness git | `120` |
+| Search model | — | `ELEFANTE_SEARCH_MODEL` | the session's model |
 
 Models are named by OpenRouter slug, not by vendor model name. The default routes to Claude
 through OpenRouter; a different vendor's model is a different slug, not a different transport.
@@ -1045,9 +1308,12 @@ permits access to this monorepo; running it from a nested directory intentionall
 accessible tree.
 
 The same binary runs the daemon: `elefante daemon` serves the socket in the foreground until its idle
-timeout, and a client that finds no daemon starts one that way. The API key, base URL, memory and
-learning switches and idle timeouts are read when the daemon starts — from the environment of
-whichever client started it — so a running daemon keeps the settings it started with. The scripted
+timeout, and a client that finds no daemon starts one that way. The daemon reads the API key, the
+base URL, the memory, learning and sandbox switches and the idle timeouts once, when it starts. It
+reads them from the environment of whichever client started it, so a running daemon keeps the
+settings it started with. The daemon
+reads `ELEFANTE_SEARCH_MODEL` at each `session.create` and `ELEFANTE_BASH_TIMEOUT_SECS` at each
+command, both from its own environment. The scripted
 test provider (`ELEFANTE_STUB_PROVIDER`) exists only in debug builds; a release daemon never reads it.
 
 Never store a real key in this repository. `.gitignore` excludes common environment and key
@@ -1069,9 +1335,17 @@ git diff --check
 Test ownership follows behavior:
 
 - `elefante-guard` tests path traversal, symlinks, secret variants, compound shell syntax,
-  redirections, known classifier limits, and scrub patterns.
+  redirections, known classifier limits, and scrub patterns. It also tests both sandbox
+  renderers, the seccomp programs and the git router. A Seatbelt snapshot and hostile path names
+  pin the renderer output.
 - `core::tools` tests (`crates/core/tests/tools.rs`) cover strict schemas, exact editing, path enforcement at syscall boundaries,
-  deterministic walks, bash non-execution, scrubbing, and cloned/concurrent executors.
+  deterministic walks, hard-link refusal, output caps, scrubbing, and cloned/concurrent executors.
+- `crates/core/tests/sandbox.rs` runs real commands in the real sandbox. Each negative test has a
+  positive control: the same operation succeeds unsandboxed or with approval. A missing sandbox
+  fails the test with setup advice; it never skips. `harness_git.rs`, `harness_route.rs`,
+  `file_access.rs`, `web_search.rs`, `tool_gate.rs` and `dns_sandbox.rs` cover the rest of the
+  boundary. The macOS host-service controls in `macos_host.rs` are `#[ignore]`d; only the
+  `macos-host-services` CI job runs them, on a disposable runner.
 - `elefante-provider` tests deterministic request JSON, per-model capabilities, arbitrary SSE
   chunking, `[DONE]` and keep-alive handling, `tool_calls` accumulation by index, malformed tool
   JSON, verbatim `reasoning_details` replay, consecutive tool-result messages, usage including
@@ -1110,7 +1384,7 @@ request and a live agent request lands a trivial, reviewed edit. Both run in CI 
 
 ### Adding or changing a tool
 
-1. Decide whether the behavior belongs in one of the seven existing tools. Tool definitions
+1. Decide whether the behavior belongs in one of the eight existing tools. Tool definitions
    consume prompt tokens on every provider round.
 2. Add or update the strict schema in `elefante_core::tools::definitions`.
 3. Add a private `Deserialize` input type with `deny_unknown_fields`.
@@ -1166,9 +1440,12 @@ effects are not statically clear.
 `PLAN.md` is the design of record. Amend it in the same change when implementation teaches
 the project that a recorded decision is wrong. Do not silently make the code and plan disagree.
 
-`MILESTONES.md` is evidence, not a roadmap. Append a completed entry only when the baseline
-and entire gate pass together, including prior milestone gates. Record what shipped, what the
-gate proved, anything deliberately deferred, and any plan amendment.
+A milestone is complete only when its baseline and its entire gate pass together, including
+every earlier gate. A milestone that needs ordered phases gets a working plan in `docs/`, such as
+`M4_milestone.md`. The milestone's closing pull request deletes that plan. Its description states
+what shipped, what the gate proved, and what the milestone deferred. Decisions that outlive the
+milestone move into `PLAN.md` or this guide before the plan goes. Git history keeps the rest; no
+file in `docs/` tracks progress.
 
 When behavior changes, update:
 
@@ -1178,7 +1455,40 @@ When behavior changes, update:
   checkable and also what makes it rot;
 - this developer guide if a public model, interaction, invariant, or workflow changed;
 - the README if setup, user-visible behavior, or project status changed; and
-- the design/milestone documents when their respective contracts require it.
+- `PLAN.md` when a recorded decision changed.
+
+### Commits and pull requests
+
+Work happens on a milestone branch. The author commits there as each fix lands and pushes the
+branch to `origin` for visibility. A pull request opens once the milestone is complete and its
+gate is green.
+
+The subject line reads `type(scope): summary`.
+
+- `type` is one of `feat`, `fix`, `refactor`, `test`, `docs`, `ci`.
+- `scope` names the crate or area: `core`, `guard`, `mem`, `provider`, `elefante`, `tui`, `ci`.
+  Leave it out when the change spans several.
+- The summary is lower case and imperative, with no final full stop. It says what the change does
+  for the reader, not which files moved.
+
+A short prose paragraph follows one blank line, wrapped at about 72 columns. A fix states what
+went wrong and what the code does now. A feature or refactor states the behavior that changed.
+Leave the body out when the subject says everything. The body has no bullet lists, file
+inventories or test counts.
+
+Commit messages never name milestones. Commit messages and pull request descriptions carry no
+attribution trailer. A pull request description uses the same voice: what changes and why, then
+what the author verified and what the author did not. A milestone's closing pull request may name
+the milestone it closes.
+
+```
+test(elefante): keep the turn's end when a withdrawal races it
+
+The interleaving test waited for turn.finished after sending its requests, but
+on a slower machine the event had already been read while waiting for an
+earlier response, so the wait timed out. It now notes the turn's end as it goes
+by and only waits when it has not seen it.
+```
 
 ## 14. Known limitations and next boundaries
 
@@ -1198,8 +1508,8 @@ When behavior changes, update:
 - There is no `session.list`, so a client cannot enumerate sessions it did not create, and
   sessions live only in daemon memory — they end with `session.close` or the daemon's idle exit.
   Durable conversation history was cut in the rescope; M6's audit log records tool activity.
-- The guard layer reduces blast radius but is not an OS sandbox and cannot eliminate
-  time-of-check/time-of-use filesystem races.
+- The OS sandbox has the residual risks listed in § 9 **Sandbox**. The daemon's own file tools
+  run outside it; root-relative no-symlink opens narrow their time-of-check/time-of-use races.
 
 These limitations are milestone boundaries. Implement them through the corresponding plan
 and gate rather than hiding partial versions behind existing APIs.
@@ -1229,6 +1539,16 @@ by Git and denied by Elefante's own path policy.
 The classifier returned `Escalate`, so the call is suspended pending an approval. Answer the
 prompt, or use a narrower existing tool (`read`, `write`, `edit`, `glob`, or `grep`). Do not
 broaden the shell allowlist just to make a task convenient.
+
+### `sandbox unavailable: …`
+
+The daemon could not apply the OS sandbox, so bash runs nothing. The message names the reason.
+On Linux, install bubblewrap and allow unprivileged user namespaces. On Ubuntu 24.04, AppArmor
+restricts them until `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts the
+restriction; CI runs that step. A session rooted at `/`, `$HOME`
+or inside `~/.elefante` is unavailable on every OS; start elefante from the repository instead.
+`ELEFANTE_SANDBOX=0` opts out, and every bash call then needs approval. Restart the daemon after a
+fix, because it probes the sandbox once, at start.
 
 ### `secret-path-policy: ...`
 

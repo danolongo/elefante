@@ -1,6 +1,6 @@
 # elefante — lightweight coding harness (Rust core + OpenTUI client)
 
-> **Living document.** This is the design of record. When a decision changes during implementation, amend this file in the same change that implements it — a plan that drifts from the code is worse than no plan. Milestone outcomes are recorded in [`MILESTONES.md`](./MILESTONES.md).
+> **Living document.** This is the design of record. When a decision changes during implementation, amend this file in the same change that implements it — a plan that drifts from the code is worse than no plan.
 
 ## Context
 
@@ -9,7 +9,7 @@ The repo began empty (one README: "a quick modifiable harness for coding"). The 
 | Pillar | Has today | Gets deeper in |
 |---|---|---|
 | **Security** | Path policy, bash classifier, output scrubber, keyed memory rows, consent | M4 (environment, key), M5 (critics), M6 (audit log) |
-| **Sandboxing** | Nothing — the guard reduces blast radius but is not an OS sandbox | M4, then reused by M6 |
+| **Sandboxing** | Nothing — the guard reduces blast radius but is not an OS sandbox | M4, M4.2 (microVM on macOS), M4.3 (microVM on Linux), then reused by M6 |
 | **Memory**, including isolated subagents | Repository index, learned notes, memory in the UI | M6 (shared with subagents), M7 |
 | **Adversarial review** | Nothing | M5, reused by M6 to review a subagent's diff before it merges |
 
@@ -32,7 +32,7 @@ Work that serves none of the pillars is out of scope. What the 2026-10-19 rescop
 
 **We do not begin milestone N+1 until milestone N's gate is green.** If a gate can't be met, the correct responses are to fix it, or to explicitly renegotiate the baseline and write that decision into this file — not to proceed with it failing.
 
-Each milestone ends with a short written record appended to `docs/MILESTONES.md`: what shipped, what the gate proved, and anything deliberately deferred. This is what keeps "incremental" from decaying into "unfinished."
+Each milestone closes with a pull request. Its description states what shipped, what the gate proved, and what the milestone deferred. Git history is the record; no file in `docs/` tracks progress.
 
 ---
 
@@ -43,7 +43,7 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 | UI | Rust daemon + Bun/OpenTUI client over JSON-RPC on a unix socket | The same split opencode runs in production, so it is a proven shape rather than one invented here. A headless core is also what lets subagents run as further sessions of the same daemon (M6). |
 | Retrieval | SQLite FTS5 + graph hop expansion | No embedding model, no API cost, deterministic and debuggable. Graph edges do the semantic work. |
 | Storage | Project graph in `<repo>/.elefante/`, self-ignoring; user-level keys and consent in `~/.elefante/` | Project memory sits next to what it describes; nothing is ever committed, so no session noise reaches a diff. |
-| Isolation | OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux) plus a git worktree per editing subagent | Fast, nothing to install, and the same sandbox already wraps every bash call (M4). A microVM backend on macOS is a proposal for later; gVisor was considered and not chosen. |
+| Isolation | OS sandbox (Seatbelt on macOS, bubblewrap + seccomp on Linux) plus a git worktree per editing subagent | Bubblewrap can mask secrets and protect `.git` inside a writable root; Landlock cannot subtract access once granted. Linux requires bubblewrap and unprivileged user namespaces. Harness write git gains its own sandbox in M4.1. An opt-in libkrun microVM backend follows: macOS (Hypervisor.framework) in M4.2, then Linux (KVM) in M4.3. It gives bash its own kernel. |
 | Cache | In-process `moka` LRU inside the daemon + SQLite WAL | Redis considered and rejected: subagents all attach to the same daemon, so they already share its cache. Redis would add a required daemon and an IPC hop to beat microsecond page-cache reads. Kept behind a trait for possible cross-machine use later. |
 | Provider | OpenRouter only | One transport, one auth, one code path. Reaching Claude via `anthropic/claude-opus-5` means this narrows the *code*, not the *models*. `Capabilities` survives and matters more, now resolved per model. |
 
@@ -55,9 +55,8 @@ Each milestone ends with a short written record appended to `docs/MILESTONES.md`
 elefante/
   Cargo.toml                 # workspace
   docs/PLAN.md               # this document
-  docs/MILESTONES.md         # per-milestone completion record
+  docs/M4_milestone.md       # the current milestone's phases and gate tests
   docs/DEVELOPER_GUIDE.md    # shipped behaviour, incl. the wire contract (§5)
-  docs/LOCKFILE.md           # why tui/ commits exactly one lockfile
   crates/
     provider/                # Provider trait + Capabilities; sse decoder, openrouter
     guard/                   # PathPolicy, BashClassifier, Scrubber; sandbox policy (M4)
@@ -79,7 +78,7 @@ provider ──► (nothing)
 
 `guard` must never depend on `core`, `mem` or `provider`. The practical consequence: `guard` is pure policy — it decides, it never performs. This is what makes the whole gate layer unit-testable without a filesystem or a network. Critics need a model, so they live in `core` (M5), not in `guard`: `mem` depends on `guard`, and a `guard → provider` edge would pull the HTTP stack into the memory crate.
 
-Five crates, after the consolidation (§ Milestones › Consolidation): eight was more seams than the pillars need. `tools` became `core::tools`; `rpc`, `srv` and `cli` became one `elefante` crate and one binary. Client and daemon now share a crate, so one rule the old graph enforced is now a rule of review: **the client never runs a turn** — it always goes through the socket.
+Five crates, after the consolidation (§ Milestones › Shipped): eight was more seams than the pillars need. `tools` became `core::tools`; `rpc`, `srv` and `cli` became one `elefante` crate and one binary. Client and daemon now share a crate, so one rule the old graph enforced is now a rule of review: **the client never runs a turn** — it always goes through the socket.
 
 Key crates: `tokio 1.53`, `reqwest 0.13`, `rusqlite 0.40` (bundled + FTS5), `tree-sitter 0.27` (+ `tree-sitter-bash`), `blake3 1.8`, `moka 0.12`, `ignore`, `serde`/`serde_json`.
 
@@ -157,10 +156,12 @@ through the environment, each falling back to the author's model when unset:
 |---|---|---|
 | author | `OPENROUTER_MODEL`, `ELEFANTE_EFFORT` | M0 |
 | extractor (learned memory) | `ELEFANTE_EXTRACT_MODEL`, `ELEFANTE_EXTRACT_EFFORT` | M3 |
+| web search | `ELEFANTE_SEARCH_MODEL` | M4 |
 | critic | `ELEFANTE_CRITIC_MODEL`, `ELEFANTE_CRITIC_EFFORT` | M5 |
 | bash triage | `ELEFANTE_TRIAGE_MODEL`, `ELEFANTE_TRIAGE_EFFORT` | M5 |
 
-No `config.toml` role table: four variables do not need a file format. The critic should be a
+The search default follows the same fallback until the end-of-M4.1 S9 probe; that probe may pick a
+cheaper default. No `config.toml` role table: a handful of variables do not need a file format. The critic should be a
 *different vendor's* model, which is what makes review adversarial rather than self-agreeing; triage
 can be anything cheap and fast. Per-model pricing needs no local table — `usage.cost` comes back on
 every response.
@@ -475,7 +476,7 @@ This decides whether the whole subsystem works. LLM memory fails by accumulating
 
 ### Secret protection — four layers, none sufficient alone
 
-1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
+1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, a final `credentials` or `credentials.toml`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
 2. **Bash gate rules** for `cat .env`, `source .env`, `env`, `printenv`.
 3. **`Scrubber` on every tool result** — `sk-ant-` prefixes, AWS key shapes, PEM blocks, `TOKEN=`/`SECRET=`/`PASSWORD=` assignments. This is the layer that actually holds, because shell bypasses are unbounded (`cat .e''nv`) and cannot be enumerated.
 4. **The same `Scrubber` gates memory writes.** Without this, a leaked secret is persisted into the graph permanently — strictly worse than transient context exposure. Two call sites, one implementation, no drift.
@@ -530,155 +531,25 @@ and M6 adds `agent`, the ninth. Every tool is permanent prompt cost, so the bar 
 
 Each has a **Baseline** (what must exist) and a **Gate** (what must pass before the next milestone starts).
 
-### M0 — Loop
+### Shipped
 
-**Baseline.** Workspace skeleton. `Provider` trait + `Capabilities` + a single OpenRouter impl (OpenAI-compatible SSE, per-model capability resolution, `reasoning` control and verbatim replay, `tool_calls` normalization, prompt caching where the upstream supports it). Transport-generic SSE decoder in its own module. Agent loop with the seven tools, plain stdout, no TUI. **`PathPolicy` and the deterministic half of the bash classifier ship here** — an ungated bash tool should never exist, even in a prototype.
+These milestones have shipped. Their gates now live in the test suite, and every later gate keeps
+them green. Pull requests and `git log` hold the detail.
 
-*The Anthropic impl was written first and then removed.* Doing this inside M0 rather than later matters because **M1 puts the neutral types on the RPC wire**; changing them after M1 would mean revising a published protocol instead of a private enum.
+| Milestone | What shipped |
+|---|---|
+| M0 — Loop | `Provider` trait, OpenRouter transport, the agent loop, seven tools, `PathPolicy`, bash classifier, scrubber |
+| M1 — Daemon + TUI | JSON-RPC daemon on a unix socket, headless client, OpenTUI client, attach and resume, approvals, first-run key setup |
+| M2 — Repo cache + mechanical graph | blake3 walk cache, tree-sitter symbols, import and co-change edges, FTS5 + graph-hop retrieval, `memory_search` |
+| M3 — Learned memory | Learned notes with verification, speaker provenance, dedupe, supersession and keyed rows; `elefante memory` |
+| M3.1 — Hardening and consent | `display_safe`, store stamp checks, `LearnMode { Off, Ask, On }` with consent bound to the extractor model |
+| Pre-rescope memory UI | `memory.status`, `memory.context`, the `/memory` panel, `/forget <id>`, headless `memory:` lines |
+| Consolidation | Eight crates became five and one `elefante` binary; the stub provider exists only in debug builds |
 
-The decision it forced, now settled: reasoning blocks are stored **verbatim as opaque JSON** (`ReasoningDetail { kind, raw }`), not parsed into typed variants. OpenRouter's replay rule requires the block sequence to return unmodified and unreordered, so an unknown future `reasoning.*` type must round-trip — a typed enum would silently violate the rule rather than erroring.
-
-**Gate.**
-- Bash classifier fixture table: commands → expected `Allow`/`Deny`/`Escalate`, including compound commands (`ls && rm -rf /` must classify as the `rm`), pipes, subshells, and command substitution. Includes obfuscation cases asserted as **known-not-caught**, so the test documents the limit rather than implying coverage.
-- `PathPolicy` canonicalization: `./x/../.env`, a symlink pointing at `.env`, `.env.local`, and a grep whose *pattern* would match secret content — all denied.
-- Secret fixture: an `.env` containing an `sk-ant-`-shaped string. Read, glob, and grep all deny; `cat .env` is gated; the scrubber redacts it from a bash result that reaches it another way.
-- Cache: `usage.prompt_tokens_details.cached_tokens > 0` on the second identical request of a session — zero means a silent invalidator. Hermetic fixture proves parsing; the live check stays credentialed and separate.
-- Requests carry name-sorted tools with stable key order — an unsorted tool list silently invalidates the cache every turn, which is exactly the bug this catches.
-- A model that does not declare reasoning support receives no `reasoning` field at all.
-- Streaming edge cases: frames split mid-boundary, mixed line endings, `: OPENROUTER PROCESSING` keep-alives ignored, `data: [DONE]` terminates, unknown future event types ignored.
-- `delta.tool_calls[]` accumulate by **array index** — `id`/`name` on the first fragment only, `arguments` concatenated then parsed. Malformed accumulated JSON is a hard error, never a silent `{}`.
-- `reasoning_details` round-trips byte-identical through a tool continuation.
-- Two parallel `tool_calls` produce two consecutive `{role:"tool"}` messages in call order.
-- An unrecognised model slug yields all-false capabilities and a request carrying no `reasoning` field.
-- No request carries a field the resolved model does not declare — no `reasoning`, no `cache_control`.
-- Every request carrying `tools` also carries `provider: {require_parameters: true}`, and a request with no tools does not. Without it an endpoint may silently drop `tools`, and the loop then finds no tool calls and stops after one round — the agent does nothing while appearing to work.
-- `openrouter/auto` (and `openrouter/auto-beta`, by prefix) resolves to reasoning and structured output but **not** caching: the catalogue declares `reasoning`/`reasoning_effort`/`structured_outputs` for that slug, and its pricing carries no `input_cache_read`, so caching is unknown rather than absent and no breakpoint is sent on a guess.
-- A missing `OPENROUTER_API_KEY` produces a named, graceful error rather than a transport failure.
-- End-to-end: run against this repo, request a trivial edit, confirm the tool loop completes and the edit lands.
-
-### M1 — Daemon + TUI
-
-**Baseline.** `elefante-rpc` protocol; daemon over unix socket with session registry; Bun/OpenTUI client rendering streamed text, reasoning, tool calls, and approval prompts. The CLI stops running the loop in process and becomes a client — one-shot prompts use a headless client, which doubles as the daemon's test harness. **First-run key setup** rides on the same channel.
-
-Shipped. The wire contract now lives in [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) §5, and the gate that proved it is recorded in [`MILESTONES.md`](./MILESTONES.md); the items below are the summary. The contract was drafted as two documents — core types first, then the wire derived from them — because an adversarial review found the reverse order had produced four blocking defects. Both were retired once the code carried the same information.
-
-M1 also lands three things M0 left as design rather than code: `guard::check` moves from `tools` into `core`'s dispatch so approval has somewhere to suspend, dispatch becomes a `JoinSet` so an interrupt can keep completed tool results, and `run_agent_loop` becomes a `Session` that owns history across turns.
-
-The headless client splits streams: **`stdout` is the answer, `stderr` is reasoning, tool activity, and errors.** Issue #4 recorded the current CLI rendering reasoning and answer through one match arm, producing an undelimited wall of prose. Splitting by stream removes that class of bug by construction — a redirected `stdout` has no reasoning in it to distinguish — rather than relying on formatting to keep them apart.
-
-**Gate.**
-- Kill and reconnect a client mid-turn: `session.attach` replays state and the turn completes with output intact.
-- Two clients attached to one session both render the same stream.
-- Interrupt cancels in-flight tools, and already-completed tool results still appear in history (no `tool_use_id` desync — assert the next request does not 400).
-- Socket is mode `0600`; daemon exits after idle timeout with zero clients.
-- First launch with no key resolvable prompts for one, stores it under `~/.elefante/` at mode `0600`, and never writes it into a working tree. An already-set `OPENROUTER_API_KEY` wins over the stored value.
-- A model that reasons at length while emitting no renderable text does not present as a frozen UI — the failure the old `thinking.display` note warned about.
-- **M0 gate still green.**
-
-### M2 — Repo cache + mechanical graph
-
-**Baseline.** Schema design pass first. Walk + blake3 cache, tree-sitter symbols, import edges, git co-change edges, repo brief, FTS5 + graph-hop retrieval injected per turn, and a working `memory_search`.
-
-**Gate.**
-- Warm start: second launch on an unchanged repo performs **zero** tree-sitter invocations (asserted by counter, not by timing).
-- Touching one file re-parses exactly one file and bumps `repo_generation` once.
-- `co_edited_with` weights match a hand-computed expectation on a fixture repo with known commit history.
-- A prompt issued before indexing completes returns a `partial: true` memory block and does not block.
-- Retrieval respects the 1500-token budget under an adversarially large graph.
-- Editing a file leaves its node id, and the ids of its unchanged symbols, intact.
-- Deleting `cache.db` or `memory.db` converges on an identical graph — the latter with zero parses — and a crash between the graph commit and the cache write converges too, edges included.
-- No secret fixture string survives in any row or in the raw bytes of any file under `.elefante/`; `git status` is clean after a session and at a mid-index kill; files are `0600`, the directory `0700`.
-- Hostile repository text cannot close or forge the injected envelope; no request carries a `system` message other than the configured prompt; the block is absent from history and from the next turn's request.
-- FTS-hostile prompts never error; a session in a subdirectory sees only its subtree; history before a rename counts for the renamed file; a non-repository indexes fully with no co-change.
-- N concurrent refresh requests collapse to at most two runs and none blocks.
-- `ELEFANTE_MEMORY=0` creates no `.elefante/` and adds no context.
-- Golden retrievals: a fixture repository's queries find the expected file in the top three.
-- **M0–M1 gates still green**, and the MSRV check passes with the new dependencies.
-- *Credentialed:* a real model, given `--max-rounds 1`, names a function it can only know from the index it was sent.
-
-### M3 — Learned memory
-
-**Baseline.** Learned notes (`preference`, `convention`, `decision`, `fact`) in the project graph;
-incremental extraction behind a gate with a watermark; verification, provenance by speaker, hybrid
-dedupe and supersession; keyed integrity for stores and rows; read-time decay and compaction; a
-separate `<repo-memory>` section in retrieval; and `elefante memory list | forget | approve | clear`.
-Deferred from the original baseline: the user-level graph (since cut) and transcript compaction (M7)
-— M3 ships the seam (`Learner::flush`, and a watermark that only shrinks after a commit), so whatever a
-future compactor drops has already been read.
-
-**Gate.**
-- `git status` is clean after a full session in a test repo.
-- The same fact stated twice, in reordered or paraphrased words, is one note with raised confidence;
-  a paraphrase merges only on a verified model verdict.
-- A contradicting fact, in the user's own words, supersedes the old note; retrieval returns the survivor.
-- No row and no byte under `.elefante/` contains the `sk-ant-` fixture after a session that touched it.
-- Extract incrementally, truncate the history, and a fact from the dropped region is still retrievable.
-- A store a repository shipped, a version-1 store, and a row with a bad or missing MAC render nothing.
-- The extractor's captured request contains no tool result, tool call or reasoning; an assistant-only
-  claim is `pending` and never shown; a quote not in the conversation is refused.
-- A note cannot close its envelope; the learned section is ≤ 400 and the block ≤ 1,500 estimated tokens;
-  with nothing learned the block is byte-identical to code-only retrieval.
-- `ELEFANTE_LEARN=0` and `ELEFANTE_MEMORY=0` each make zero extractor requests.
-- **M0–M2 gates still green.**
-- **Credentialed, once:** `live_learned_memory_is_extracted_stored_and_used`.
-
-### M3.1 — Learned-memory hardening and consent
-
-**Shipped** (record in [`MILESTONES.md`](./MILESTONES.md)). Follow-up to M3. It fixes two defects
-found in the merged code and changes one default.
-
-**Baseline.** `learn::display_safe` (Unicode categories Cc, Cf, Zl, Zp) applied at ingest and to every
-column the CLI prints; `elefante memory list` verifies the store's stamp; the learner clears its failure
-state on success. `ELEFANTE_LEARN` becomes `LearnMode { Off, Ask, On }` with **unset meaning Ask**: the
-TUI asks once at launch (Y/N, no default, `Esc` asks later), the answer is stored beside the credentials
-with a keyed stamp and is bound to the extractor model, and until it is given the daemon reads and keeps
-nothing. `elefante memory learn on|off` answers headlessly; `memory.consent` and an additive
-`memory: { consent, extractor }` field on the create/attach results carry it.
-
-**Gate.**
-- No note, stored or displayed, holds a control or formatting character in any column; an unstamped
-  store prints nothing.
-- No extractor request is made before consent, on any client; the answer persists, is bound to the
-  extractor, is tamper-evident, and `ELEFANTE_LEARN` overrides it.
-- An old client ignores the new result field; a new client against a result without it shows no modal.
-- Nothing but the launch-time modal opens an overlay or takes focus; with consent granted the screen is
-  byte-identical to today's.
-- **M0–M3 gates still green.**
-
-### Shipped before the rescope
-
-The memory-facing parts of the old M5, M6 and M7 shipped on 2026-10-11 and stay part of the baseline
-every later gate must keep green (records in [`MILESTONES.md`](./MILESTONES.md), under "pre-rescope"):
-`MemoryStatus` and the `memory.status` event, lenient clients on both parsers, `View::emit_session`,
-one session cost including memory spend; `InjectedContext`, `memory.context` and `memory_note_ids`
-on turns; `memory.learned`, `memory.list | forget | approve | clear | status` keyed by `cwd`, the
-`/memory` panel and `/forget <id>` in the TUI, and the headless stderr lines. Everything else those
-milestones planned was cut (§ Cut in the rescope) or moved into M4–M7 below.
-
-### Consolidation (before M4)
-
-**Implemented** (record in [`MILESTONES.md`](./MILESTONES.md)).
-
-**Baseline.** Eight crates become five. `tools` moves into `core` as `core::tools`. `rpc`, `srv` and
-`cli` become one `elefante` crate and one binary: `wire/`, `daemon/` and `client/` modules, with
-`elefante daemon` in place of `elefante-srv`, and a client that starts the daemon by running its own
-executable rather than looking for a sibling binary. `elefante memory` goes through the daemon only,
-starting one if needed; the direct-store path and the "older daemon" fallbacks are deleted. A daemon
-that answers "method not found" is named as an older build, with how to stop it, and nothing is
-worked around. (A `version` field on create/attach was planned for this and dropped: every crate is
-version 0.1.0, so it would have detected nothing.) The scripted stub provider is compiled only into
-debug builds. No behaviour visible to the model or the TUI changes.
-
-**Gate.**
-- `cargo metadata --no-deps` lists exactly `elefante`, `elefante-core`, `elefante-guard`,
-  `elefante-mem`, `elefante-provider`.
-- No test is lost: the direct-mode `elefante memory` tests run through the binary and a daemon it
-  starts, so the gate items they carried (hostile rows sanitised, an unstamped store shows nothing,
-  consent per extractor) still hold.
-- With no daemon running, a one-shot prompt and every `elefante memory` subcommand start one and work.
-- A daemon that lacks a method is named as an older build, and nothing is written around it.
-- A release build contains no `ELEFANTE_STUB_PROVIDER`.
-- **M0–M3 gates still green**, credentialed ones included, since the client and daemon paths moved.
+`cargo test --workspace` and `bun test` run the hermetic gates. The credentialed gates are
+`live_second_identical_request_reads_prompt_cache`, `live_edit_lands_in_a_scratch_repository`,
+`live_memory_context_reaches_the_model` and `live_learned_memory_is_extracted_stored_and_used`;
+`.github/workflows/credentialed.yml` runs them.
 
 ### M4 — Sandbox
 
@@ -688,132 +559,284 @@ network, inherits the daemon's environment — the API key included, when it was
 timeout. The classifier cannot fix this: every bypass costs another rule (`known_gaps()` lists eight
 classes). M4 moves enforcement to the operating system and lets the classifier go back to intent.
 
-**Threat model.** A prompt-injected model acting with the user's permissions. M4 stops three things:
-secrets leaving, network leaving, and files planted inside the root that something *outside* the
-sandbox later runs (git hooks, editor tasks — the class behind the July 2026 escapes in other agents).
-Kernel exploits are out of scope here; the microVM backend below is the answer to them.
+**Threat model.** A prompt-injected model choosing tool calls. M4 keeps shell commands inside a
+rooted OS sandbox, without the daemon's key or access to the daemon socket. The harness controls
+git writes and web research. Code the user later chooses to run outside elefante — builds, IDE
+tasks and hook managers — is outside this guarantee. Kernel exploits are also outside it; the
+opt-in microVM backend of M4.2 (macOS) and M4.3 (Linux) addresses them.
 
 **The key never enters the sandbox.** The model runs at OpenRouter and every request comes from the
 daemon, which is not sandboxed. Sandboxed processes run model-chosen commands and never need the key,
 so there is no mapping or proxy to build: the key lives only in the daemon (and `credentials.toml`).
 
-**Baseline.** Design pass first, with a spike on both platforms.
-- **Policy, in `guard`.** `guard::sandbox::Policy { root, readable, writable, protected, network }`,
-  rendered to a Seatbelt profile (macOS) or a Landlock ruleset plus seccomp filter (Linux). Pure, and
-  tested by rendering. Readable: the root, system directories and the toolchains (`CARGO_HOME`,
-  `RUSTUP_HOME`) — an allowlist, because Landlock can only grant. Writable: the root and a private temp
-  directory. Protected (read-only inside the writable root): `.git` — and the directory a `.git` file
-  points to — and `.elefante/`. Never readable: `~/.elefante`, `~/.ssh` and the built-in credential
-  paths. Network: off.
-- **macOS.** `/usr/bin/sandbox-exec -p <profile> bash -c …` with a deny-by-default profile. Protected
-  paths are denied by pattern, so a `.git` created later anywhere in the root is covered too. Network,
-  Unix-socket connections and the DNS resolver's service are denied.
-- **Linux.** The daemon runs `/proc/self/exe sandbox-exec <policy> -- bash -c <command>` — the running
-  binary, never a path, which a `cargo build` inside the root could replace. The helper closes every
-  descriptor except stdin, stdout and stderr (Landlock does not cover files opened before it), sets
-  `no_new_privs`, applies Landlock and seccomp to itself, then starts bash; everything bash starts
-  inherits both, and neither can be undone. Safe Rust through the `landlock` and `seccompiler` crates.
-  - **Landlock** (files and TCP): the path allowlist above; TCP connect and bind with no port allowed;
-    from ABI 6, no signals to and no abstract-socket connections outside the sandbox; from ABI 9, no
-    connections to pathname Unix sockets outside it. ABI 4 is the minimum: below it, bash refuses.
-  - **seccomp** (system calls): `socket()` is refused for every address family but `AF_UNIX` — so no
-    TCP, UDP, ICMP or raw sockets, over IPv4 or IPv6 — and for `AF_UNIX` too below Landlock ABI 9
-    (`socketpair` stays allowed; it reaches nothing outside). Also refused: `io_uring_*` (it opens
-    sockets without calling `socket()`), `ptrace`, namespace creation (`unshare`, `setns`, `clone` and
-    `clone3` with namespace flags), the mount calls, `bpf` and `keyctl`. A system call from another
-    architecture kills the process.
-  - **DNS** is covered by the same rules: every resolver path needs an internet socket or a Unix socket
-    (systemd-resolved, nscd).
-  - **`.git` is detected and restored, not blocked.** Landlock rules only grant, and a grant on the
-    root covers everything beneath it, so a read-only `.git` cannot be carved out of a writable root.
-    Before each command the daemon snapshots `.git` except `objects/`; after it, once every process the
-    command started is dead, it compares, restores any change and says in the tool result what it
-    reverted. The same pass finds any new `.git` elsewhere in the root, deletes it and reports it. The
-    design pass measures the cost of that scan on a large `target/`.
-- **Every process a command started ends with it.** On Linux the helper is a child subreaper: it starts
-  bash rather than becoming it, and when bash exits it kills whatever is left, including processes
-  that left the process group. That closes the window in which a leftover process could rewrite `.git`
-  after the check or swap a symlink under the daemon's `read`. On macOS the process group is killed;
-  the design pass decides whether that is enough.
-- **The daemon's socket requires a token.** At start the daemon writes 128 random bits to
-  `~/.elefante/run/token` (`0600`); every connection presents it first, and the CLI and TUI read it
-  there. The sandbox cannot read `~/.elefante`, so a command that reaches the socket still cannot
-  create a session, resolve an approval, set the key or change memory.
-- **Git goes through the harness.** `.git` is read-only, so the read commands (`status`, `diff`, `log`,
-  `show`, `blame`) run in the sandbox with `GIT_OPTIONAL_LOCKS=0`. A bash call that is a single plain
-  `git <subcommand> …` — no pipe, `&&`, redirection or substitution — is run by the daemon instead,
-  outside the sandbox, through one hardened git helper:
-  - Subcommands are allowlisted (the local ones: `add`, `rm`, `mv`, `restore`, `commit -m`, `switch`,
-    `branch`, `stash`, `tag`, `reset`, `merge`, `cherry-pick`, non-interactive `rebase`, plus the read
-    commands). Refused: anything touching remotes or configuration (`push`, `pull`, `fetch`, `clone`,
-    `remote`, `submodule`, `config`, `credential`), the options `-c`, `-C`, `--git-dir`, `--work-tree`
-    and `--exec-path`, and unknown subcommands, so aliases never resolve. The classifier's destructive
-    forms stay `Deny`. A git write inside a compound command is refused with a message asking for one
-    git command per call.
-  - Every invocation passes `-c protocol.allow=never` (no transport works) and turns off everything
-    that runs a program: hooks (`core.hooksPath=/dev/null`), fsmonitor, the pager, external diff,
-    textconv, the editor, credential helpers and signing. System and global configuration are skipped;
-    `user.name` and `user.email` are passed explicitly.
-  - Output is scrubbed and capped like bash. The argument and environment builder lives in `guard`
-    (pure); the existing hardening in `mem/src/cochange.rs`, the M5 diff critic and the M6 worktree and
-    `git apply` all use it.
-  - **Hooks do not run on the agent's commits** (in effect `--no-verify`). The design pass decides
-    whether `pre-commit` and `commit-msg` hooks run inside the sandbox before the harness commits.
+**Baseline.** Design pass first, with a spike on both platforms. The Linux spike uses a
+temporary `ubuntu-24.04` Actions job. Phase 0 has separately approved setup, CI-iteration and
+results commits: GitHub only dispatches a manual workflow when its file is on the default branch,
+so the temporary job runs on `sandboxing` pushes. Probe-harness errors are fixed and rerun before
+recording Linux behavior. The maintainer deferred
+the billable OpenRouter web-search spike and other credentialed checks until the end of M4.1;
+their results remain `not run` through M4 and must be obtained before completion is reported.
+The policy phase needed a separately approved gate-fix commit: pinned Linux Clippy saw two
+Linux-only lint errors after the first push. No runtime phase begins until the Linux gate reruns
+green; the test requirements are unchanged.
+The runtime phase moves Linux CI's bubblewrap and SQLite installation and user-namespace probe
+ahead of the later two-OS matrix change, because runtime tests must exercise isolation before
+that phase can pass its gate.
+- **Policy, in `guard`.** `guard::sandbox::Policy { root, home, harness_dir, protected, temp,
+  readable, writable, read_only, hidden, network }`, rendered to a Seatbelt profile (macOS) or bubblewrap arguments and seccomp
+  programs (Linux). It is pure and tested by rendering. The root is validated before use: `/`,
+  `$HOME`, ancestors of `$HOME`, paths containing or contained by `~/.elefante`, and paths with a
+  case-insensitive `.git` component make the
+  sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
+  harness state. Readable paths are the root, system directories and exact executable/toolchain
+  directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
+  are read-only. The root scan hides `.elefante` and every name on the `PathPolicy` secret list,
+  inside `target/` and `node_modules/` too; the Seatbelt name rules repeat that list as a kernel
+  backstop, and a test checks that they cover it. Linux mounts exact
+  resolver files, not all of `/etc`, so approved DNS can use libc. Hidden paths carry an explicit
+  file/directory kind so rendering performs no filesystem lookup. The home,
+  harness directory and exact socket/token paths let renderers reject overlapping readable
+  mounts, including custom socket locations. Network is off by default.
+  Bubblewrap's `--dev /dev` supplies writable standard device nodes; the readable mount loop
+  must not overlay `/dev/null`, `/dev/random` or `/dev/urandom` read-only.
+  Its minimal PID 1 reaper is masked with a tmpfs overlay on `/proc/1`, so shell tools cannot
+  inspect that parent process even though the PID namespace still reaps children.
+- **macOS.** `/usr/bin/sandbox-exec -p <profile> -D… bash -c …` with a deny-by-default profile.
+  Every path enters through a checked `-D` parameter, never interpolated profile text. Secret
+  reads and `.git` writes (in any case) are denied by pattern, including new nested directories.
+  An exact literal write exception for `/dev/null` lets Git reads open the cleared global config
+  target read-write; no general out-of-root write grant is made.
+  A Git read with `--output=<outside-scratch-path>` must still fail at the OS; `$HOME` inside
+  the sandbox is private session temp, so it is not a suitable outside-root test target.
+  Off denies host loopback; approved network enables outbound TCP/UDP and the exact system DNS
+  socket while other Unix sockets remain restricted to the root and session temp. Host process inspection, keychain,
+  pasteboard, Apple Events and launchd submission are denied. System reads use exact directories;
+  the host's whole `/private/var` is excluded, with required descendants tested during the
+  runtime gate. The profile grants exact literal reads of the ancestors of the root, temp,
+  readable and writable paths, including `$HOME` when the workspace is beneath it. A command can
+  list the names in those ancestors, but the profile grants no home subtree. Seatbelt applies
+  the last matching rule, so every allow precedes every deny.
+- **Linux.** Bubblewrap creates user, PID, IPC, UTS and (when network is off) network namespaces,
+  clears the environment, binds exact read paths, binds the root writable, overlays each existing
+  `.git` read-only, and masks secrets and harness state. `--disable-userns` prevents nested user
+  namespaces when available. A `/tmp` tmpfs and private home replace host locations; `/run`, host
+  `/tmp` and `$XDG_RUNTIME_DIR` are not bound. The renderer rejects a readable path under them,
+  under `/var/run` or under `/dev`, apart from the device nodes, the resolver directory and
+  validated git directories. The daemon feeds two stacked `seccompiler` programs
+  through repeated bubblewrap `--add-seccomp-fd` arguments. It writes each program into an
+  anonymous memory file that keeps close-on-exec. The fixed `bash` launcher reopens both files
+  as fds 3 and 4 in the launched process only, then execs bubblewrap. The programs return
+  ENOSYS for `clone3` and `io_uring_*` so runtimes fall back, and EPERM for
+  namespace/mount, process-inspection, keyring and other escape-prone calls. On x86_64 both
+  programs explicitly reject x32 syscall numbers; `seccompiler` 0.5.0's generated architecture
+  check does not cover them. The EPERM program also refuses `ioctl(TIOCSTI)` to prevent
+  terminal input injection. That rule compares the low 32 bits of the request, as the kernel
+  does. The filter restricts
+  socket families; approved network still blocks `AF_UNIX` to avoid abstract host sockets. The
+  spike settled repeated `--add-seccomp-fd` arguments, Ubuntu's AppArmor user-namespace sysctl
+  step, and `--disable-userns` without a clone-flag mask. Its toolchain probe required exact
+  Cargo/Bun binary directories, the selected rustup toolchain and settings, a read-only Cargo
+  registry, `/etc/alternatives` for GCC and `/etc/ssl/certs` for TLS clients; writable caches
+  lived under the private temp directory. No whole real home or Cargo home was bound.
+  A new nested `.git` is quarantined after the command, including under ignored directories.
+  If a move fails, the next root scan refuses until the entry is gone. On every OS, a `.git` that
+  was absent at session start makes bash and harness git refuse, and in-root include or hooksPath
+  targets are read-only in the shell. The scan also reads the config of a repository that encloses
+  the root.
+- **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
+  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. macOS has no
+  PID namespace, so the daemon also kills each descendant that one `ps` snapshot links to the
+  group, such as a `setsid` child. A descendant whose parent exits before that snapshot
+  reparents to launchd and can still survive, sandboxed. The output reader stops two seconds
+  after bash exits so a held pipe cannot stall the turn.
+- **The daemon's socket requires a token.** At start the daemon writes 128 random bits beside its
+  socket (`~/.elefante/run/token` by default, `0600`); every connection presents it first, and the
+  CLI and TUI read it there. The sandbox cannot read the token, so a command that reaches the
+  socket still cannot create a session, resolve an approval, set the key or change memory.
+- **Git goes through the harness for writes.** Read git runs in the shell sandbox with
+  `GIT_OPTIONAL_LOCKS=0`. A write routes only when the whole bash call is one plain `git`
+  command with literal words or single-quoted strings. Pipes, lists, substitutions, expansions,
+  redirections, environment prefixes and global options are refused. `guard::git` applies an
+  exact option allowlist per local write subcommand (`add`, `rm`, `mv`, `restore`, `commit`,
+  `switch`, `checkout`, `branch`, `stash`, `tag`, `merge`, `cherry-pick`, `rebase`) and validates
+  paths and refs. `reset`, `clean`, `push`, `fetch`, `pull`, `config` writes and unknown options
+  are refused, also behind wrappers such as `env`, `exec` or `xargs`. `checkout <ref>` runs as
+  `checkout <ref> --`, so git never reads the ref as a pathspec, and a branch may share its
+  name with a file or directory. Every other subcommand, such as
+  `grep`, `blame` or an alias, is a read and runs in the sandbox. Every routed write asks for approval; the disabled sandbox asks for every bash
+  call. The harness uses an absolute git binary, a cleared environment and flags that disable
+  hooks, fsmonitor, pager, external diff, editors, credential helpers, signing and transports.
+  It acts only on the `root/.git` present at session start and shares the bash timeout. It
+  refuses in-root or `~/` include or hooksPath targets and LFS filters. Hooks do not
+  run on harness commits. Git attributes can select custom clean/smudge filters or merge drivers,
+  so the harness also refuses a repository with any `filter=` or custom `merge=` attribute in
+  the worktree, index fallback or `.git/info/attributes`. The invocation disables global
+  attributes and an implicit custom merge default. Local repository config defining executable
+  `filter.*` or `merge.*.driver` is refused too, because a target revision may introduce
+  attributes during checkout. The pure invocation builder also hardens
+  indexer git.
 - **`web_search`, the eighth tool.** Bash never gets the internet for research; the daemon searches
   instead and returns the results as an ordinary tool result (untrusted content), capped. The query is
   an outbound channel, so it is scrubbed, length-capped and shown to the user. The design pass picks
   the backend, preferring OpenRouter's web search because it needs no second key. There is no
   fetch-a-URL tool: a URL the model chooses is an exfiltration channel.
 - **The standing prompt** gains two lines: `.git` is read-only and git runs one command per call with
-  no remotes; research goes through `web_search`. It stays within the 400-token budget.
+  no remotes; research goes through `web_search`. It stays within the 400-token budget. The
+  per-session search cap is reserved in `check_with_tools` before parallel dispatch, using state
+  shared by executor clones; `check_in` remains the pure bash policy entry point.
 - **Fail closed.** If the sandbox cannot be applied, bash does not run and the error names why.
   `ELEFANTE_SANDBOX=0` is the only opt-out, and the status line shows it while it is set. Nothing in
   the workspace can change the policy: it is built from the daemon's own configuration only.
-- **Process hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`, `LANG`, `TERM`,
-  `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `GIT_OPTIONAL_LOCKS`); `OPENROUTER_API_KEY` is never passed.
-  `bash -c`, not a login shell. A wall-clock timeout (120 s default) kills the command. Model-facing
-  output of `bash`, `read` and `grep` is capped, keeping head and tail and stating the size cut.
-- **Network on request.** A command that needs the network (a dependency fetch) escalates; approving
-  it runs that one command without the network rules. It then has the whole internet — there is no
-  per-domain filter in M4. Loopback is network too: a test that binds `127.0.0.1` needs approval,
-  because Landlock matches ports, not addresses, and seccomp cannot read the address.
+- **Process and file hygiene.** The environment is cleared to an allowlist (`PATH`, `HOME`,
+  `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, fixed macOS `SDKROOT`, and
+  sandbox-only git flags). On macOS, fixed `PATH` puts the resolved Command Line Tools compiler
+  directory ahead of `/usr/bin`: the `/usr/bin/clang` shim created assembler temporaries outside
+  the private temp directory even when `TMPDIR` was set, while the direct compiler did not.
+  `OPENROUTER_API_KEY` is never passed. A fixed `bash` launcher closes every descriptor above
+  stderr before it execs the sandbox, so a descriptor the daemon inherited never reaches a
+  command. Shell uses `bash -c`, not a login shell, with a 120-second
+  default timeout. `bash` and `grep` output is capped at 32 KiB, `read` at 128 KiB, keeping head,
+  tail and the total size. Daemon file tools and the indexer open root-relative paths without
+  following symlinks, after rejecting absolute and parent components; they refuse hard-linked
+  regular files and write by same-directory rename. The macOS `rustix` flag for this needs
+  `rustix` 1.1.5 or later: 1.1.4 lacks `OFlags::NOFOLLOW_ANY`.
+- **Network on request.** `network: true` escalates and, if approved, enables the network for
+  that one sandboxed call, including an otherwise unclassified command such as `curl`; denied
+  commands stay denied and harness Git stays network-off. It then has the whole internet, with no per-domain filter. macOS host
+  loopback needs approval; Linux's private loopback works inside the network-off sandbox and
+  cannot reach the host listener. This repository's existing tests bind host loopback, so a
+  full `cargo test` run inside the macOS sandbox requires network approval; the off-profile
+  probe failed exactly those ten tests and the approved-profile probe passed all 553.
 - **The classifier shrinks.** With paths enforced by the OS, the `.elefante` argument scanning in
   `guard/src/bash.rs` (glob forms, grep/rg flag tables) is deleted. The classifier keeps intent:
-  destructive and privileged commands are denied, unknown ones ask, plain git is routed.
+  destructive and privileged commands are denied, unknown ones ask, plain git is routed. A
+  directory-only `cd` may name a protected directory so the OS denial is exercised, while
+  literal content readers still deny; only read-only `sqlite3 <db> .schema` and exact `xargs cat`
+  are newly allowed for the bypass gate. When the sandbox is disabled, every Bash call escalates
+  before any of these rules apply.
 
 **Proposals, outside M4's gate.**
-- **A second lock on harness git.** Run the git helper itself under a sandbox profile — network off,
-  `.git` writable except `hooks/`, `config` and `info/` — so a gap in the allowlist still cannot reach
-  the network or plant a hook.
+- **Landlock inside bubblewrap**, as an additional Linux restriction if it brings measurable
+  protection without breaking toolchains.
+- **Hooks in the sandbox**, instead of skipping them on harness commits, after their behavior is
+  specified and tested.
 - **A per-domain egress proxy**, so an approved command reaches only named hosts. On Linux this needs a
-  network namespace, which Landlock and seccomp alone cannot provide.
-- **A microVM backend on macOS** (Apple `container`, which targets macOS 26, or Docker Sandboxes)
-  behind a `Backend` trait that M4 shapes but does not implement. It isolates the kernel too, and is
-  the fallback if Apple removes `sandbox-exec`. gVisor was considered and not chosen: Linux only, so on
-  a Mac it needs Docker Desktop's VM, builds a Linux toolchain rather than the one shipped, and Docker's
-  privileged daemon is itself a known way out.
+  controlled network path rather than the host network namespace.
+
+The microVM backend, formerly a proposal here, is required work: M4.2 and M4.3.
+
+**Gate.** The detailed positive and negative controls are in `M4_milestone.md`. They prove the
+old classifier harness-state bypasses fail at the OS, outside paths and secrets stay hidden,
+network off and approved network differ correctly on both operating systems, `.git` is
+read-only in shell and write git routes through the harness, and repository config traps are
+refused. The daemon socket requires a token even if reached. Process, key, link, timeout,
+output-cap, seccomp and fail-closed cases are exercised. `web_search` rejects secrets and URLs.
+The socket gate uses a fake home and synthetic runtime/override sockets; the `/run` case is a
+pure no-broad-mount assertion plus runtime outside/abstract-socket controls, because CI does not
+guarantee a writable `/run` location for a listener. This retains the service boundary without
+opening or disturbing the real daemon socket.
+The current macOS profile's Keychain, clipboard, app-launch, launchd and Apple Event controls
+run only in a dedicated disposable macOS CI job with synthetic fixtures, not on the maintainer's
+machine. The job invokes explicitly ignored tests; if the runner lacks a required GUI service,
+the gate fails with a setup reason and is reported rather than silently skipped.
+Sandbox tests fail with setup instructions if the sandbox is missing, and each negative test has
+a positive control. Both macOS and Linux CI legs, MSRV, TUI checks and **all M0–M3 gates** must
+be green before M4.1 starts. Credentialed tests are run separately by the maintainer at the end
+of M4.1, under the explicit deferral above.
+
+### M4.1 — Sandboxed harness git
+
+**Baseline.** Harness write git runs under its own profile with network off, nothing outside
+the root readable, the root writable, and `.git` writable except `hooks/`, `config`, `info/`
+and any protected hooksPath target. Linux uses bubblewrap overlays; macOS uses Seatbelt. The
+exact per-subcommand allowlist remains as a second line of defence.
+
+**`web_search` egress.** M4 lets a session send up to 30 queries of 300 characters each with
+no approval. A prompt-injected model can therefore send about 9 KB of non-secret file content
+out through queries. The URL filter (`://`, `www.`) is a courtesy, not a control: a `[.]`
+spelling or base64 passes it. M4.1 closes the gap:
+- The first `web_search` of each session escalates. The approval prompt shows the query.
+- The threat model in `DEVELOPER_GUIDE.md` states the channel and its size bound.
+
+**Gate.** A test-only widening of the allowlist admits attempts such as
+`--output=$HOME/x`, `--no-index ~/.ssh/f` and `merge -s evil`; the OS still blocks them. A
+normal commit and rebase continue to work. The first `web_search` in a session escalates and
+shows its query; a later one within the cap runs without a prompt. M4 and earlier gates remain
+green on both operating systems before the milestone is recorded.
+
+### M4.2 — MicroVM backend on macOS
+
+Seatbelt and bubblewrap share the host kernel, so a kernel exploit escapes them. M4.2 runs bash
+in a Linux microVM with its own kernel, using libkrun: a Rust VMM library on Hypervisor.framework
+(Apple silicon) and on KVM, so M4.3 reuses the same backend on Linux. It is also the fallback if
+Apple removes `sandbox-exec`.
+
+Considered and not chosen:
+- **Apple `container`.** It is macOS 26 only and macOS only, so Linux would need a second
+  backend. Its CLI also gives less control over shares and network devices.
+- **gVisor.** Linux only, so on a Mac it needs Docker Desktop's VM, and Docker's privileged
+  daemon is itself a known way out.
+- **Firecracker.** It needs KVM and has no macOS port.
+
+**Opt-in for now.** Seatbelt stays the macOS default; `ELEFANTE_SANDBOX=microvm` selects the VM,
+and the status line shows it. **The microVM should become the macOS default in the near future**,
+once M4.2's measurements show its start-up cost and the Linux toolchain are acceptable for
+everyday use.
+
+**What moves into the VM.** Only a bash call and everything it starts. The daemon, the key, the
+TUI, the file tools, harness git, the indexer and `web_search` stay on the host. Inside the guest,
+commands build and run Linux tools, so `cargo build` there produces Linux binaries.
+
+**Baseline.** Design pass first, with a spike. Its results go into the milestone file before any
+phase begins.
+- **A `Backend` seam** in `core` with Seatbelt, bubblewrap and the microVM behind it, selected by
+  the daemon's configuration only, never by the workspace.
+- **libkrun never runs in the daemon.** It runs in the process that links it, so a VM escape
+  inside the daemon would land beside the key. A separate VM-runner child links it, receives no
+  key, and itself runs under Seatbelt with only the shares it serves.
+- **A pinned stable libkrun branch.** `main` is an unstable 2.0. The runner is signed with the
+  hypervisor entitlement that Hypervisor.framework requires.
+- **We own the guest:** kernel, root filesystem with the Linux toolchain, and a minimal init.
+- **The same `Policy`.** Network off attaches no network device at all; libkrun's socket
+  forwarding (TSI) uses the runner's host network, so it is never enabled for an off call.
+  Approved network gives the guest outbound access for that one call. The key never enters the
+  guest; the environment is the same allowlist. Timeouts stop the command and the VM.
+- **Bubblewrap and seccomp inside the guest**, as the second layer, so the M4 rules still hold
+  when the VM boundary is not the one under test.
+- **Fail closed.** If the microVM is selected but unavailable (unsupported macOS, Intel Mac,
+  libkrun or the guest image missing), bash does not run and the error names why. It never
+  silently falls back to Seatbelt.
+
+**Open for the design pass (spike questions):**
+- libkrun's minimum macOS version on the pinned branch.
+- Cold and warm start time per call and per session; whether one VM per session is needed to
+  keep calls fast.
+- Can the virtio-fs shares keep `.git` read-only and secrets and `.elefante` absent at the host
+  side, not only inside the guest?
+- How the guest kernel and image are built, versioned and kept small.
+- Shared-folder speed for `cargo test` and `bun test` on this repository.
+- Linux build output must not clobber the host's: `target/` and native `node_modules` need a
+  guest-private location.
+- Does a GitHub-hosted macOS runner, itself a VM, support Hypervisor.framework guests? If not,
+  where the gate runs.
 
 **Gate.**
-- Each harness-state bypass in `known_gaps()` — a shell variable naming the path, `cd` then a relative
-  path, `sqlite3` with an assembled path, `xargs` — is classified `Allow` and blocked by the OS.
-- Reading a `~/.ssh` fixture and writing outside the root fail. TCP and UDP to loopback over IPv4 and
-  IPv6, and a DNS lookup of a public name, all fail; with approval, the TCP connection succeeds.
-- Writing `.git/hooks/pre-commit` or `.git/config` is blocked (macOS) or reverted and reported (Linux);
-  a new `sub/.git` is removed and reported. `git status` works inside the sandbox; `git commit -m`
-  through the harness works; `git push`, `git fetch` and `git -c core.hooksPath=… commit` are refused.
-- Connecting to the daemon's socket from inside fails, and a connection without the token is refused.
-- A child sees no `OPENROUTER_API_KEY` while the daemon has one in its environment, and reading the
-  daemon's environment (`/proc/$PPID/environ`, `ps eww` on macOS) fails.
-- Linux: replacing `target/debug/elefante` between two calls does not change the helper; only
-  descriptors 0–2 are open inside; `io_uring_setup` is refused.
-- A symlink and a hard link to a `~/.ssh` fixture are refused by `read`, including a link swapped in
-  while `read` runs.
-- The timeout kills a grandchild, a process that left the group is gone when its command ends (Linux),
-  and an oversized output arrives capped.
-- A `web_search` query containing a secret fixture is scrubbed before it leaves.
-- With the sandbox unavailable, bash refuses and never runs unsandboxed.
-- Green on the macOS and Linux CI runners; the Linux job first asserts Landlock ABI ≥ 4.
-- **M0–M3 gates still green**, after the classifier shrinks.
+- Inside the VM, `uname -s` is Linux and host processes are invisible.
+- The M4 negative controls pass with the microVM backend: outside paths and secrets hidden, `.git`
+  read-only, network off and approved differ, the daemon socket refuses without the token, the
+  timeout kills the command.
+- Selecting the microVM where it is unavailable fails closed with a setup reason.
+- With the microVM not selected, Seatbelt behaves exactly as in M4.
+- **M0–M4.1 gates still green.**
+
+### M4.3 — MicroVM backend on Linux
+
+**Baseline.** The M4.2 libkrun backend on Linux over KVM, opt-in on the same setting, behind the
+same `Backend` seam, with the same runner process, fail-closed rule and gate. The runner process
+is confined by bubblewrap and seccomp instead of Seatbelt. The design pass confirms `/dev/kvm` on
+the CI runner.
+
+**Gate.** M4.2's gate on Linux, and **M0–M4.2 gates still green.**
 
 ### M5 — Critics
 
@@ -905,7 +928,7 @@ plainer wording.
 - A note anchored to a renamed file still links to it.
 - The learner's held text stays under its cap across a long scripted session.
 - After compaction, a fact from the dropped history is still retrievable.
-- The measurement's results are recorded in `MILESTONES.md`.
+- M7's pull request states the measurement's results.
 - **M0–M6 gates still green.**
 
 ---

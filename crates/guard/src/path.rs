@@ -157,6 +157,31 @@ impl PathPolicy {
         Ok(resolved)
     }
 
+    /// Resolves a write target, additionally protecting git metadata in any case.
+    ///
+    /// # Errors
+    /// Returns a policy error for secret, escaping, or git metadata paths.
+    pub fn resolve_for_write(&self, path: impl AsRef<Path>) -> Result<PathBuf, PolicyError> {
+        let input = path.as_ref();
+        let resolved = self.resolve(input)?;
+        if [
+            input,
+            resolved.strip_prefix(&self.root).unwrap_or(&resolved),
+        ]
+        .into_iter()
+        .any(|path| {
+            path.components().any(
+                |part| matches!(part, Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+            )
+        }) {
+            return Err(PolicyError::Denied {
+                path: input.display().to_string(),
+                rule: "git-metadata-write",
+            });
+        }
+        Ok(resolved)
+    }
+
     fn check_denied(
         &self,
         input: &Path,
@@ -295,6 +320,14 @@ fn secret_rule(path: &Path, harness_state: bool) -> Option<&'static str> {
         if *component == ".aws" && components.get(index + 1) == Some(&"credentials") {
             return Some(".aws/credentials");
         }
+        if *component == ".cargo"
+            && matches!(
+                components.get(index + 1),
+                Some(&("credentials" | "credentials.toml"))
+            )
+        {
+            return Some(".cargo/credentials or .cargo/credentials.toml");
+        }
         if *component == ".elefante" && components.get(index + 1) == Some(&"credentials.toml") {
             return Some(".elefante/credentials.toml");
         }
@@ -309,6 +342,11 @@ fn secret_rule(path: &Path, harness_state: bool) -> Option<&'static str> {
         }
         if matches!(*component, ".netrc" | ".npmrc" | ".git-credentials") {
             return Some("credential-file");
+        }
+        // Only the last component: files below a `credentials/` directory stay reachable.
+        if index + 1 == components.len() && matches!(*component, "credentials" | "credentials.toml")
+        {
+            return Some("credentials or credentials.toml");
         }
         if component.starts_with("id_rsa") {
             return Some("id_rsa*");

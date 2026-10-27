@@ -136,6 +136,10 @@ fn every_notification_has_one_fixed_envelope() {
             json!({"approval_id":"a1","command":"echo ok","rule":"shell"}),
         ),
         (
+            "approval.requested",
+            json!({"approval_id":"a2","command":"curl example.com","rule":"network-requested","network":true}),
+        ),
+        (
             "approval.resolved",
             json!({"approval_id":"a1","approved":false}),
         ),
@@ -229,6 +233,23 @@ fn method_results_and_all_application_errors_round_trip() {
         "session_id":"s1", "seq":0,
         "memory":memory_status()
     }));
+    for (state, detail) in [
+        ("on", "seatbelt"),
+        ("off", "ELEFANTE_SANDBOX=0"),
+        ("unavailable", "bubblewrap is unavailable"),
+    ] {
+        let created = round_trip::<CreateResult>(json!({
+            "session_id":"s1", "seq":0,
+            "sandbox":{"state":state,"detail":detail}
+        }));
+        assert_eq!(created.sandbox.unwrap().detail, detail);
+    }
+    assert!(
+        serde_json::from_value::<CreateResult>(
+            json!({"session_id":"s1","seq":0,"sandbox":{"state":"partial","detail":""}})
+        )
+        .is_err()
+    );
     round_trip::<MemoryConsentResult>(json!({"consent":"granted"}));
     round_trip::<MemoryStatus>(memory_status());
     round_trip::<MemoryListResult>(json!({"notes":[{
@@ -295,6 +316,30 @@ fn attach_uses_full_envelopes_and_one_tool_shape_everywhere() {
         "kind":"snapshot", "seq":981, "snapshot":snapshot,
         "memory":memory_status()
     }));
+    let sandbox = json!({"state":"unavailable","detail":"sandbox probe failed"});
+    round_trip::<AttachResult>(json!({"kind":"resumed","from":413,"events":[],"sandbox":sandbox}));
+    let mut networked = snapshot.clone();
+    networked["active_turn"]["pending_approval"]["network"] = json!(true);
+    networked["sandbox"] = sandbox.clone();
+    let AttachResult::Snapshot {
+        snapshot: restored,
+        sandbox: attached,
+        ..
+    } = round_trip::<AttachResult>(
+        json!({"kind":"snapshot","seq":981,"snapshot":networked,"sandbox":sandbox}),
+    )
+    else {
+        panic!("expected a snapshot");
+    };
+    assert!(
+        restored
+            .active_turn
+            .unwrap()
+            .pending_approval
+            .unwrap()
+            .network
+    );
+    assert_eq!(restored.sandbox, attached);
     snapshot["active_turn"]["pending_approval"] = Value::Null;
     round_trip::<SessionSnapshot>(snapshot.clone());
     snapshot["active_turn"] = Value::Null;

@@ -2,7 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, parseMemoryList, type CreateResult, type MemoryRow, type MemorySeed } from "./protocol";
+import { OlderDaemonError, RpcClient, RpcError, connectOrExplain, isMemoryStatus, parseConsentResult, parseCreate, parseMemoryList, type CreateResult, type MemoryRow, type MemorySeed } from "./protocol";
 import type { Command } from "./commands";
 import { learningLine } from "./memoryView";
 import { initialSession, reduceSession, restoreSnapshot } from "./session";
@@ -40,6 +40,7 @@ let retryPrompt = "";
 let stopped = false;
 let reconnecting = false;
 let consentPrompt: MemorySeed | null = null;
+const answered = new Set<string>();   // approvals the user answered, hidden before the daemon confirms
 let panel: { rows: MemoryRow[] | null; error: string | null; busy: boolean } | null = null;
 let notice: string | null = null;
 let timer: ReturnType<typeof setInterval>;
@@ -85,7 +86,7 @@ async function command(c: Exclude<Command, { kind: "prompt" }>) {
 }
 function draw() {
   if (stopped) return;
-  const approval = state.active_turn?.pending_approvals[0];
+  const approval = state.active_turn?.pending_approvals.find(a => !answered.has(a.approval_id));
   let modal: ModalProps | null = null;
   if (panel) modal = { kind: "memory", cwd: state.cwd, rows: panel.rows, error: panel.error, learning: learningLine(state.memory), extractor: state.memory?.extractor ?? null, busy: panel.busy, onForget: id => void forgetNote(id), onClose: () => { panel = null; draw(); } };
   else if (consentPrompt) modal = { kind: "consent", extractor: consentPrompt.extractor!, sameModel: consentPrompt.extractor === state.model, busy, onDecision: async decision => {
@@ -103,11 +104,14 @@ function draw() {
     catch (error) { fail(error); }
     finally { busy = false; draw(); }
   } };
-  else if (approval) modal = { kind: "approval", approval, busy, onDecision: async decision => {
-    busy = true; draw();
+  else if (approval) modal = { kind: "approval", approval, onDecision: async decision => {
+    // Hide the question now. The daemon's approval.resolved arrives after the reply.
+    answered.add(approval.approval_id); message = null; draw();
     try { await rpc.request("session.resolve_approval", { session_id: state.session_id, approval_id: approval.approval_id, decision }); }
-    catch (error) { fail(error); }
-    finally { busy = false; draw(); }
+    catch (error) {
+      // -32005: someone already resolved it, so there is nothing left to answer.
+      if (!(error instanceof RpcError && error.code === -32005)) { answered.delete(approval.approval_id); fail(error); }
+    }
   } };
   // Publish, never re-render: `root.render()` remounts the tree on every call, so calling it
   // per update leaked one keypress listener each time — four a second, unbounded.
@@ -124,6 +128,7 @@ async function recover() {
       connected = true; message = null;
       // The snapshot callback restored state with the old status; the attach result's is current.
       // A consent question already asked (or put off) is not reopened, only closed if answered elsewhere.
+      if (attached?.sandbox) state = { ...state, sandbox: attached.sandbox };
       if (isMemoryStatus(attached?.memory)) {
         state = { ...state, memory: attached.memory };
         if (attached.memory.consent !== "unset") consentPrompt = null;
@@ -131,6 +136,7 @@ async function recover() {
     }
     catch (error) {
       if (error instanceof RpcError && error.code === -32001) { message = "Session no longer exists. Restart elefante to create a new session."; break; }
+      if (error instanceof OlderDaemonError || error instanceof RpcError && error.code === -32008) { message = error.message; break; }
     }
   }
   reconnecting = false;
@@ -146,6 +152,8 @@ try {
   const attached = await rpc.attach(created.session_id, note => { state = reduceSession(state, note, Date.now()); draw(); }, snapshot => { state = restoreSnapshot(snapshot, Date.now(), state.effort, state.memory, state.memory_lines); draw(); });
   const memory = attached.memory ?? created.memory;
   if (isMemoryStatus(memory)) state = { ...state, memory };
+  const sandbox = attached.sandbox ?? created.sandbox;
+  if (sandbox) state = { ...state, sandbox };
   if (memory?.consent === "unset" && memory.extractor !== null) consentPrompt = memory;
   timer = setInterval(draw, 250);
   draw();                 // seeds the store before the first read

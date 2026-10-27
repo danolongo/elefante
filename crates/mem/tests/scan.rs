@@ -12,7 +12,7 @@ use std::{
 use elefante_mem::{
     Counters, RepoId, Store,
     diff::{RACY_WINDOW_NS, diff},
-    hash::{BINARY_SNIFF_BYTES, hash_files, read_and_hash},
+    hash::{BINARY_SNIFF_BYTES, hash_files},
     state::{self, StateRow},
     walk::{Walk, WalkedFile, walk, walk_limited},
 };
@@ -384,32 +384,40 @@ fn file_state_round_trips_including_the_skip_flag() {
 #[test]
 fn hashing_matches_the_reference_and_detects_binaries_at_the_sniff_boundary() {
     let tmp = tempfile::tempdir().unwrap();
-    let write = |name: &str, bytes: &[u8]| {
-        let path = tmp.path().join(name);
-        fs::write(&path, bytes).unwrap();
-        path
+    let write = |name: &str, bytes: &[u8]| fs::write(tmp.path().join(name), bytes).unwrap();
+    let hash = |name: &str| {
+        let file = WalkedFile {
+            path: name.into(),
+            size: 0,
+            mtime_ns: 0,
+        };
+        hash_files(tmp.path(), &[file], &Counters::default())
+            .pop()
+            .expect("one result per file")
     };
 
-    let text = write("t.txt", b"hello");
-    let hashed = read_and_hash(&text).unwrap();
+    write("t.txt", b"hello");
+    let hashed = hash("t.txt").unwrap();
     assert_eq!(hashed.blake3, *blake3::hash(b"hello").as_bytes());
     assert!(!hashed.binary);
     assert_eq!(hashed.bytes, b"hello");
 
     let mut inside = vec![b'a'; BINARY_SNIFF_BYTES];
     inside[BINARY_SNIFF_BYTES - 1] = 0;
-    let inside = read_and_hash(&write("in.bin", &inside)).unwrap();
+    write("in.bin", &inside);
+    let inside = hash("in.bin").unwrap();
     assert!(inside.binary && inside.bytes.is_empty());
 
     let mut outside = vec![b'a'; BINARY_SNIFF_BYTES + 1];
     outside[BINARY_SNIFF_BYTES] = 0;
-    let outside = read_and_hash(&write("out.txt", &outside)).unwrap();
+    write("out.txt", &outside);
+    let outside = hash("out.txt").unwrap();
     assert!(
         !outside.binary,
         "a NUL past the sniff window does not make a file binary"
     );
 
-    assert!(read_and_hash(&tmp.path().join("missing")).is_err());
+    assert!(hash("missing").is_err());
 }
 
 #[test]

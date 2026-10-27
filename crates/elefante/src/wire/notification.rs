@@ -2,6 +2,11 @@ use super::{MemoryChange, MemoryNote, MemoryStatus, StopReason, Usage, encode_fr
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(super) fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Sequence {
@@ -177,6 +182,8 @@ pub enum NotificationEvent {
         approval_id: String,
         command: String,
         rule: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        network: bool,
     },
     #[serde(rename = "approval.resolved")]
     ApprovalResolved { approval_id: String, approved: bool },
@@ -229,6 +236,8 @@ enum KnownNotificationEvent {
         approval_id: String,
         command: String,
         rule: String,
+        #[serde(default)]
+        network: bool,
     },
     #[serde(rename = "approval.resolved")]
     ApprovalResolved { approval_id: String, approved: bool },
@@ -282,10 +291,12 @@ impl From<KnownNotificationEvent> for NotificationEvent {
                 approval_id,
                 command,
                 rule,
+                network,
             } => Self::ApprovalRequested {
                 approval_id,
                 command,
                 rule,
+                network,
             },
             KnownNotificationEvent::ApprovalResolved {
                 approval_id,

@@ -13,8 +13,8 @@ subprocess.
 | `src/bash.rs` | 458 | `BashClassifier` — tree-sitter full-parse-tree shell classification. |
 | `src/path.rs` | 356 | `PathPolicy` — repository-bound path resolution and secret denial. |
 | `src/scrub.rs` | 56 | `Scrubber` — credential redaction over untrusted output. |
-| `src/sandbox.rs` | 670 | `Policy`, `validate_root`, the Seatbelt renderer `seatbelt_profile`, the bubblewrap renderer `bwrap_args`, `seccomp_programs` (Linux only) and the cleared `environment`. |
-| `src/git.rs` | 448 | The write-git router `route`, the harness `invocation`, and `hardened`, the base invocation for trusted git reads. |
+| `src/sandbox.rs` | 618 | `Policy`, `validate_root`, the Seatbelt renderer `seatbelt_profile`, the bubblewrap renderer `bwrap_args`, `seccomp_programs` (Linux only) and the cleared `environment`. |
+| `src/git.rs` | 445 | The write-git router `route`, the harness `invocation`, and `hardened`, the base invocation for trusted git reads. |
 
 `bash.rs` and `git.rs` share the list of write subcommands, so the classifier and the router agree
 on what a git read is. `bash.rs` also reuses `path::built_in_secret_rule`, so a shell argument
@@ -76,8 +76,9 @@ before every deny. `Policy::validate` runs first in both renderers. It refuses:
   the device nodes and the resolver directory;
 - a private temp directory that overlaps the root.
 
-`bwrap_args` also refuses an environment variable outside its
-allowlist and anything other than two distinct seccomp descriptors above stderr.
+`bwrap_args` always passes `--add-seccomp-fd 3 --add-seccomp-fd 4`; the caller's launcher opens
+those descriptors. The caller fills `Policy::runtime_dir`, so the renderer reads no process
+environment.
 
 **The git router routes only literal commands.** `route` routes a write only when the whole call is
 one plain `git` command of literal words or single-quoted strings. Each write subcommand has an

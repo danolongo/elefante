@@ -166,6 +166,8 @@ pub struct Policy {
     pub read_only: Vec<PathBuf>,
     pub hidden: Vec<HiddenPath>,
     pub network: Network,
+    /// The host's absolute `XDG_RUNTIME_DIR`. No readable mount may reach into it.
+    pub runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,10 +194,6 @@ pub enum RootError {
     ProtectedMount(PathBuf),
     #[error("private sandbox temp must be outside the workspace")]
     InvalidTemp,
-    #[error("bubblewrap requires two distinct inherited seccomp descriptors above stderr")]
-    InvalidSeccompDescriptors,
-    #[error("sandbox environment contains an unsafe or duplicate variable: {0}")]
-    UnsafeEnvironment(String),
 }
 
 /// Checks canonical paths supplied by the session creator.
@@ -254,7 +252,6 @@ impl Policy {
         &self,
         source: impl IntoIterator<Item = (OsString, OsString)>,
         tool_bin_dirs: &[PathBuf],
-        sandboxed: bool,
     ) -> Result<Vec<(OsString, OsString)>, RootError> {
         self.validate()?;
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -271,20 +268,18 @@ impl Policy {
             }
         }
         let joined = std::env::join_paths(dirs).map_err(|_| RootError::InvalidPath)?;
-        let mut vars = environment(source, sandboxed);
+        let mut vars = environment(source, true);
         vars.retain(|(key, _)| key != "PATH" && key != "HOME" && key != "TMPDIR");
-        vars.push(("PATH".into(), joined));
-        if sandboxed {
-            let home = if cfg!(target_os = "linux") {
-                PathBuf::from("/tmp/home")
-            } else {
-                self.temp.join("home")
-            };
-            vars.extend([
-                ("HOME".into(), home.into_os_string()),
-                ("TMPDIR".into(), self.temp.as_os_str().into()),
-            ]);
-        }
+        let home = if cfg!(target_os = "linux") {
+            PathBuf::from("/tmp/home")
+        } else {
+            self.temp.join("home")
+        };
+        vars.extend([
+            ("PATH".into(), joined),
+            ("HOME".into(), home.into_os_string()),
+            ("TMPDIR".into(), self.temp.as_os_str().into()),
+        ]);
         for (key, fallback) in [
             ("CARGO_HOME", self.temp.join("cargo")),
             ("RUSTUP_HOME", self.temp.join("rustup")),
@@ -373,8 +368,10 @@ impl Policy {
             || under("/var/run")
             || under("/private/var/run")
             || under("/dev") && !device
-            || std::env::var_os("XDG_RUNTIME_DIR")
-                .is_some_and(|dir| Path::new(&dir).is_absolute() && path.starts_with(dir))
+            || self
+                .runtime_dir
+                .as_ref()
+                .is_some_and(|dir| path.starts_with(dir))
             || self.home.starts_with(path)
             || overlaps(path, &self.harness_dir)
             || self.protected.iter().any(|secret| overlaps(path, secret))
@@ -480,25 +477,16 @@ pub struct LaunchSpec {
     pub bash: PathBuf,
     pub command: OsString,
     pub environment: Vec<(OsString, OsString)>,
-    /// Inheritable descriptors prepared by the caller; repeated `--add-seccomp-fd` is required.
-    pub seccomp_fds: Vec<u32>,
 }
 
-/// Renders bubblewrap arguments, preserving mount overlay order.
+/// Renders bubblewrap arguments, preserving mount overlay order. bubblewrap reads the two
+/// seccomp programs from descriptors 3 and 4, which the launcher opens.
 ///
 /// # Errors
 /// Rejects invalid policy or executable paths.
 pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>, RootError> {
     policy.validate()?;
     validate_path(&launch.bash)?;
-    validate_bwrap_environment(policy, &launch.environment)?;
-    if launch.seccomp_fds.len() != 2
-        || launch.seccomp_fds[0] <= 2
-        || launch.seccomp_fds[1] <= 2
-        || launch.seccomp_fds[0] == launch.seccomp_fds[1]
-    {
-        return Err(RootError::InvalidSeccompDescriptors);
-    }
     let mut args: Vec<OsString> = [
         "--unshare-user",
         "--disable-userns",
@@ -566,57 +554,17 @@ pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>,
         args.extend(["--setenv".into(), key.clone(), value.clone()]);
     }
     args.extend(["--chdir".into(), policy.root.as_os_str().into()]);
-    for fd in &launch.seccomp_fds {
-        args.extend(["--add-seccomp-fd".into(), fd.to_string().into()]);
-    }
     args.extend([
+        "--add-seccomp-fd".into(),
+        "3".into(),
+        "--add-seccomp-fd".into(),
+        "4".into(),
         "--".into(),
         launch.bash.as_os_str().into(),
         "-c".into(),
         launch.command.clone(),
     ]);
     Ok(args)
-}
-
-fn validate_bwrap_environment(
-    policy: &Policy,
-    environment: &[(OsString, OsString)],
-) -> Result<(), RootError> {
-    let mut seen = std::collections::HashSet::new();
-    for (key, value) in environment {
-        let Some(name) = key.to_str() else {
-            return Err(RootError::UnsafeEnvironment(
-                key.to_string_lossy().escape_debug().to_string(),
-            ));
-        };
-        let allowed = matches!(
-            name,
-            "PATH"
-                | "LANG"
-                | "LC_ALL"
-                | "TERM"
-                | "CARGO_HOME"
-                | "RUSTUP_HOME"
-                | "HOME"
-                | "TMPDIR"
-                | "GIT_OPTIONAL_LOCKS"
-                | "GIT_CONFIG_GLOBAL"
-                | "GIT_CONFIG_NOSYSTEM"
-        );
-        let expected = match name {
-            "TERM" => Some(OsString::from("dumb")),
-            "HOME" => Some(OsString::from("/tmp/home")),
-            "TMPDIR" => Some(policy.temp.as_os_str().to_owned()),
-            "GIT_OPTIONAL_LOCKS" => Some(OsString::from("0")),
-            "GIT_CONFIG_GLOBAL" => Some(OsString::from("/dev/null")),
-            "GIT_CONFIG_NOSYSTEM" => Some(OsString::from("1")),
-            _ => None,
-        };
-        if !allowed || !seen.insert(name) || expected.is_some_and(|expected| *value != expected) {
-            return Err(RootError::UnsafeEnvironment(name.to_owned()));
-        }
-    }
-    Ok(())
 }
 
 fn mount(args: &mut Vec<OsString>, flag: &str, source: &Path, target: &Path) {

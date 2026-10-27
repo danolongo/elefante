@@ -220,8 +220,8 @@ fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Polic
         }
         protected.push(path);
     }
-    if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let directory = PathBuf::from(directory);
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    if let Some(directory) = &runtime_dir {
         protected.push(directory.join("elefante.sock"));
         protected.push(directory.join("token"));
     }
@@ -236,6 +236,7 @@ fn base_policy(root: &Path, home: PathBuf, harness_dir: PathBuf) -> Result<Polic
         read_only: Vec::new(),
         hidden: Vec::new(),
         network: Network::Off,
+        runtime_dir: runtime_dir.filter(|directory| directory.is_absolute()),
     })
 }
 
@@ -632,7 +633,7 @@ impl SessionSandbox {
             .map(|path| ("RUSTUP_HOME".into(), path.as_os_str().to_owned()));
         let environment = if sandboxed {
             policy
-                .environment(env_source, &self.tool_dirs, true)
+                .environment(env_source, &self.tool_dirs)
                 .map_err(|error| error.to_string())?
         } else {
             self.disabled_environment()?
@@ -670,7 +671,6 @@ impl SessionSandbox {
                         bash: self.bash.clone(),
                         command: source.into(),
                         environment: environment.clone(),
-                        seccomp_fds: vec![3, 4],
                     };
                     let args =
                         sandbox::bwrap_args(&policy, &spec).map_err(|error| error.to_string())?;

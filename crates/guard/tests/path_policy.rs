@@ -62,11 +62,17 @@ fn denies_traversal_and_secret_variants() {
         "sub/.elefante/anything",
         ".elefante",
         "sub/.elefante",
+        "credentials",
+        "deploy/credentials.toml",
     ] {
         assert!(
             matches!(policy.resolve(path), Err(PolicyError::Denied { .. })),
             "{path}"
         );
+    }
+    // Positive controls: a source file and a directory that only share the name stay reachable.
+    for path in ["src/credentials.rs", "credentials/notes.md"] {
+        assert!(policy.resolve(path).is_ok(), "{path}");
     }
 }
 
@@ -222,6 +228,8 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         ".netrc",
         ".npmrc",
         ".git-credentials",
+        "credentials",
+        "src/credentials.toml",
     ] {
         assert!(PathPolicy::is_secret_path(Path::new(path)), "{path}");
     }
@@ -235,7 +243,8 @@ fn lexical_secret_check_agrees_with_resolve_on_names() {
         ".elefanteish/x",
         ".aws/config",
         ".cargo/config.toml",
-        "src/credentials.toml",
+        "src/credentials.rs",
+        "credentials/notes.md",
     ] {
         // `.envrc.md.bak` is a directory name that merely begins with `.env`; it does not match
         // `.env` exactly nor `.env.` prefix, so it must stay indexable.

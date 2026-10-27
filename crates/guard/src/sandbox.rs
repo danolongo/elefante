@@ -379,15 +379,10 @@ impl Policy {
                 .hidden
                 .iter()
                 .any(|secret| overlaps(path, &secret.path))
+            || crate::path::built_in_secret_rule(path).is_some()
             || path
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".elefante")))
-            || path.file_name().is_some_and(|name| {
-                matches!(
-                    name.to_str(),
-                    Some("credentials" | "credentials.toml" | "token" | "daemon.sock")
-                )
-            })
+                .file_name()
+                .is_some_and(|name| matches!(name.to_str(), Some("token" | "daemon.sock")))
     }
 }
 
@@ -399,15 +394,11 @@ fn overlaps(left: &Path, right: &Path) -> bool {
 const ROOT_DENIES: &str = concat!(
     r#"(deny file-write* (require-all (subpath (param "ROOT")) (regex #"/\.[Gg][Ii][Tt](/|$)")))"#,
     "\n",
-    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/(\.env(\.[^/]*)?|\.netrc|\.npmrc|\.git-credentials|id_rsa[^/]*|[^/]*\.[Pp][Ee][Mm]|[^/]*\.[Kk][Ee][Yy])(/|$)")))"#,
+    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/(\.env(\.[^/]*)?|\.netrc|\.npmrc|\.git-credentials|credentials(\.toml)?|id_rsa[^/]*|[^/]*\.[Pp][Ee][Mm]|[^/]*\.[Kk][Ee][Yy])(/|$)")))"#,
     "\n",
     r#"(deny file-read* file-write* (require-all (subpath (param "ROOT")) (regex #"/\.elefante(/|$)")))"#,
     "\n",
     r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.ssh(/|$)")))"#,
-    "\n",
-    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.aws/credentials(/|$)")))"#,
-    "\n",
-    r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.cargo/credentials(\.toml)?(/|$)")))"#,
     "\n",
 );
 

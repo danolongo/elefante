@@ -476,7 +476,7 @@ This decides whether the whole subsystem works. LLM memory fails by accumulating
 
 ### Secret protection — four layers, none sufficient alone
 
-1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
+1. **`PathPolicy` at the tool path resolver.** Every filesystem tool calls `policy.resolve(path)?`, which canonicalizes *then* matches — defeating `foo/../.env` and symlinks. It lives in `tools`, directly above the syscall, so a newly added tool cannot accidentally bypass it. Set: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `.git-credentials`, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, a final `credentials` or `credentials.toml`, `.ssh/**`, user-extensible. Applies to read, glob, **and grep** — grep is the one people forget, and it leaks contents just as readily.
 2. **Bash gate rules** for `cat .env`, `source .env`, `env`, `printenv`.
 3. **`Scrubber` on every tool result** — `sk-ant-` prefixes, AWS key shapes, PEM blocks, `TOKEN=`/`SECRET=`/`PASSWORD=` assignments. This is the layer that actually holds, because shell bypasses are unbounded (`cat .e''nv`) and cannot be enumerated.
 4. **The same `Scrubber` gates memory writes.** Without this, a leaked secret is persisted into the graph permanently — strictly worse than transient context exposure. Two call sites, one implementation, no drift.
@@ -590,7 +590,9 @@ that phase can pass its gate.
   sandbox unavailable. The per-session temp directory is private (`0700`), outside the root and
   harness state. Readable paths are the root, system directories and exact executable/toolchain
   directories, never `$HOME` or a whole tool root. `.git` directories and validated gitdir targets
-  are read-only; `.elefante`, secret names and Cargo credentials are hidden. Linux mounts exact
+  are read-only. The root scan hides `.elefante` and every name on the `PathPolicy` secret list,
+  inside `target/` and `node_modules/` too; the Seatbelt name rules repeat that list as a kernel
+  backstop, and a test checks that they cover it. Linux mounts exact
   resolver files, not all of `/etc`, so approved DNS can use libc. Hidden paths carry an explicit
   file/directory kind so rendering performs no filesystem lookup. The home,
   harness directory and exact socket/token paths let renderers reject overlapping readable

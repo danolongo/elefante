@@ -15,7 +15,7 @@ filesystem, to append to the `ELEFANTE_LEARN_LOG` file.
 | `src/learn.rs` | 1017 | `Learner`, `LearnConfig`, and the `LearnSink` it reports to. |
 | `src/memory.rs` | 138 | `MemContext` and `MemSearchTool` — the repository index as a source of context and as the backing for `memory_search`. |
 | `src/tools.rs` | 821 | `ToolExecutor`, the eight tool implementations, `definitions()`, the `MemorySearch` and `WebSearch` traits, and the input structs each tool decodes. Formerly the `elefante-tools` crate. |
-| `src/sandbox.rs` | 1058 | `Sandbox` (the host state), `probe`, `SessionSandbox` (one session's policy, root scan, lock and launch), `run_process` with its timeout and output cap, and the temp-directory sweep. |
+| `src/sandbox.rs` | 1188 | `Sandbox` (the host state), `probe`, `SessionSandbox` (one session's policy, root scan, lock and launch), `run_process` with its timeout and output cap, and the temp-directory sweep. |
 | `src/harness_git.rs` | 294 | `HarnessGit`: the repository preflight and the launch of one approved git write. |
 | `src/file_access.rs` | 160 | `FileAccess`: root-descriptor-relative reads and rename writes for the file tools. |
 
@@ -185,7 +185,8 @@ tools.sandbox_state();                               // Seatbelt | Bubblewrap | 
   state. `ToolExecutor::new` builds a `SessionSandbox`, which validates the root, creates the
   private temp directory and resolves `bash` and `git` from fixed system directories.
 - **The root scan runs before every command.** An unpruned walk finds every `.git` in any case and
-  validates `gitdir` and `commondir` targets; a name scan finds secrets. Any unreadable directory
+  validates `gitdir` and `commondir` targets. `PathPolicy::is_secret_path` judges each entry name,
+  so the scan and the file tools share one secret list. Any unreadable directory
   or unsupported git indirection fails the command.
 - **The launcher is the fixed `bash`.** Its script closes every inherited descriptor above stderr,
   then execs `sandbox-exec` or bubblewrap. On Linux it first reopens the two seccomp memory files
@@ -253,7 +254,7 @@ control. A missing sandbox fails them with setup advice; they never skip.
 
 | File | Tests | Covers |
 |---|---:|---|
-| `tests/sandbox.rs` | 29, plus 9 Linux-only | Secrets, outside paths, `.git`, network off and approved, sockets, the key, descriptors, links, lifetime, output caps, root validation, and on Linux seccomp, quarantine and orphans. |
+| `tests/sandbox.rs` | 32, plus 9 Linux-only and 1 macOS-only | Secrets, outside paths, `.git`, network off and approved, sockets, the key, descriptors, links, lifetime, output caps, root validation, on Linux seccomp, quarantine and orphans, and on macOS descendants that leave the process group. |
 | `tests/harness_git.rs` | 9 | A commit with hooks off, the preflight refusals (late repository, attribute drivers, in-root config targets, configured drivers), and the timeout. |
 | `tests/harness_route.rs` | 4 | Approved writes through the harness, read git in the sandbox, a `.git` session root, the read-only `.git` hint, and `git diff --output` outside the root. |
 | `tests/tool_gate.rs` | 3 | The bash gate order, `Disabled` and `Unavailable`, and `git-identity-missing`. |

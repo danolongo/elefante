@@ -1,8 +1,12 @@
+use elefante_guard::PathPolicy;
 use elefante_guard::sandbox::{
     HiddenKind, HiddenPath, LaunchSpec, Network, Policy, bwrap_args, environment, seatbelt_profile,
     validate_root,
 };
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 fn policy() -> Policy {
     Policy {
@@ -103,8 +107,6 @@ fn seatbelt_never_interpolates_paths_and_rejects_injection() {
     assert!(params.iter().any(|(_, value)| value == p.root.as_os_str()));
     assert!(profile.contains("(deny default)"));
     assert!(profile.contains(r#"regex #"/\.ssh(/|$)""#));
-    assert!(profile.contains(r#"regex #"/\.aws/credentials(/|$)""#));
-    assert!(profile.contains(r#"regex #"/\.cargo/credentials(\.toml)?(/|$)""#));
     assert_eq!(profile, include_str!("snapshots/seatbelt.sb"));
     for name in [
         "/work/quote\"",
@@ -115,6 +117,58 @@ fn seatbelt_never_interpolates_paths_and_rejects_injection() {
         let mut p = policy();
         p.root = name.into();
         assert!(seatbelt_profile(&p).is_err());
+    }
+}
+
+#[test]
+fn seatbelt_name_denies_cover_every_shared_secret_name() {
+    let (profile, _) = seatbelt_profile(&policy()).unwrap();
+    let denies: Vec<regex::Regex> = profile
+        .lines()
+        .filter(|line| line.starts_with("(deny file-read*"))
+        .filter_map(|line| line.split_once("(regex #\"")?.1.split_once("\")"))
+        .map(|(pattern, _)| regex::Regex::new(pattern).expect("Seatbelt regex"))
+        .collect();
+    let regex_denies = |name: &str| {
+        denies
+            .iter()
+            .any(|deny| deny.is_match(&format!("/work/project[1]/{name}")))
+    };
+    // One or more names for each rule of the shared list in `PathPolicy`.
+    for name in [
+        ".ssh",
+        "sub/.ssh/config",
+        ".aws/credentials",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".elefante",
+        ".elefante/credentials.toml",
+        ".env",
+        "app/.env.production",
+        ".netrc",
+        ".npmrc",
+        ".git-credentials",
+        "credentials",
+        "deploy/credentials.toml",
+        "id_rsa",
+        "keys/id_rsa.pub",
+        "server.pem",
+        "Server.PEM",
+        "private.key",
+        "private.KEY",
+    ] {
+        assert!(PathPolicy::is_secret_path(Path::new(name)), "{name}");
+        assert!(regex_denies(name), "the Seatbelt regex misses {name}");
+    }
+    // Positive controls: ordinary names pass both checks.
+    for name in [
+        "src/lib.rs",
+        "src/credentials.rs",
+        "environment.rs",
+        "docs/keys.md",
+    ] {
+        assert!(!PathPolicy::is_secret_path(Path::new(name)), "{name}");
+        assert!(!regex_denies(name), "{name}");
     }
 }
 

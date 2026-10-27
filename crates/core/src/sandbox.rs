@@ -1,4 +1,5 @@
 //! Fail-closed shell launch and bounded process output.
+use elefante_guard::PathPolicy;
 use elefante_guard::sandbox::{self, HiddenKind, HiddenPath, Network, Policy};
 use std::{collections::VecDeque, ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 use std::{
@@ -550,23 +551,7 @@ impl SessionSandbox {
                     && !in_git_metadata
                     && !skip_links
                     && entry.metadata().map_err(|error| error.to_string())?.nlink() > 1;
-                let secret = hard_link
-                    || (name == ".elefante"
-                        || name == ".ssh"
-                        || name == ".env"
-                        || name.starts_with(".env.")
-                        || matches!(
-                            name.as_ref(),
-                            ".netrc"
-                                | ".npmrc"
-                                | ".git-credentials"
-                                | "credentials"
-                                | "credentials.toml"
-                        )
-                        || name.starts_with("id_rsa")
-                        || name.to_ascii_lowercase().ends_with(".pem")
-                        || name.to_ascii_lowercase().ends_with(".key"));
-                if secret {
+                if hard_link || PathPolicy::is_secret_path(Path::new(name.as_ref())) {
                     policy.hidden.push(HiddenPath {
                         path: path.clone(),
                         kind: if kind.is_dir() {

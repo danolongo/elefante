@@ -1061,9 +1061,9 @@ gets `/dev/null` on stdin and its own process group.
 - Seatbelt applies the last matching rule. The profile therefore emits every allow before every
   deny, so no later allow can cancel a `.git`, secret or hidden-path deny.
 - Name rules under the root deny `.git` writes in any case, and reads of `.env*`, `.netrc`,
-  `.npmrc`, `.git-credentials`, `id_rsa*`, `*.pem`, `*.key`, `.ssh`, `.aws/credentials`,
-  `.cargo/credentials{,.toml}` and `.elefante`. These rules also cover files a command creates
-  after the scan.
+  `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem`, `*.key`,
+  `.ssh` and `.elefante`. These rules also cover files a command creates after the scan. A guard
+  test checks that the rules match every name of the `PathPolicy` secret list.
 - Network off allows no network at all, not even host loopback. Unix sockets work only under the
   root and the session temp directory.
 - Approved network adds outbound TCP and UDP and the system mDNSResponder socket. Unix sockets
@@ -1113,7 +1113,7 @@ it rescans the root and refreshes `read_only` and `hidden`.
 | `readable` | Exact system paths: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/System/Library`, `/Library/Apple`, the Command Line Tools, `/private/etc`, `/private/var/db/dyld`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, and the resolver files `/etc/resolv.conf`, `/etc/nsswitch.conf` and `/etc/hosts`. Also `/dev/null`, `/dev/random` and `/dev/urandom`; the directories of the resolved `bash` and `git`; the Cargo and Bun `bin` directories; the Cargo registry; and the selected rustup toolchain with its settings file. Only paths that exist enter the list. |
 | `writable` | Empty. Only `root` and `temp` are writable. |
 | `read_only` | Every `.git` entry in the root, in any case, from an unpruned walk; the validated `gitdir` and `commondir` targets; and any in-root `core.hooksPath` or include target, including one that an enclosing repository's config names. A `gitdir` or `commondir` that points outside the root and the session's initial repository makes the command fail. |
-| `hidden` | Names the scan finds under the root: `.elefante`, `.ssh`, `.env`, `.env.*`, `.netrc`, `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem` and `*.key`, plus every hard-linked regular file outside `.git`, `target/` and `node_modules/`. |
+| `hidden` | Every entry under the root whose name `PathPolicy::is_secret_path` matches: `.elefante`, `.ssh`, `.env`, `.env.*`, `.netrc`, `.npmrc`, `.git-credentials`, `credentials`, `credentials.toml`, `id_rsa*`, `*.pem` and `*.key`. Also every hard-linked regular file outside `.git`, `target/` and `node_modules/`. |
 | `protected` | The socket and token paths: `~/.elefante/run/{elefante.sock,token}`, `$XDG_RUNTIME_DIR/{elefante.sock,token}`, and `ELEFANTE_SOCKET` with the `token` beside it. Never readable. |
 | `network` | `Off`, or `Approved` for one call. |
 
@@ -1214,8 +1214,8 @@ while `alias -> .env` must also be denied. New filesystem tools must call policy
 before the syscall and must not accept pre-resolved paths from untrusted input.
 
 Built-in protected paths include `.env`, `.env.*`, private-key extensions, `id_rsa*`, common
-credential files, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, and
-`.ssh/**`. A caller can add custom repository-relative globs when it constructs a policy.
+credential files, `.aws/credentials`, `.cargo/credentials`, `.cargo/credentials.toml`, a final
+component named `credentials` or `credentials.toml`, and `.ssh/**`. A caller can add custom repository-relative globs when it constructs a policy.
 `resolve_for_write` also refuses any `.git` component, in any case.
 
 The daemon's file tools open the resolved path relative to a root descriptor, without following

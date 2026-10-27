@@ -11,9 +11,9 @@ subprocess.
 |---|---:|---|
 | `src/lib.rs` | 13 | Module declarations, the public `git` and `sandbox` modules, and the three re-exports. Nothing else. |
 | `src/bash.rs` | 458 | `BashClassifier` — tree-sitter full-parse-tree shell classification. |
-| `src/path.rs` | 356 | `PathPolicy` — repository-bound path resolution and secret denial. |
+| `src/path.rs` | 361 | `PathPolicy` — repository-bound path resolution and secret denial. |
 | `src/scrub.rs` | 56 | `Scrubber` — credential redaction over untrusted output. |
-| `src/sandbox.rs` | 618 | `Policy`, `validate_root`, the Seatbelt renderer `seatbelt_profile`, the bubblewrap renderer `bwrap_args`, `seccomp_programs` (Linux only) and the cleared `environment`. |
+| `src/sandbox.rs` | 609 | `Policy`, `validate_root`, the Seatbelt renderer `seatbelt_profile`, the bubblewrap renderer `bwrap_args`, `seccomp_programs` (Linux only) and the cleared `environment`. |
 | `src/git.rs` | 445 | The write-git router `route`, the harness `invocation`, and `hardened`, the base invocation for trusted git reads. |
 
 `bash.rs` and `git.rs` share the list of write subcommands, so the classifier and the router agree
@@ -78,7 +78,8 @@ before every deny. `Policy::validate` runs first in both renderers. It refuses:
 
 `bwrap_args` always passes `--add-seccomp-fd 3 --add-seccomp-fd 4`; the caller's launcher opens
 those descriptors. The caller fills `Policy::runtime_dir`, so the renderer reads no process
-environment.
+environment. The Seatbelt name rules repeat the `PathPolicy` secret list, and a test checks that
+they cover it.
 
 **The git router routes only literal commands.** `route` routes a write only when the whole call is
 one plain `git` command of literal words or single-quoted strings. Each write subcommand has an
@@ -131,7 +132,7 @@ cargo test -p elefante-guard        # no fixtures, no network
 ```
 
 Five files mirroring the modules — `tests/bash_classifier.rs` (13), `tests/path_policy.rs` (13),
-`tests/scrubber.rs` (3), `tests/sandbox_policy.rs` (16, plus one Linux-only seccomp test) and
+`tests/scrubber.rs` (3), `tests/sandbox_policy.rs` (17, plus one Linux-only seccomp test) and
 `tests/git_router.rs` (6). `sandbox_policy.rs` compares the rendered Seatbelt profile with
 `tests/snapshots/seatbelt.sb` and renders hostile path names. Nothing is `#[ignore]`d and nothing
 needs credentials; the whole crate is pure decision logic, which is the point.

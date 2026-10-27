@@ -209,6 +209,13 @@ impl ToolGate {
             let Ok(request) = tools.web_search_request(input.clone()) else {
                 return GateDecision::Allow;
             };
+            if !tools.web_search_approved() {
+                return GateDecision::Escalate {
+                    rule: "web-search-first",
+                    command: request.query,
+                    network: false,
+                };
+            }
             if !tools.reserve_web_search() {
                 return GateDecision::Escalate {
                     rule: "web-search-cap",
@@ -977,6 +984,9 @@ async fn execute_one(
             drop(slot);
             if approved {
                 let _ = clock.set(Instant::now());
+                if call.name == "web_search" {
+                    tools.approve_web_search();
+                }
                 tools
                     .execute_approved(&call.name, call.input, network)
                     .await

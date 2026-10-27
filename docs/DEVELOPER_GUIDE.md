@@ -1141,9 +1141,10 @@ It also refuses a path that is not absolute and normalized, because Seatbelt nev
 `OPENROUTER_API_KEY` never enters this environment.
 
 **Limits.** `ELEFANTE_BASH_TIMEOUT_SECS` (default 120) bounds each bash call and each harness git
-write. On expiry the process-group guard kills the group. The output reader stops 2 s after bash
-exits, so a process that holds the pipe cannot stall the turn. Bash output fits one 32 KiB budget:
-each stream keeps its head and tail, and a marker states its original size.
+write. On every exit path, expiry included, the process-group guard kills the group. On macOS it
+also kills each descendant that one `ps` snapshot links to the group. The output reader stops 2 s
+after bash exits, so a process that holds the pipe cannot stall the turn. Bash output fits one
+32 KiB budget: each stream keeps its head and tail, and a marker states its original size.
 
 **Locks.** Sessions on one root share a `RwLock`. Bash takes it shared, so parallel bash calls
 stay parallel. `write`, `edit` and harness git take it exclusively.
@@ -1186,8 +1187,10 @@ then `$XDG_CONFIG_HOME/git/config`, through `guard::git::hardened`.
   user's build, their IDE's tasks, rust-analyzer's `build.rs`, hook managers' config files
   (`.pre-commit-config.yaml`, `lefthook.yml`), or the dev-mode TUI source when the user develops
   elefante itself.
-- **Leftover processes on macOS.** A process that calls `setsid` outlives its command. It stays
-  sandboxed but keeps approved network.
+- **Leftover processes on macOS.** macOS has no PID namespace. The guard finds a descendant that
+  left the group (`setsid`, `set -m`) through its parent. A descendant whose parent exits before
+  the snapshot reparents to launchd and survives the call. It stays sandboxed but keeps approved
+  network. Linux uses the PID namespace instead.
 - **`web_search` queries leave without per-call approval**, up to the cap. The executor scrubs them
   and refuses URLs, but each query remains an outbound channel.
 - **The secret scan is name-based**, and it skips `target/` and `node_modules/`.

@@ -117,6 +117,89 @@ async fn inherited_pipe_cannot_hold_result_indefinitely() {
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 
+/// Starts a sleeper that leaves the process group with `setsid`, then waits until the sleeper
+/// writes its pid to `file`. macOS has no `setsid` command, so `perl` calls it.
+#[cfg(target_os = "macos")]
+fn escaping_sleeper(file: &std::path::Path) -> String {
+    format!(
+        "perl -MPOSIX -e 'POSIX::setsid(); open my $f, \">\", $ARGV[0] or die; print $f $$; close $f; sleep 60' '{0}' >/dev/null 2>&1 & until [ -s '{0}' ]; do sleep 0.05; done",
+        file.display()
+    )
+}
+
+#[cfg(target_os = "macos")]
+async fn sleeper_alive(file: &std::path::Path) -> (rustix::process::Pid, bool) {
+    let pid = std::fs::read_to_string(file)
+        .expect("sleeper pid file")
+        .trim()
+        .parse()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("sleeper pid");
+    // A killed sleeper stays a zombie until launchd reaps it.
+    for _ in 0..40 {
+        if rustix::process::test_kill_process(pid).is_err() {
+            return (pid, false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (pid, true)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_cleanup_kills_descendants_that_left_the_process_group() {
+    use elefante_core::sandbox::SessionSandbox;
+    use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+    use std::os::unix::process::CommandExt;
+    let root = tempfile::tempdir().expect("fixture root");
+    let root_path = root.path().canonicalize().expect("canonical fixture root");
+    // Positive control: a plain group kill leaves the setsid sleeper running.
+    let control = root_path.join("control");
+    let mut child = std::process::Command::new("/bin/bash")
+        .args(["-c", &format!("{}; wait", escaping_sleeper(&control))])
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("control shell");
+    while !std::fs::read_to_string(&control).is_ok_and(|pid| !pid.is_empty()) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let group = Pid::from_raw(i32::try_from(child.id()).expect("pid")).expect("pid");
+    kill_process_group(group, Signal::KILL).expect("group kill");
+    child.wait().expect("control shell exits");
+    let (pid, alive) = sleeper_alive(&control).await;
+    assert!(alive, "control: the setsid sleeper survived the group kill");
+    kill_process(pid, Signal::KILL).expect("control cleanup");
+
+    // Normal exit: a subshell in the group still parents the sleeper at the snapshot.
+    let session = SessionSandbox::new(&root_path).expect("session setup");
+    let normal = root_path.join("normal");
+    let output = session
+        .run_shell(
+            &format!("({}; wait) & sleep 0.2", escaping_sleeper(&normal)),
+            Network::Off,
+        )
+        .await
+        .expect("sandbox executes; enable sandbox-exec on macOS");
+    assert!(output.success, "{}", output.content);
+    assert!(!sleeper_alive(&normal).await.1, "sleeper outlived the call");
+
+    // Timeout: the command shell still parents the sleeper at the snapshot.
+    let timeout = root_path.join("timeout");
+    let error = run_process(
+        shell(&format!("{}; sleep 30", escaping_sleeper(&timeout))),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect_err("command times out");
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        !sleeper_alive(&timeout).await.1,
+        "sleeper outlived the timeout"
+    );
+}
+
 #[tokio::test]
 async fn real_sandbox_preserves_workspace_writes_and_hides_secret_names() {
     use elefante_core::sandbox::SessionSandbox;

@@ -642,9 +642,11 @@ that phase can pass its gate.
   targets are read-only in the shell. The scan also reads the config of a repository that encloses
   the root.
 - **Process lifetime.** Every call has a wall-clock timeout and process group. Linux also uses
-  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. On macOS a
-  process that leaves the group can survive, but remains sandboxed; the output reader stops two
-  seconds after bash exits so a held pipe cannot stall the turn.
+  bubblewrap's PID namespace and `--die-with-parent` to kill orphaned descendants. macOS has no
+  PID namespace, so the daemon also kills each descendant that one `ps` snapshot links to the
+  group, such as a `setsid` child. A descendant whose parent exits before that snapshot
+  reparents to launchd and can still survive, sandboxed. The output reader stops two seconds
+  after bash exits so a held pipe cannot stall the turn.
 - **The daemon's socket requires a token.** At start the daemon writes 128 random bits beside its
   socket (`~/.elefante/run/token` by default, `0600`); every connection presents it first, and the
   CLI and TUI read it there. The sandbox cannot read the token, so a command that reaches the

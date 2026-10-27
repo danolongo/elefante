@@ -191,8 +191,11 @@ tools.sandbox_state();                               // Seatbelt | Bubblewrap | 
   then execs `sandbox-exec` or bubblewrap. On Linux it first reopens the two seccomp memory files
   as descriptors 3 and 4. On Linux the daemon quarantines any new `.git` after each command.
 - **`run_process` bounds every child.** `ELEFANTE_BASH_TIMEOUT_SECS` (default 120) sets the
-  deadline. The process group dies on every exit path. Output fits one 32 KiB budget, and a marker
-  states each stream's original size.
+  deadline. On every exit path it kills the process group. On macOS, which has no PID namespace,
+  it also kills each descendant that one `ps` snapshot links to the group, such as a `setsid`
+  child. A descendant whose parent exits before that snapshot reparents to launchd and can still
+  survive. Linux uses the PID namespace. Output fits one 32 KiB budget, and a marker states each
+  stream's original size.
 - **`HarnessGit::execute` runs one approved write.** Its preflight refuses:
   - a repository that was absent at session start, or has changed since;
   - in-root `include.path` or `core.hooksPath` targets;

@@ -927,15 +927,60 @@ pub struct ProcessOutput {
 struct ProcessGroup(Option<u32>);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let group = self
-            .0
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(rustix::process::Pid::from_raw);
-        if let Some(group) = group {
-            // The group may already be gone; nothing else can be done with an error here.
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        let Some(group) = self.0.and_then(|id| i32::try_from(id).ok()) else {
+            return;
+        };
+        // macOS has no PID namespace. A descendant that ran `setsid` or `set -m` left the group,
+        // so the daemon also kills every descendant that one `ps` snapshot links to the group.
+        let escaped = if cfg!(target_os = "macos") {
+            descendants(group)
+        } else {
+            Vec::new()
+        };
+        // A process may already be gone; nothing else can be done with an error here.
+        if let Some(group) = Pid::from_raw(group) {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+        for pid in escaped.into_iter().filter_map(Pid::from_raw) {
+            let _ = kill_process(pid, Signal::KILL);
         }
     }
+}
+
+/// The live members of `group` and all their descendants, from one `ps` snapshot. A descendant
+/// that the system already reparented away from the tree is missing.
+fn descendants(group: i32) -> Vec<i32> {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let rows: Vec<[i32; 3]> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(|field| field.parse().ok());
+            Some([fields.next()??, fields.next()??, fields.next()??])
+        })
+        .collect();
+    let mut found: Vec<i32> = rows
+        .iter()
+        .filter(|[_, _, pgid]| *pgid == group)
+        .map(|[pid, _, _]| *pid)
+        .collect();
+    let mut next = 0;
+    while let Some(&parent) = found.get(next) {
+        next += 1;
+        for [pid, ppid, _] in &rows {
+            if *ppid == parent && !found.contains(pid) {
+                found.push(*pid);
+            }
+        }
+    }
+    found
 }
 
 /// Each stream keeps this much from its start and its end, so either stream can fill the budget.
@@ -1016,7 +1061,8 @@ async fn drain(
 /// Runs an already configured command with a deadline and bounded output.
 ///
 /// # Errors
-/// Returns launch, wait, pipe, or deadline failures. The process group is killed on every exit.
+/// Returns launch, wait, pipe, or deadline failures. On every exit path the daemon kills the
+/// process group and, on macOS, the descendants that left it.
 pub async fn run_process(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
     command
         .kill_on_drop(true)

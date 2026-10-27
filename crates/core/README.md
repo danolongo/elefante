@@ -161,8 +161,9 @@ order keeps the prompt cacheable. The eight tools are `bash`, `edit`, `glob`, `g
   §9 **Sandbox** documents the policy.
 - **`web_search` is a trait too.** `tools.rs` validates the query (1–300 characters, no URL shape,
   unchanged by the scrubber) and `max_results` (1–10). It then calls the `WebSearch` attached with
-  `with_web_search`. `ToolGate::check_with_tools` escalates with `web-search-first` until the user approves a search, then reserves one of the
-  session's 30 searches before the batch starts; clones share the counter. With no backend the tool returns one fixed refusal.
+  `with_web_search`. `ToolGate::check_with_tools` escalates with `web-search-first` until the user
+  approves a search, then reserves one of the session's 30 searches before the batch starts; clones
+  share the counter. With no backend the tool returns one fixed refusal.
 - **`memory_search` is a trait.** The tool is validated in `tools.rs` (a non-empty query, `limit`
   1–20, `kind` of `file`, `symbol` or `note`, no other fields) and handed to a `MemorySearch`
   attached with `ToolExecutor::with_memory`; `memory.rs` implements it over `elefante-mem`. With
@@ -231,8 +232,8 @@ and waits. `DenyApprovalSink` is the default, so a caller that wires nothing get
 behavior rather than silent approval. For `bash`, `check_in` checks four things in order: a
 `Disabled` sandbox (`sandbox-off`), a git write (`git-write` or `git-write-refused`), the
 classifier's verdict, and the `network` input (`network-requested`). `check_with_tools`
-adds three rules that need the executor: `git-identity-missing`, `web-search-first` and `web-search-cap`. An
-`Escalate` event carries `network`, and only an approved `network-requested` call runs with
+adds three rules that need the executor: `git-identity-missing`, `web-search-first` and
+`web-search-cap`. An `Escalate` event carries `network`, and only an approved `network-requested` call runs with
 the network on.
 
 Refusals end the invocation without dispatching pending tools, and a partial tool block is
@@ -244,7 +245,7 @@ discarded before validation so a refusal mid-block cannot desynchronize ids.
 cargo test -p elefante-core     # no network, no credentials; needs the host's sandbox
 ```
 
-`tests/session.rs` (22) covers multi-turn history, cancellation, and pairing under interrupt.
+`tests/session.rs` (23) covers multi-turn history, cancellation, and pairing under interrupt.
 `tests/loop.rs` (6) covers the single-turn path. `tests/tools.rs` (24) covers the tools against
 `tempfile` workspaces — real files, real `bash`, no network. `tests/context.rs` (12) covers where context goes in
 a request, that it never enters history, and that the audit event follows `turn.started` without the rendered text. `tests/learn.rs` (29) and `tests/learn_wire.rs` (7) cover the learner, including the sink. `tests/prompt.rs` (2) keeps the standing prompt small, with and without the index hint.

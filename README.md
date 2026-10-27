@@ -51,6 +51,9 @@ When no prompt argument is supplied, Elefante reads the prompt from standard inp
 printf '%s\n' 'Explain the current test strategy.' | cargo run -p elefante
 ```
 
+A run with a prompt cannot ask you anything, so it denies every approval. In a terminal,
+`cargo run -p elefante` with no prompt opens the TUI, which asks before each escalated command.
+
 Useful options:
 
 ```text

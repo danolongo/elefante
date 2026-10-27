@@ -110,7 +110,7 @@ impl<W: Write> StreamRenderer<W> {
                 if *approved {
                     "Approval allowed\n"
                 } else {
-                    "Approval denied\n"
+                    "Approval denied: a run with a prompt cannot ask you. Run `elefante` with no prompt to approve commands.\n"
                 },
                 false,
             ),

@@ -669,15 +669,28 @@ impl SessionSandbox {
             .file_name()
             .ok_or("missing session identifier")?;
         let quarantine = self.policy.harness_dir.join("quarantine").join(session);
-        fs::create_dir_all(&quarantine).map_err(|error| error.to_string())?;
+        let mut stuck = Vec::new();
+        // Without a quarantine directory every entry takes the removal path below.
+        let _ = fs::create_dir_all(&quarantine);
         for path in found {
             let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fs::rename(path, quarantine.join(id.to_string())).map_err(|error| {
-                format!(
-                    "new Git metadata at {} could not be quarantined: {error}",
-                    path.display()
-                )
-            })?;
+            if fs::rename(path, quarantine.join(id.to_string())).is_err() {
+                // The entry is new since the run began, so removing it loses nothing of the user's.
+                let removed = if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                if removed.is_err() {
+                    stuck.push(path.display().to_string());
+                }
+            }
+        }
+        if !stuck.is_empty() {
+            return Err(format!(
+                "new Git metadata could not be quarantined or removed; left in place: {}",
+                stuck.join(", ")
+            ));
         }
         Err(format!(
             "{} new Git metadata entr{} quarantined",
@@ -763,7 +776,6 @@ fn git_policy(mut policy: Policy) -> Result<Policy, String> {
         writable.push(common.clone());
     }
     policy.read_only.retain(|path| !writable.contains(path));
-    // A missing path cannot be mounted, and no allowlisted command creates these.
     let mut protected: Vec<PathBuf> = writable
         .iter()
         .flat_map(|directory| PROTECTED_NAMES.map(|name| directory.join(name)))
@@ -777,10 +789,12 @@ fn git_policy(mut policy: Policy) -> Result<Policy, String> {
             protected.push(entry.path());
         }
     }
+    // Seatbelt denies a missing name, so a process that outlives the call cannot create it.
+    // Bubblewrap cannot mount a missing path, but `--unshare-pid` ends such a process.
     policy.read_only.extend(
         protected
             .into_iter()
-            .filter(|path| fs::symlink_metadata(path).is_ok()),
+            .filter(|path| cfg!(target_os = "macos") || fs::symlink_metadata(path).is_ok()),
     );
     // Secret names stay readable: hiding a tracked file would record it as blank or deleted.
     // Hard-linked files become read-only, and `.elefante` stays hidden.
@@ -899,6 +913,13 @@ fn scan_root(
                             || main_git.is_some_and(|main| canonical.starts_with(main)) =>
                     {
                         canonical
+                    }
+                    None if main_git.is_some_and(|main| target.path.starts_with(main)) => {
+                        return Err(format!(
+                            "Git config {} target {} is missing; create it or remove the setting",
+                            target.key,
+                            target.path.display()
+                        ));
                     }
                     _ => continue,
                 }
@@ -1302,6 +1323,38 @@ mod tests {
         let pid = child.id();
         child.wait().expect("wait for true");
         pid
+    }
+
+    #[test]
+    fn failed_quarantine_removes_the_entries_and_names_what_stays() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base = base.path().canonicalize().expect("canonical tempdir");
+        let root = base.join("root");
+        fs::create_dir(&root).expect("root");
+        let mut session = SessionSandbox::new(&root).expect("session");
+        // A regular file where the quarantine directory belongs: it cannot be created.
+        let blocked = base.join("blocked");
+        fs::write(&blocked, "x").expect("blocker");
+        session.policy.harness_dir = blocked;
+        let directory = root.join("new-dir");
+        let file = root.join("new-file");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(directory.join("inner"), "x").expect("inner");
+        fs::write(&file, "x").expect("file");
+        let error = session
+            .quarantine(&[directory.clone(), file.clone()])
+            .expect_err("the call fails");
+        assert!(error.contains("2 new Git metadata entries"), "{error}");
+        assert!(!directory.exists() && !file.exists());
+        // Control: an entry that cannot be removed either is named.
+        let missing = root.join("missing");
+        let error = session
+            .quarantine(std::slice::from_ref(&missing))
+            .expect_err("the call fails");
+        assert!(
+            error.contains("left in place") && error.contains("missing"),
+            "{error}"
+        );
     }
 
     #[test]

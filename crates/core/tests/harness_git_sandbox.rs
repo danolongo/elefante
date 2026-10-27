@@ -181,6 +181,16 @@ async fn alias_script_cannot_escape() {
     let outside = base.join("outside");
     fs::create_dir(&outside).expect("outside directory");
     diverged(&root);
+    // Protections that the script below tries and fails to defeat.
+    let alternates = root.join(".git/objects/info/alternates");
+    fs::create_dir_all(alternates.parent().unwrap()).expect("info directory");
+    fs::create_dir(base.join("alt")).expect("alternate store");
+    fs::write(&alternates, base.join("alt").to_str().unwrap()).expect("alternates");
+    fs::create_dir(root.join(".git/modules")).expect("modules");
+    fs::hard_link(root.join("base"), root.join(".env.local")).expect("hard link");
+    fs::write(root.join(".env"), "S").expect("secret-named file");
+    fs::create_dir(root.join(".elefante")).expect("harness directory");
+    fs::write(root.join(".elefante/key"), "K").expect("harness file");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("host listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("address").port();
@@ -194,6 +204,12 @@ try hook sh -c 'echo x > .git/hooks/x'
 try config sh -c 'echo x > .git/config'
 try commondir sh -c 'echo ../x > .git/commondir'
 try rename mv .git .git-moved
+try info mv .git/objects/info .git/objects/info-moved
+try modules mv .git/modules .git/modules-moved
+try hardlink sh -c 'echo x >> .env.local'
+try harnessdir cat .elefante/key
+try secretread cat .env
+perl -MPOSIX=setsid -e 'fork and exit; setsid; fork and exit; sleep 2; for (@ARGV) {{ open F, ">", $_; print F "x" }}' "{root}/detached" "{root}/.git/commondir" >/dev/null 2>&1
 try network bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'
 exit 2
 "#,
@@ -209,7 +225,19 @@ exit 2
     let marker =
         fs::read_to_string(root.join("marker")).unwrap_or_else(|_| panic!("no marker: {error}"));
     assert!(marker.starts_with("ran"), "{marker}");
-    for attempt in ["outside", "hook", "config", "rename", "network"] {
+    // Controls: a secret-named file in the root stays readable.
+    assert!(marker.contains("secretread wrote"), "{marker}");
+    for attempt in [
+        "outside",
+        "hook",
+        "config",
+        "rename",
+        "network",
+        "info",
+        "modules",
+        "hardlink",
+        "harnessdir",
+    ] {
         assert!(!marker.contains(attempt), "{attempt} succeeded: {marker}");
     }
     assert!(!outside.join("x").exists());
@@ -218,7 +246,17 @@ exit 2
     assert!(root.join(".git").is_dir() && !root.join(".git-moved").exists());
     // A new protected name is caught after the run, wherever the OS allowed it.
     assert!(!root.join(".git/commondir").exists());
-    assert!(error.contains("quarantined"), "{error}");
+    if cfg!(target_os = "linux") {
+        assert!(error.contains("quarantined"), "{error}");
+    }
+    // A detached process outlives the call; it must still not create a protected name.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Bubblewrap ends the process with the call, so only Seatbelt has a control to check.
+    assert!(
+        cfg!(target_os = "linux") || root.join("detached").exists(),
+        "the detached control never ran"
+    );
+    assert!(!root.join(".git/commondir").exists());
     assert!(matches!(
         listener.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -239,7 +277,12 @@ async fn protected_names_and_new_repositories_are_quarantined() {
         "echo x > .git/commondir; mkdir .git/HOOKS; mkdir -p .git/modules/x/hooks sub/.git; exit 2\n",
     );
     let error = unchecked(&root, &attack).await.expect_err("the call fails");
-    assert!(error.contains("quarantined"), "{error}");
+    // macOS denies the names up front, so there is nothing to quarantine there.
+    assert_eq!(
+        error.contains("quarantined"),
+        cfg!(target_os = "linux"),
+        "{error}"
+    );
     let names: Vec<_> = fs::read_dir(root.join(".git"))
         .expect(".git")
         .map(|entry| entry.expect("entry").file_name())
@@ -252,15 +295,17 @@ async fn protected_names_and_new_repositories_are_quarantined() {
     }
     // macOS refuses the new repository at the OS; Linux quarantines it.
     assert!(!root.join("sub/.git").exists());
-    let quarantined: usize = fs::read_dir(base.join("home/.elefante/quarantine"))
-        .expect("quarantine under the fake HOME")
-        .map(|session| {
-            fs::read_dir(session.expect("session").path())
-                .expect("entries")
-                .count()
-        })
-        .sum();
-    assert_eq!(quarantined, if cfg!(target_os = "linux") { 4 } else { 3 });
+    if cfg!(target_os = "linux") {
+        let quarantined: usize = fs::read_dir(base.join("home/.elefante/quarantine"))
+            .expect("quarantine under the fake HOME")
+            .map(|session| {
+                fs::read_dir(session.expect("session").path())
+                    .expect("entries")
+                    .count()
+            })
+            .sum();
+        assert_eq!(quarantined, 4);
+    }
 }
 
 async fn bash(tools: &ToolExecutor, command: &str) -> String {
@@ -370,6 +415,10 @@ async fn a_sibling_worktree_admin_directory_stays_read_only() {
     let (main, wt) = worktrees(&base);
     let sibling = main.join(".git/worktrees/wt2");
     let own = main.join(".git/worktrees/wt");
+    // An include target inside the common directory stays read-only.
+    let include = main.join(".git/extra");
+    fs::write(&include, "[core]\n").expect("include target");
+    git(&main, &["config", "include.path", "extra"]);
     let attack = script(
         &wt,
         &format!(
@@ -379,9 +428,11 @@ try sibling-edit sh -c 'echo x > "{sibling}/commondir"'
 try sibling-new sh -c 'echo x > "{sibling}/new"'
 try own-edit sh -c 'echo x > "{own}/commondir"'
 try own-new sh -c 'echo x > "{own}/control"'
+try include sh -c 'echo x > "{include}"'
 exit 2
 "#,
             wt = wt.display(),
+            include = include.display(),
             sibling = sibling.display(),
             own = own.display(),
         ),
@@ -394,4 +445,45 @@ exit 2
     // Control: the session's own admin directory takes a new file, and only that write succeeds.
     assert_eq!(marker, "ran\nown-new wrote\n");
     assert!(!sibling.join("new").exists());
+}
+
+#[tokio::test]
+async fn a_missing_include_target_in_the_common_directory_is_refused() {
+    let base = tempfile::tempdir().expect("fixture");
+    let base = base.path().canonicalize().expect("canonical fixture");
+    let (main, wt) = worktrees(&base);
+    git(&main, &["config", "include.path", "extra"]);
+    let session = SessionSandbox::new(&wt).expect("session");
+    let error = session.scan().expect_err("the target is missing");
+    assert!(error.contains("is missing"), "{error}");
+    // Control: once the target exists, the scan passes.
+    fs::write(main.join(".git/extra"), "[core]\n").expect("include target");
+    session.scan().expect("scan");
+}
+
+#[tokio::test]
+async fn harness_git_follows_the_sandbox_state() {
+    let Some(base) = in_fake_home("harness_git_follows_the_sandbox_state") else {
+        return;
+    };
+    let root = base.join("root");
+    diverged(&root);
+    // Disabled runs on the host path.
+    let disabled = tools(&root).with_sandbox_disabled().expect("disabled");
+    fs::write(root.join("host"), "host").expect("file");
+    bash(&disabled, "git add host").await;
+    bash(&disabled, "git commit -m host").await;
+    assert!(bash(&disabled, "git log --oneline").await.contains("host"));
+    // Unavailable refuses: the home directory is not a valid root.
+    let home = base.join("home");
+    git(&home, &["init", "-q"]);
+    let unavailable = tools(&home);
+    let result = unavailable
+        .execute("bash", json!({ "command": "git add ." }))
+        .await;
+    assert!(
+        result.is_error && result.content.contains("sandbox unavailable"),
+        "{}",
+        result.content
+    );
 }

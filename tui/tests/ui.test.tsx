@@ -9,7 +9,7 @@ import type { AppProps } from "../src/ui/App";
 import { emptyUsage, initialSession, reduceSession } from "../src/session";
 import { Transcript } from "../src/ui/Transcript";
 import { Status } from "../src/ui/Status";
-import { Input } from "../src/ui/Input";
+import { Input, MAX_PROMPT_ROWS } from "../src/ui/Input";
 import { Modal } from "../src/ui/Modal";
 import { ApprovalPrompt } from "../src/ui/ApprovalPrompt";
 import { ConsentPrompt } from "../src/ui/ConsentPrompt";
@@ -171,6 +171,23 @@ test("memory spend joins the single total and only exceptional memory state adds
   expect(await render(memoryStatus({ learning: "failing", problem: "no reply from the provider" }))).toContain("memory: not saving  /memory");
   expect(await render(memoryStatus({ enabled: false, learning: "paused", problem: "the memory key is unavailable" }))).toContain("memory: unavailable");
   expect(await render(memoryStatus({ consent: "declined", learning: "paused" }))).not.toContain("memory:");
+});
+test("the prompt bar wraps long text downward, stops growing at 16 rows, and Enter sends the whole text", async () => {
+  const sent: string[] = [];
+  const setup = await testRender(<box flexDirection="column" height="100%"><box flexGrow={1} /><Input disabled={false} onSubmit={text => sent.push(text)} onCommand={() => {}} /></box>, { width: 60, height: 30 });
+  // Rows between the prompt bar's top and bottom borders.
+  const rows = async () => { await setup.renderOnce(); const frame = setup.captureCharFrame().split("\n"); return frame.findIndex(r => r.includes("└")) - frame.findIndex(r => r.includes("┌")) - 1; };
+  try {
+    expect(await rows()).toBe(1);
+    await act(async () => { await setup.mockInput.typeText("first " + "word ".repeat(20)); });
+    expect(await rows()).toBeGreaterThan(1);
+    expect(setup.captureCharFrame()).toContain("first");   // a bar that scrolled sideways would hide it
+    await act(async () => { await setup.mockInput.typeText("more ".repeat(200)); });
+    expect(await rows()).toBe(MAX_PROMPT_ROWS);
+    await act(async () => setup.mockInput.pressEnter());
+    expect(sent).toEqual(["first " + "word ".repeat(20) + "more ".repeat(200)]);
+    expect(await rows()).toBe(1);
+  } finally { await act(async () => setup.renderer.destroy()); }
 });
 test("the status line, prompt border and placeholder are tints of one blue: light, rgb(78, 126, 163), darker", async () => {
   const setup = await testRender(<box flexDirection="column"><Status state={initialSession("s")} now={0} /><Input disabled={false} onSubmit={() => {}} onCommand={() => {}} /></box>, { width: 60, height: 6 });

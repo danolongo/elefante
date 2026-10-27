@@ -54,7 +54,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/elephant/paint.ts` | 47 | Composes a frame into pixels and paints it as half-block cells. |
 | `src/ui/elephant/phase.ts` | 21 | The `intro → perch` transition, as pure functions. |
 | `src/ui/Status.tsx` | 16 | Thinking indicator, elapsed time, usage, the memory suffix when memory is not healthy, and `sandbox: off` or `sandbox: unavailable` in the warning colour. |
-| `src/ui/Input.tsx` | 13 | Prompt entry; routes `/memory` and `/forget <id>` through `parseCommand`. |
+| `src/ui/Input.tsx` | 20 | Prompt entry; wraps long text and grows up to 16 rows, then scrolls; routes `/memory` and `/forget <id>` through `parseCommand`. |
 | `src/ui/theme.ts` | 6 | The blue behind the prompt border and its two neighbouring tints. |
 
 `session.ts` is short but dense — single-line functions, not a stub.
@@ -66,7 +66,8 @@ and `--max-tokens` configure a new one. `ELEFANTE_SOCKET` selects an isolated da
 effort, and limits also read `ELEFANTE_MODEL`, `ELEFANTE_EFFORT`, `ELEFANTE_MAX_ROUNDS`, and
 `ELEFANTE_MAX_TOKENS`, with explicit arguments taking priority.
 
-Enter submits, **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
+Enter submits and Ctrl+J starts a new line. A long prompt wraps, and the prompt bar grows up to 16
+rows before it scrolls. **Esc interrupts** the running turn, **Ctrl+C exits**, and **Ctrl+R** shows or hides
 the model's reasoning (hidden at start; the "Thinking" line stays either way). An approval
 replaces the prompt bar with a Yes / No choice: Y allows, N denies, `↑↓` and Enter pick, and Esc
 means *deny* — it does not also interrupt the turn.

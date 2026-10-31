@@ -26,6 +26,16 @@ impl GitWrite {
     pub fn args(&self) -> &[String] {
         &self.args
     }
+
+    /// Wraps arguments the router would refuse, so tests can check that the OS still confines
+    /// them.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn unchecked(args: &[&str]) -> Self {
+        Self {
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +396,9 @@ pub fn hardened(git: &Path, root: &Path) -> Invocation {
         "core.sshCommand=false",
         "diff.external=",
         "merge.default=text",
+        "gc.auto=0",
+        "maintenance.auto=false",
+        "branch.autoSetupMerge=false",
     ];
     let args = settings
         .into_iter()

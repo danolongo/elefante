@@ -874,3 +874,170 @@ async fn cancellation_during_provider_stream_preserves_partial_text_and_usage() 
         .await
         .unwrap();
 }
+
+struct CountedApproval {
+    asked: std::sync::atomic::AtomicUsize,
+    outcome: ApprovalOutcome,
+}
+
+impl ApprovalSink for CountedApproval {
+    fn request<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, ApprovalOutcome> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { self.outcome })
+    }
+}
+
+#[derive(Debug, Default)]
+struct CountedSearch(std::sync::atomic::AtomicUsize);
+
+impl elefante_core::tools::WebSearch for CountedSearch {
+    fn search(
+        &self,
+        _: elefante_core::tools::WebSearchRequest,
+    ) -> BoxFuture<'_, Result<String, String>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok("1. https://example.org".to_owned()) })
+    }
+}
+
+fn searches(ids: &[&str]) -> Vec<Event> {
+    let mut round = Vec::new();
+    for id in ids {
+        round.push(Event::ToolUseStart {
+            id: (*id).into(),
+            name: "web_search".into(),
+        });
+        round.push(Event::ToolUseComplete {
+            id: (*id).into(),
+            input: json!({"query": "rust"}),
+        });
+    }
+    round.push(Event::Stop(StopReason::ToolUse));
+    round
+}
+
+#[tokio::test]
+async fn the_first_search_asks_in_every_call_and_one_approval_opens_the_session() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let repo = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountedSearch::default());
+    let executor = ToolExecutor::new(repo.path())
+        .unwrap()
+        .with_web_search(backend.clone());
+    let provider = Script::new(vec![
+        searches(&["a", "b"]),
+        end("one"),
+        searches(&["c"]),
+        end("two"),
+    ]);
+    let approvals = Arc::new(CountedApproval {
+        asked: 0.into(),
+        outcome: ApprovalOutcome::Approved,
+    });
+    let gate = ToolGate::new(approvals.clone());
+    let mut session = Session::new(RunConfig::new("test"));
+    let mut events = Vec::new();
+    for prompt in ["first", "second"] {
+        session
+            .prompt(
+                &provider,
+                &executor,
+                &gate,
+                prompt,
+                CancellationToken::new(),
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+    }
+    // Both searches of the first batch asked; the later one did not.
+    assert_eq!(approvals.asked.load(SeqCst), 2);
+    assert_eq!(backend.0.load(SeqCst), 3);
+    assert!(events.iter().any(|event| matches!(event, OutputEvent::ApprovalRequested { rule: "web-search-first", command, .. } if command == "rust")));
+}
+
+#[tokio::test]
+async fn a_denied_search_takes_no_slot_and_approves_nothing() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let repo = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountedSearch::default());
+    let executor = ToolExecutor::new(repo.path())
+        .unwrap()
+        .with_web_search(backend.clone());
+    let provider = Script::new(vec![
+        searches(&["a"]),
+        end("one"),
+        searches(&["b"]),
+        end("two"),
+    ]);
+    let approvals = Arc::new(CountedApproval {
+        asked: 0.into(),
+        outcome: ApprovalOutcome::Denied,
+    });
+    let gate = ToolGate::new(approvals.clone());
+    let mut session = Session::new(RunConfig::new("test"));
+    for prompt in ["first", "second"] {
+        session
+            .prompt(
+                &provider,
+                &executor,
+                &gate,
+                prompt,
+                CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(approvals.asked.load(SeqCst), 2);
+    assert_eq!(backend.0.load(SeqCst), 0);
+    assert!(!executor.web_search_approved());
+    // 29 reservations remain after the next approval; an unused slot would leave 28.
+    executor.approve_web_search();
+    for _ in 0..29 {
+        assert!(executor.reserve_web_search());
+    }
+    assert!(!executor.reserve_web_search());
+}
+
+#[tokio::test]
+async fn a_cancelled_search_approval_runs_nothing_and_the_next_search_asks_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let repo = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountedSearch::default());
+    let executor = ToolExecutor::new(repo.path())
+        .unwrap()
+        .with_web_search(backend.clone());
+    let provider = Script::new(vec![
+        searches(&["a"]),
+        end("one"),
+        searches(&["b"]),
+        end("two"),
+    ]);
+    let approvals = Arc::new(CountedApproval {
+        asked: 0.into(),
+        outcome: ApprovalOutcome::Cancelled,
+    });
+    let gate = ToolGate::new(approvals.clone());
+    let mut session = Session::new(RunConfig::new("test"));
+    for prompt in ["first", "second"] {
+        session
+            .prompt(
+                &provider,
+                &executor,
+                &gate,
+                prompt,
+                CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(approvals.asked.load(SeqCst), 2);
+    assert_eq!(backend.0.load(SeqCst), 0);
+    assert!(!executor.web_search_approved());
+}

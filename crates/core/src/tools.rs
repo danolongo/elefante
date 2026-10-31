@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use thiserror::Error;
 
@@ -105,6 +105,7 @@ pub struct ToolExecutor {
     scrubber: Scrubber,
     memory: Option<Arc<dyn MemorySearch>>,
     web_search: Option<Arc<dyn WebSearch>>,
+    web_search_approved: Arc<AtomicBool>,
     web_search_count: Arc<AtomicUsize>,
     files: Arc<FileAccess>,
     sandbox: Arc<crate::sandbox::SessionSandbox>,
@@ -130,6 +131,7 @@ impl ToolExecutor {
             scrubber: Scrubber::new(),
             memory: None,
             web_search: None,
+            web_search_approved: Arc::new(AtomicBool::new(false)),
             web_search_count: Arc::new(AtomicUsize::new(0)),
             files: Arc::new(files),
             sandbox: Arc::new(sandbox),
@@ -148,6 +150,19 @@ impl ToolExecutor {
     pub fn with_web_search(mut self, web_search: Arc<dyn WebSearch>) -> Self {
         self.web_search = Some(web_search);
         self
+    }
+
+    /// Whether the user has approved a search in this session.
+    #[must_use]
+    pub fn web_search_approved(&self) -> bool {
+        self.web_search_approved.load(Ordering::Acquire)
+    }
+
+    /// Records the user's approval of a search. The approved search takes a slot, so the count can pass
+    /// 30 after a cap approval.
+    pub fn approve_web_search(&self) {
+        self.web_search_approved.store(true, Ordering::Release);
+        self.web_search_count.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Reserves one search before concurrent tool calls start; returns false past the cap.
@@ -493,12 +508,17 @@ impl ToolExecutor {
                 };
                 let _lock = self.sandbox.lock.write().await;
                 let sandbox = Arc::clone(&self.sandbox);
-                match tokio::task::spawn_blocking(move || sandbox.scan()).await {
-                    Ok(Ok(_)) => {}
+                let scanned = match tokio::task::spawn_blocking(move || sandbox.scan()).await {
+                    Ok(Ok(policy)) => policy,
                     Ok(Err(error)) => return ToolResult::error(error),
                     Err(error) => return ToolResult::error(format!("scan failed: {error}")),
-                }
-                return match git.execute(&write).await {
+                };
+                let result = if matches!(self.sandbox.state(), crate::sandbox::Sandbox::Disabled) {
+                    git.execute(&write).await
+                } else {
+                    git.execute_sandboxed(&write, &self.sandbox, scanned).await
+                };
+                return match result {
                     Ok(content) => ToolResult::success(content),
                     Err(error) => ToolResult::error(error),
                 };

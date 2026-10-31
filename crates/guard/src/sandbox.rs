@@ -164,6 +164,8 @@ pub struct Policy {
     pub readable: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
+    /// Git directories that harness git may write. A non-empty list selects the git profile.
+    pub git_writable: Vec<PathBuf>,
     pub hidden: Vec<HiddenPath>,
     pub network: Network,
     /// The host's absolute `XDG_RUNTIME_DIR`. No readable mount may reach into it.
@@ -301,6 +303,7 @@ impl Policy {
             .chain(self.readable.iter())
             .chain(self.writable.iter())
             .chain(self.read_only.iter())
+            .chain(self.git_writable.iter())
             .chain(self.hidden.iter().map(|hidden| &hidden.path))
             .chain(self.protected.iter())
         {
@@ -316,6 +319,11 @@ impl Policy {
         }
         for path in &self.read_only {
             if !path.starts_with(&self.root) && self.exposes_protected(path) {
+                return Err(RootError::ProtectedMount(path.clone()));
+            }
+        }
+        for path in &self.git_writable {
+            if self.exposes_protected(path) {
                 return Err(RootError::ProtectedMount(path.clone()));
             }
         }
@@ -360,7 +368,9 @@ impl Policy {
         // Only a path in the root or a validated git directory may live in host temp.
         let shared_temp = (under("/tmp") || under("/private/tmp"))
             && (matches!(path.to_str(), Some("/tmp" | "/private/tmp"))
-                || !path.starts_with(&self.root) && !self.read_only.iter().any(|ro| ro == path));
+                || !path.starts_with(&self.root)
+                    && !self.read_only.iter().any(|ro| ro == path)
+                    && !self.git_writable.iter().any(|git| git == path));
         path.parent().is_none()
             || matches!(path.to_str(), Some("/home" | "/Users" | "/private/var"))
             || shared_temp
@@ -390,17 +400,14 @@ fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-/// Name-based denies under `ROOT`: `.git` writes, secret names and harness state.
-const ROOT_DENIES: &str = concat!(
+/// Name-based denies under `ROOT`: `.git` writes, secret names and harness state. The git profile
+/// skips the secret-name read deny, the second rule.
+const ROOT_DENIES: [&str; 4] = [
     r#"(deny file-write* (require-all (subpath (param "ROOT")) (regex #"/\.[Gg][Ii][Tt](/|$)")))"#,
-    "\n",
     r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/(\.env(\.[^/]*)?|\.netrc|\.npmrc|\.git-credentials|credentials(\.toml)?|id_rsa[^/]*|[^/]*\.[Pp][Ee][Mm]|[^/]*\.[Kk][Ee][Yy])(/|$)")))"#,
-    "\n",
     r#"(deny file-read* file-write* (require-all (subpath (param "ROOT")) (regex #"/\.elefante(/|$)")))"#,
-    "\n",
     r#"(deny file-read* (require-all (subpath (param "ROOT")) (regex #"/\.ssh(/|$)")))"#,
-    "\n",
-);
+];
 
 /// Renders a deny-default Seatbelt profile and separate `-D` path parameters.
 ///
@@ -437,15 +444,21 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
         .chain([policy.harness_dir.clone()])
         .chain(policy.protected.iter().cloned())
         .collect();
+    let git = !policy.git_writable.is_empty();
     // Seatbelt applies the last matching rule, so every deny follows every allow.
     for (prefix, paths, rule) in [
         ("READ", &policy.readable, "allow file-read*"),
         ("WRITE", &policy.writable, "allow file-write*"),
+        ("GITW", &policy.git_writable, "allow file-write*"),
         ("RO", &policy.read_only, "deny file-write*"),
         ("HIDDEN", &hidden, "deny file-read* file-write*"),
     ] {
-        if prefix == "RO" {
-            profile.push_str(ROOT_DENIES);
+        if prefix == "GITW" {
+            for (index, rule) in ROOT_DENIES.iter().enumerate() {
+                if !(git && index == 1) {
+                    writeln!(profile, "{rule}").expect("writing to String cannot fail");
+                }
+            }
         }
         for (index, path) in paths.iter().enumerate() {
             let key = format!("{prefix}_{index}");
@@ -453,6 +466,27 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
                 .expect("writing to String cannot fail");
             params.push((key, path.as_os_str().into()));
         }
+    }
+    // An allow on a directory also allows renaming it, so the git directories and every writable
+    // ancestor of a read-only entry get a literal write deny.
+    let mut literals: BTreeSet<&Path> = policy.git_writable.iter().map(PathBuf::as_path).collect();
+    for entry in &policy.read_only {
+        for git in &policy.git_writable {
+            if entry.starts_with(git) {
+                literals.extend(
+                    entry
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|dir| dir.starts_with(git)),
+                );
+            }
+        }
+    }
+    for (index, path) in literals.into_iter().enumerate() {
+        let key = format!("GITL_{index}");
+        writeln!(profile, "(deny file-write* (literal (param \"{key}\")))")
+            .expect("writing to String cannot fail");
+        params.push((key, path.as_os_str().into()));
     }
     profile.push_str("(allow mach-lookup (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
     profile.push_str("(allow mach-lookup (global-name \"com.apple.cfprefsd.daemon\") (global-name \"com.apple.cfprefsd.agent\") (global-name \"com.apple.bsd.dirhelper\"))\n");
@@ -465,8 +499,8 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, OsStrin
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
-    pub bash: PathBuf,
-    pub command: OsString,
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
 }
 
@@ -477,7 +511,7 @@ pub struct LaunchSpec {
 /// Rejects invalid policy or executable paths.
 pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>, RootError> {
     policy.validate()?;
-    validate_path(&launch.bash)?;
+    validate_path(&launch.program)?;
     let mut args: Vec<OsString> = [
         "--unshare-user",
         "--disable-userns",
@@ -520,7 +554,7 @@ pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>,
     }
     mount(&mut args, "--bind", &policy.root, &policy.root);
     mount(&mut args, "--bind", &policy.temp, &policy.temp);
-    for path in &policy.writable {
+    for path in policy.writable.iter().chain(&policy.git_writable) {
         mount(&mut args, "--bind", path, path);
     }
     for path in &policy.read_only {
@@ -551,10 +585,9 @@ pub fn bwrap_args(policy: &Policy, launch: &LaunchSpec) -> Result<Vec<OsString>,
         "--add-seccomp-fd".into(),
         "4".into(),
         "--".into(),
-        launch.bash.as_os_str().into(),
-        "-c".into(),
-        launch.command.clone(),
+        launch.program.as_os_str().into(),
     ]);
+    args.extend(launch.args.iter().cloned());
     Ok(args)
 }
 

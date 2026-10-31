@@ -584,6 +584,18 @@ test("the status line names an off or unavailable sandbox in the warning colour 
     expect(fg).toBeUndefined();
   }
 });
+test("the approval prompt heading follows the rule", async () => {
+  const heading = async (rule: string) => {
+    const setup = await testRender(<ApprovalPrompt kind="approval" approval={{ approval_id: "a", command: "rust release", rule }} onDecision={() => {}} />, { width: 100, height: 12 });
+    try { await setup.renderOnce(); return setup.captureCharFrame(); }
+    finally { await act(async () => setup.renderer.destroy()); }
+  };
+  const first = await heading("web-search-first");
+  expect(first).toContain("Allow web searches? Approving lets up to 29 more run without asking.");
+  expect(first).toContain("rust release");
+  expect(await heading("web-search-cap")).toContain("Allow this web search?");
+  expect(await heading("git-write")).toContain("Allow this command?");
+});
 test("the approval prompt escapes the command and shows a network badge only for a network request", async () => {
   const render = async (network: boolean | undefined) => {
     const approval = { approval_id: "a", command: "curl\x1b[2J example.com\n‮rm -rf ~", rule: "network-requested", ...(network === undefined ? {} : { network }) };

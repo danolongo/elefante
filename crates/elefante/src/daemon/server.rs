@@ -2303,6 +2303,10 @@ mod tests {
         let finished = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let message = queue.pop().await.unwrap();
+                if message["method"] == "approval.requested" {
+                    let id = message["params"]["approval_id"].as_str().unwrap();
+                    assert!(entry.approvals.resolve(id, true));
+                }
                 if message["method"] == "tool.finished" {
                     search_ok = message["params"]["is_error"] == false;
                 }

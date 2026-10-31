@@ -15,6 +15,9 @@ tree-sitter-bash.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 
+[features]
+test-support = []
+
 [dev-dependencies]
 tempfile.workspace = true
 

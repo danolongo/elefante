@@ -8,7 +8,7 @@ use futures_util::{StreamExt as _, future::BoxFuture};
 /// Selects the search model; unset, searches use the session's author model.
 pub(super) const ENV_MODEL: &str = "ELEFANTE_SEARCH_MODEL";
 const MAX_TOKENS: u32 = 1024;
-const SYSTEM: &str = "Answer the search query briefly from the web results. List each source as a numbered plain URL on its own line.";
+const SYSTEM: &str = "Answer the search query from the web results in one to three sentences. Then list each source as a numbered plain URL on its own line.";
 
 type ProviderSource = Box<dyn Fn() -> Option<Arc<dyn Provider>> + Send + Sync>;
 
@@ -232,6 +232,8 @@ mod tests {
         let total = *total.lock().unwrap();
         println!("model: {model}\ncost: {:?}\n{text}", total.cost);
         assert!(text.contains("https://"), "no plain-text source URL");
+        let answer = text.split("https://").next().unwrap_or_default();
+        assert!(answer.contains("2025"), "no answer before the sources");
         assert!(
             total.cost.is_some_and(|cost| cost > 0.0),
             "no cost reported"

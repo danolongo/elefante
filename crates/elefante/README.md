@@ -22,7 +22,7 @@ boundaries below are the old crate boundaries and keep their rules.
 | `src/wire/snapshot.rs` | 85 | `AttachResult` (both kinds carry optional `memory` and `sandbox`), `SessionSnapshot` (with optional `sandbox`), `CompletedTurn` and `ActiveTurn` (with `memory_note_ids`), `PendingApproval` (with `network`), `ToolStatus`. |
 | `src/daemon/mod.rs` | 14 | Module declarations, re-exports, three capacity constants. |
 | `src/daemon/server.rs` | 2442 | **The largest file in the workspace.** Listener and token, `auth`, session registry, ring buffer, method dispatch, turn driving, memory and consent, sandbox status and the git identity. |
-| `src/daemon/search.rs` | 208 | `ProviderSearch`, the `web_search` backend, and `search_model`. |
+| `src/daemon/search.rs` | 242 | `ProviderSearch`, the `web_search` backend, and `search_model`. |
 | `src/daemon/queue.rs` | 300 | `ClientQueue` — per-client delivery with coalescing and eviction. |
 | `src/daemon/stub.rs` | 264 | `StubProvider`, the scripted fake the tests use. **Compiled into debug builds only.** |
 | `src/daemon/credentials.rs` | 105 | `0700` directories and `0600` files, written by rename, for the socket, the token and the stored key. |

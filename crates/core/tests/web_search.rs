@@ -75,13 +75,51 @@ async fn web_search_without_a_backend_has_a_fixed_refusal() {
     );
 }
 
+fn approved_tools(root: &std::path::Path) -> ToolExecutor {
+    let tools = ToolExecutor::new(root).unwrap();
+    tools.approve_web_search();
+    tools
+}
+
+fn escalated(rule: &'static str) -> GateDecision {
+    GateDecision::Escalate {
+        rule,
+        command: "rust".into(),
+        network: false,
+    }
+}
+
+#[test]
+fn the_first_search_escalates_without_taking_a_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let tools = ToolExecutor::new(root.path()).unwrap();
+    let gate = ToolGate::default();
+    for _ in 0..40 {
+        assert_eq!(
+            gate.check_with_tools("web_search", &json!({"query":"rust"}), &tools),
+            escalated("web-search-first"),
+        );
+    }
+    tools.approve_web_search();
+    for _ in 0..29 {
+        assert_eq!(
+            gate.check_with_tools("web_search", &json!({"query":"rust"}), &tools),
+            GateDecision::Allow
+        );
+    }
+    assert_eq!(
+        gate.check_with_tools("web_search", &json!({"query":"rust"}), &tools),
+        escalated("web-search-cap"),
+    );
+}
+
 #[test]
 fn the_thirty_first_search_escalates_across_executor_clones() {
     let root = tempfile::tempdir().unwrap();
-    let tools = ToolExecutor::new(root.path()).unwrap();
+    let tools = approved_tools(root.path());
     let clone = tools.clone();
     let gate = ToolGate::default();
-    for _ in 0..30 {
+    for _ in 0..29 {
         assert_eq!(
             gate.check_with_tools("web_search", &json!({"query":"rust"}), &tools),
             GateDecision::Allow
@@ -89,18 +127,14 @@ fn the_thirty_first_search_escalates_across_executor_clones() {
     }
     assert_eq!(
         gate.check_with_tools("web_search", &json!({"query":"rust"}), &clone),
-        GateDecision::Escalate {
-            rule: "web-search-cap",
-            command: "rust".into(),
-            network: false
-        },
+        escalated("web-search-cap"),
     );
 }
 
 #[test]
 fn parallel_search_reservations_cannot_exceed_the_session_cap() {
     let root = tempfile::tempdir().unwrap();
-    let tools = ToolExecutor::new(root.path()).unwrap();
+    let tools = approved_tools(root.path());
     let gate = ToolGate::default();
     let decisions = std::thread::scope(|scope| {
         let handles = (0..64)
@@ -122,7 +156,7 @@ fn parallel_search_reservations_cannot_exceed_the_session_cap() {
             .iter()
             .filter(|decision| **decision == GateDecision::Allow)
             .count(),
-        30
+        29
     );
     assert_eq!(
         decisions
@@ -135,28 +169,31 @@ fn parallel_search_reservations_cannot_exceed_the_session_cap() {
                 }
             ))
             .count(),
-        34
+        35
     );
 }
 
 #[test]
 fn rejected_searches_do_not_consume_the_session_cap() {
     let root = tempfile::tempdir().unwrap();
-    let tools = ToolExecutor::new(root.path()).unwrap();
+    let tools = approved_tools(root.path());
     let gate = ToolGate::default();
+    let unapproved = ToolExecutor::new(root.path()).unwrap();
     for _ in 0..40 {
         for input in [
             json!({"query":""}),
             json!({"query":"https://example.org"}),
             json!({"query":"SECRET_TOKEN=synthetic"}),
         ] {
-            assert_eq!(
-                gate.check_with_tools("web_search", &input, &tools),
-                GateDecision::Allow
-            );
+            for executor in [&tools, &unapproved] {
+                assert_eq!(
+                    gate.check_with_tools("web_search", &input, executor),
+                    GateDecision::Allow
+                );
+            }
         }
     }
-    for _ in 0..30 {
+    for _ in 0..29 {
         assert_eq!(
             gate.check_with_tools("web_search", &json!({"query":"rust"}), &tools),
             GateDecision::Allow

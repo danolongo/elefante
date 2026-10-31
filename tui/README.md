@@ -40,7 +40,7 @@ and `Root.tsx` are the seam between the imperative entrypoint and the React tree
 | `src/ui/Transcript.tsx` | 66 | Completed turns and the live turn; a shaded prompt, then reasoning (indented, dim, hidden until Ctrl+R), markdown text and tool calls drawn in the order they happened, as separate renderables with no text labels. |
 | `src/ui/toolView.ts` | 72 | Pure: a tool call as a header subject (`✓ bash \`ls\` (12 ms)`) and at most three body lines indented four spaces. A `read` is just its path, never the file. |
 | `src/ui/Modal.tsx` | 21 | The first-run key modal, and the `ModalProps` union of every question and panel. |
-| `src/ui/ApprovalPrompt.tsx` | 34 | The approval prompt, drawn in place of the prompt bar, and the `PromptPanel` frame it shares with the consent question. It shows the command through `displaySafe`, the rule, and a `[network]` badge when the command asks for internet access. Only the first decision counts. |
+| `src/ui/ApprovalPrompt.tsx` | 38 | The approval prompt, drawn in place of the prompt bar, and the `PromptPanel` frame it shares with the consent question. It words its heading by rule (`web-search-first`, `web-search-cap`), shows the command through `displaySafe`, the rule, and a `[network]` badge when the command asks for internet access. Only the first decision counts. |
 | `src/ui/ConsentPrompt.tsx` | 22 | The memory-consent question, drawn in place of the prompt bar. |
 | `src/ui/MemoryPanel.tsx` | 58 | The `/memory` panel: list, scroll, forget with a Y/N confirmation, close. |
 | `src/ui/App.tsx` | 55 | Composition, key handling and copy-on-select; the prompt bar shares a row with the perched elephant. |
@@ -186,7 +186,7 @@ bun run typecheck     # tsc --noEmit across all three layers
 ```
 
 `tests/protocol.test.ts` (12) covers framing at every byte split, sequence windows, and the
-no-daemon failure path. `tests/session.test.ts` (13) covers the reducer, including turn-less memory events. `tests/ui.test.tsx` (28)
+no-daemon failure path. `tests/session.test.ts` (13) covers the reducer, including turn-less memory events. `tests/ui.test.tsx` (29)
 drives the real OpenTUI test renderer — **without a TTY**, which is what lets the render site be
 asserted in CI. `tests/elephant.test.ts` (11) covers the sprites, wordmark, clips, flap pause and phase transitions
 as pure functions; `tests/commands.test.ts` (4) covers slash-command routing and note sanitising; `tests/copy.test.ts` (2) covers where copied text goes; `tests/toolView.test.ts` (8) covers how each tool call is laid out; `tests/elephant.ui.test.tsx` (11) renders the app and steps the animation by calling

@@ -862,6 +862,40 @@ Run on macOS locally and on Linux in CI, in scratch repositories only:
 Results go into this section before track A writes code. A result that breaks a decision
 changes this plan first.
 
+**Results (macOS, 2026-10-27, Command Line Tools git 2.54.0 under a hand-written profile).**
+1. Passed. All allowlisted writes worked with `config`, `config.worktree`, `hooks/`, `info/`,
+   `commondir`, `gitdir` and `objects/info/alternates` write-denied. `branch -d` prints
+   `could not write config file` and still exits 0: git tries to remove the branch's config
+   section. The call succeeds, so no change.
+2. Passed. A commit, `add` and `switch -c` worked in a linked worktree whose common directory is
+   outside the root. Writes to a sibling worktree's `commondir` and to the session's own
+   `commondir` failed.
+3. Switching to a remote-tracking name (`switch feature`, only `origin/feature` exists) tries to
+   write upstream config. It prints `could not write config file` twice and exits 0. With
+   `-c branch.autoSetupMerge=false` the output is clean and the branch is created. The plan adds
+   `branch.autoSetupMerge=false` to `git::hardened`.
+4. Passed. The Command Line Tools git ran with the hardened environment and only the private
+   temp as `TMPDIR`.
+5. Passed. With literal write denies on the git directory, `objects`, `objects/info` and an
+   existing `worktrees`, git created objects, fan-out directories and lock files inside them.
+   `mv .git g2`, `mv .git/objects …`, `mv .git/objects/info …` and `mv worktrees/<own> …` all
+   failed with `Operation not permitted`. A literal deny on a `worktrees` directory that does not
+   exist blocks `mkdir .git/worktrees`. No allowlisted command creates it, so the profile denies
+   only an existing `worktrees`.
+
+Three findings change the gate wording, not the design:
+- Seatbelt matched denied names case-insensitively on APFS: writes to `.git/COMMONDIR`,
+  `.git/Config.Worktree` and `.git/CONFIG` all failed. The spike profile denied the absent names
+  too. The git profile does not, as decided above, so the before-and-after check is what catches a
+  new protected name on both systems.
+- `--exec-path=<root>/bin merge -s evil` does not run `git-merge-evil` on git 2.54: git finds a
+  custom strategy through `PATH`, and the sandbox fixes `PATH`. The gate runs its escape script
+  through `-c alias.evil=!<script> evil` instead. That is also a command the router refuses.
+- `diff.external=` in `git::hardened` makes `git diff` fail with `cannot run`. The two `diff`
+  attacks pass `--no-ext-diff`.
+
+Linux results come from the CI run of the track A pull request.
+
 ### Tracks
 
 Two Sonnet workers run in parallel in their own Orca worktrees, each on its own branch from

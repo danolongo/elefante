@@ -508,12 +508,17 @@ impl ToolExecutor {
                 };
                 let _lock = self.sandbox.lock.write().await;
                 let sandbox = Arc::clone(&self.sandbox);
-                match tokio::task::spawn_blocking(move || sandbox.scan()).await {
-                    Ok(Ok(_)) => {}
+                let scanned = match tokio::task::spawn_blocking(move || sandbox.scan()).await {
+                    Ok(Ok(policy)) => policy,
                     Ok(Err(error)) => return ToolResult::error(error),
                     Err(error) => return ToolResult::error(format!("scan failed: {error}")),
-                }
-                return match git.execute(&write).await {
+                };
+                let result = if matches!(self.sandbox.state(), crate::sandbox::Sandbox::Disabled) {
+                    git.execute(&write).await
+                } else {
+                    git.execute_sandboxed(&write, &self.sandbox, scanned).await
+                };
+                return match result {
                     Ok(content) => ToolResult::success(content),
                     Err(error) => ToolResult::error(error),
                 };

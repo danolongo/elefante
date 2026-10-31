@@ -18,6 +18,7 @@ fn policy() -> Policy {
         readable: vec![PathBuf::from("/usr")],
         writable: vec![],
         read_only: vec![PathBuf::from("/work/project[1]/.git")],
+        git_writable: vec![],
         hidden: vec![],
         network: Network::Off,
         runtime_dir: None,
@@ -68,8 +69,8 @@ fn bubblewrap_keeps_its_private_devices_writable() {
     p.readable
         .extend(["/dev/null", "/dev/random", "/dev/urandom"].map(PathBuf::from));
     let launch = LaunchSpec {
-        bash: "/bin/bash".into(),
-        command: "true".into(),
+        program: "/bin/bash".into(),
+        args: vec!["-c".into(), "true".into()],
         environment: vec![("TERM".into(), "dumb".into())],
     };
     let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
@@ -88,8 +89,8 @@ fn bubblewrap_keeps_its_private_devices_writable() {
 fn bubblewrap_masks_its_init_process_from_shell_inspection() {
     let p = policy();
     let launch = LaunchSpec {
-        bash: "/bin/bash".into(),
-        command: "ps eww $PPID".into(),
+        program: "/bin/bash".into(),
+        args: vec!["-c".into(), "ps eww $PPID".into()],
         environment: vec![("TERM".into(), "dumb".into())],
     };
     let args = bwrap_args(&p, &launch).expect("rendered bubblewrap command");
@@ -364,8 +365,8 @@ fn bubblewrap_snapshot_preserves_overlay_and_descriptor_order() {
         },
     ];
     let launch = LaunchSpec {
-        bash: "/bin/bash".into(),
-        command: "printf '%s' '$HOME'".into(),
+        program: "/bin/bash".into(),
+        args: vec!["-c".into(), "printf '%s' '$HOME'".into()],
         environment: vec![("TERM".into(), "dumb".into())],
     };
     let args = bwrap_args(&p, &launch).unwrap();
@@ -654,5 +655,85 @@ mod linux {
                 assert_eq!(action(&programs[1], audit, ioctl, 0x5401), 0x7fff_0000);
             }
         }
+    }
+}
+
+fn git_policy() -> Policy {
+    let mut p = policy();
+    let git = p.root.join(".git");
+    p.read_only = vec![git.join("hooks"), git.join("config")];
+    p.git_writable = vec![git];
+    p.hidden = vec![HiddenPath {
+        path: p.root.join(".elefante"),
+        kind: HiddenKind::Directory,
+    }];
+    p
+}
+
+#[test]
+fn seatbelt_git_profile_allows_the_git_directory_between_the_denies() {
+    let (profile, params) = seatbelt_profile(&git_policy()).unwrap();
+    let position = |needle: &str| profile.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    let allow = position(r#"(allow file-write* (subpath (param "GITW_0")))"#);
+    assert!(position(r#"regex #"/\.[Gg][Ii][Tt](/|$)""#) < allow);
+    assert!(allow < position(r#"(deny file-write* (subpath (param "RO_0")))"#));
+    assert!(allow < position(r#"(deny file-write* (literal (param "GITL_0")))"#));
+    // The secret-name read deny is off, and the other root denies stay.
+    assert!(!profile.contains(r"id_rsa"));
+    assert!(profile.contains(r#"regex #"/\.elefante(/|$)""#));
+    assert!(profile.contains(r#"regex #"/\.ssh(/|$)""#));
+    assert!(
+        params
+            .iter()
+            .any(|(key, value)| key == "GITL_0" && value == "/work/project[1]/.git")
+    );
+}
+
+#[test]
+fn seatbelt_literal_denies_cover_every_writable_ancestor_of_a_read_only_entry() {
+    let mut p = git_policy();
+    let git = p.root.join(".git");
+    p.read_only.push(git.join("objects/info/alternates"));
+    let (_, params) = seatbelt_profile(&p).unwrap();
+    let literals: Vec<_> = params
+        .iter()
+        .filter(|(key, _)| key.starts_with("GITL_"))
+        .map(|(_, value)| PathBuf::from(value))
+        .collect();
+    assert_eq!(
+        literals,
+        [git.clone(), git.join("objects"), git.join("objects/info")]
+    );
+}
+
+#[test]
+fn bubblewrap_git_profile_binds_the_git_directory_before_the_read_only_entries() {
+    let p = git_policy();
+    let launch = LaunchSpec {
+        program: "/usr/bin/git".into(),
+        args: vec!["status".into()],
+        environment: vec![],
+    };
+    let args = bwrap_args(&p, &launch).unwrap();
+    let position = |flag: &str, path: &PathBuf| {
+        args.windows(3)
+            .position(|parts| parts == [flag, path.to_str().unwrap(), path.to_str().unwrap()])
+            .unwrap_or_else(|| panic!("{flag} {}", path.display()))
+    };
+    let git = p.root.join(".git");
+    assert!(position("--bind", &p.root) < position("--bind", &git));
+    assert!(position("--bind", &git) < position("--ro-bind", &git.join("hooks")));
+    assert!(args.ends_with(&["--".into(), "/usr/bin/git".into(), "status".into()]));
+}
+
+#[test]
+fn git_writable_paths_in_host_temp_are_valid_but_other_protected_paths_are_not() {
+    let mut p = git_policy();
+    p.git_writable = vec![PathBuf::from("/tmp/main/.git")];
+    p.readable.push(PathBuf::from("/tmp/main/.git"));
+    p.validate().expect("exact host temp git directory");
+    for bad in ["/tmp", "/users/alice", "/work/project[1]/../x", "relative"] {
+        p.git_writable = vec![PathBuf::from(bad)];
+        assert!(p.validate().is_err(), "{bad}");
     }
 }

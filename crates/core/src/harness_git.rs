@@ -1,5 +1,6 @@
-//! The host Git exception: preflight every approved literal write before launching it.
+//! Harness git: preflight every approved literal write before running it in the git sandbox.
 use elefante_guard::git::{self, GitWrite, Identity};
+use elefante_guard::sandbox::Policy;
 use std::{
     collections::BTreeSet,
     fs,
@@ -38,7 +39,8 @@ impl HarnessGit {
         })
     }
 
-    /// Caller holds the session's exclusive root lock throughout preflight and execution.
+    /// Runs the write on the host, for a session with the sandbox disabled. Caller holds the
+    /// session's exclusive root lock throughout preflight and execution.
     ///
     /// # Errors
     /// Refuses unsafe repositories and returns process failures, timeouts or output errors.
@@ -56,6 +58,28 @@ impl HarnessGit {
             crate::sandbox::command_timeout(),
         ))
         .await?;
+        if output.success {
+            Ok(output.content)
+        } else {
+            Err(output.content)
+        }
+    }
+
+    /// Runs the write under the git profile of `sandbox`. `scanned` is the caller's scan, made
+    /// under the same lock.
+    ///
+    /// # Errors
+    /// Refuses unsafe repositories and returns process failures, timeouts or output errors.
+    pub async fn execute_sandboxed(
+        &self,
+        write: &GitWrite,
+        sandbox: &crate::sandbox::SessionSandbox,
+        scanned: Policy,
+    ) -> Result<String, String> {
+        self.preflight().await?;
+        let git = Path::new(crate::sandbox::SANDBOX_GIT);
+        let invocation = git::invocation(git, &self.root, write, &self.identity);
+        let output = Box::pin(sandbox.run_git(scanned, invocation)).await?;
         if output.success {
             Ok(output.content)
         } else {
